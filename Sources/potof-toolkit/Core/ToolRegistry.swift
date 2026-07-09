@@ -7,7 +7,7 @@ import Foundation
 enum ToolRegistry {
     static let all: [Tool] = [
         Tool(
-            id: "claude-launcher",
+            id: ClaudeLauncherView.toolID,
             title: "Claude Launcher",
             subtitle: "Lancer Claude Code dans un terminal embarqué",
             icon: "terminal.fill",

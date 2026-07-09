@@ -1,66 +1,128 @@
-# Notifications internes — plan de câblage (ancrages en place, non branché)
+# Notifications internes — câblage des événements Claude
 
-Objectif à terme : une **barre de notif interne** à Potof Toolkit, alimentée par le
-système de notif Claude déjà en place, avec clic → focus de la session concernée.
+Potof Toolkit reçoit les **événements Claude Code** de ses sessions embarquées et les
+remonte sur **quatre surfaces** : la cloche du header, une **bannière macOS native**, le
+**rebond** de l'icône du Dock et une **pastille** (badge) sur cette icône. Cliquer une
+bannière ou une ligne de cloche ramène l'app au premier plan et **focalise** la session
+concernée.
 
-**État actuel : ancrages seulement.** Le code prévoit les points d'accroche mais
-**aucun canal n'est branché** — la cloche du header reste vide.
+> Reprend la logique de l'ancienne intégration iTerm2 (`~/.claude/hooks/claude-notify.js`
+> + `terminal-notifier`), mais en interne à l'app. 100 % local, aucun réseau (cf. CLAUDE.md).
 
-## Ce qui est déjà en place (ancrages)
+## Chaîne complète
 
-| Élément | Fichier | Rôle |
+```
+claude (session embarquée, env POTOF_SESSION_ID=<Session.id>)
+   │  event Notification / Stop
+   ▼
+~/.claude/hooks/claude-notify.js   (hook Claude Code, events Notification + Stop)
+   │  si POTOF_SESSION_ID présent → append JSONL (et saute terminal-notifier)
+   ▼
+~/Library/Application Support/PotofToolkit/notifications.jsonl
+   │  { potofSessionId, event, notificationType, message, lastMessage, cwd, ts }
+   ▼
+NotificationChannel  (DispatchSource vnode, tail sur le thread principal)
+   ▼
+NotificationCenterCoordinator.shared
+   ├─ bus.ingest(_:)                → cloche du header (NotificationSlot)
+   ├─ NSApp.dockTile.badgeLabel     → pastille Dock
+   ├─ NSApp.requestUserAttention    → rebond Dock
+   └─ UNUserNotificationCenter.add  → bannière macOS (sauf anti-spam)
+
+clic (bannière ou ligne de cloche)
+   → NotificationCenterCoordinator.handleClick(sessionID:)
+   → focusRequests (Combine) → RootView bascule l'outil affiché
+   → SessionStore.focusSession(id) → session active au centre
+```
+
+## Côté hook — `~/.claude/hooks/claude-notify.js`
+
+Le hook (branché sur les events `Notification` + `Stop` dans `~/.claude/settings.json`,
+inchangé) lit le JSON de l'event sur stdin. **Quand `process.env.POTOF_SESSION_ID` est
+présent** (session dans le terminal embarqué de l'app), il **append une ligne JSON** dans
+le canal et **retourne sans lancer `terminal-notifier`** (l'app pose sa propre bannière →
+pas de double bannière) :
+
+```js
+const potofSid = process.env.POTOF_SESSION_ID;
+if (potofSid) {
+  appendPotofChannel({ potofSessionId: potofSid, event, message, cwd, ts: Date.now() });
+  return;
+}
+// … sinon : chemin ITERM_SESSION_ID + terminal-notifier INCHANGÉ (iTerm2, etc.) …
+```
+
+`appendFileSync` (`O_APPEND`) → chaque ligne JSON est écrite atomiquement. `ts` en **ms**.
+
+## Côté app — les fichiers
+
+| Fichier | Rôle |
+|---|---|
+| `TerminalController.start` | injecte `POTOF_SESSION_ID=<Session.id>` dans l'env de chaque session |
+| `Core/Notifications/NotificationChannel.swift` | tail le JSONL via `DispatchSource` vnode ; décode chaque ligne (`ChannelEvent`) sur `main` |
+| `Core/Notifications/NotificationCenterCoordinator.swift` | **propriétaire unique** : possède le `NotificationBus`, la Dock tile, le délégué `UNUserNotificationCenter` ; pipeline par event + routage des clics |
+| `Core/Notifications/NotificationSessionProviding.swift` | protocole de découplage (`Core` ne connaît pas l'outil) + `FocusRequest` |
+| `Core/Notifications/AppNotification.swift` | modèle d'event `{ sessionID?, kind(.waiting/.finished), title, body, date }` |
+| `Core/Notifications/NotificationBus.swift` | bus de la cloche (`ingest` / `dismiss` / `clear`) |
+| `Core/Notifications/NotificationSlot.swift` | cloche + popover ; lignes cliquables (`onSelect`) + `onReveal` |
+| `SessionStore` (extension) | conforme `NotificationSessionProviding` ; `containsSession` / `activeSessionID` / `focusSession` |
+
+### Le pont entre les deux arbres de vues
+
+Le `NotificationBus`, la `selection` d'outil et la Dock tile vivent au **niveau app**
+(`RootView` / `AppDelegate`) ; le `SessionStore` vit **dans l'outil** ClaudeLauncher. Le
+coordinateur (singleton, comme `TerminalController.shared`) les relie via **deux coutures
+découplées** :
+
+- **`NotificationSessionProviding`** (outil → Core) : `ClaudeLauncherView` enregistre son
+  `SessionStore` auprès du coordinateur (`registerSessionProvider(_:toolID:)`) en fournissant
+  son `Tool.ID`. `Core` n'importe jamais l'outil et ne code aucun id en dur.
+- **`focusRequests` (Combine `PassthroughSubject`)** (Core → RootView) : au clic, le
+  coordinateur émet un `FocusRequest` ; `RootView` s'y abonne (`.onReceive`) et reste **le
+  seul writer** de `selection` (invariant : sélection d'outil = menu du header).
+
+### Trois types d'événement (`AppNotification.Kind`)
+
+| Situation | Détection | Rendu |
 |---|---|---|
-| `POTOF_SESSION_ID` | `TerminalController.start` | chaque session `claude` reçoit un id unique dans son env |
-| `AppNotification` | `Core/Notifications/AppNotification.swift` | modèle d'event `{ sessionID?, kind, title, body, date }` |
-| `NotificationBus` | `Core/Notifications/NotificationBus.swift` | bus interne ; **`ingest(_:)`** = point d'entrée unique |
-| `NotificationSlot` | `Core/Notifications/NotificationSlot.swift` | cloche + popover dans le header (`RootView`) |
+| **Action attendue** (TUI bloquée) | `Notification` + `notification_type == "permission_prompt"` | 🔔 « Claude attend ton action » (`bell.badge`, bleu) |
+| **Question / attente réponse** | `Notification` `idle_prompt`/`agent_needs_input`, **ou** `Stop` dont `last_assistant_message` finit par « ? » | 💬 « Claude attend une réponse » (`bubble.left`, orange) |
+| **Tâche terminée** | event `Stop` (message qui n'est pas une question) | ✅ « Claude a terminé » (coche, vert) |
 
-Brancher la notif = **faire appeler `NotificationBus.ingest(_:)`** depuis un lecteur
-de canal, sur le thread principal. Rien d'autre côté UI.
+⚠️ Deux limites de Claude Code (constatées en v2.1.205, via dump des payloads) :
+- **`permission_prompt` est ambigu** : il est émis à l'identique (`message: "Claude needs
+  your permission"`, aucun champ outil/`details`) aussi bien pour une **approbation d'outil**
+  que pour une **question interactive à choix multiple** (`AskUserQuestion`). Impossible de
+  les distinguer → un **seul** libellé neutre (« attend ton action »).
+- **Une question de fin de tour arrive comme un `Stop`** (aucun `idle_prompt` émis dans ce
+  flux). D'où l'heuristique `isQuestion` sur `last_assistant_message` (finit par « ? ») pour
+  séparer question et tâche terminée. Le corps de la notif reprend le message, tronqué ~140 car.
 
-## Le système de notif existant (rappel)
+### Anti-spam
 
-`~/.claude/hooks/claude-notify.js`, branché sur les events `Notification` + `Stop`
-dans `~/.claude/settings.json` :
-- lit le JSON de l'event sur stdin (`hook_event_name`, `message`, `cwd`…),
-- envoie une notif macOS via `terminal-notifier`,
-- clé de regroupement = **`ITERM_SESSION_ID`** ; clic → refocalise l'onglet iTerm2.
+Pas de **bannière** si `NSApp.isActive && activeSessionID == sessionID` (on regarde déjà
+cette session). Version in-process triviale — pas d'AppleScript (contrairement à l'ancien
+hook iTerm2). La **cloche** enregistre quand même l'event.
 
-Or nos sessions ne tournent plus dans iTerm2 : `ITERM_SESSION_ID` est absent, mais
-**`POTOF_SESSION_ID` est présent** dans l'env du process `claude`.
+### Cycle de vie & robustesse
 
-## Plan de branchement (le jour venu)
+- `AppDelegate.applicationDidFinishLaunching` → `NotificationCenterCoordinator.shared.start()` ;
+  `applicationWillTerminate` → `stop()`.
+- **Truncate au lancement** : le canal est vidé au démarrage de l'app (les vieilles lignes
+  réfèrent des sessions mortes — jamais persistées ; les rejouer serait faux) et sa taille
+  reste bornée.
+- Le tailer gère troncature/rotation (`offset > taille` → reset) et suppression/renommage du
+  fichier (`.delete`/`.rename` → ré-arme, avec debounce).
 
-Contrainte : **100 % local, aucun réseau** (cf. CLAUDE.md).
+## Caveat de test — bannières natives
 
-1. **Côté app — un lecteur de canal local.** Deux options, au choix :
-   - **Socket Unix** : l'app écoute sur `~/Library/Application Support/PotofToolkit/notif.sock`
-     et lit des lignes JSON `{ potofSessionId, event, message }`.
-   - **Fichier JSONL surveillé** (plus simple, sans serveur) : l'app tail un fichier
-     `…/PotofToolkit/notifications.jsonl` via `DispatchSource` (vnode) ; chaque ligne
-     ajoutée → un `AppNotification`.
+`UNUserNotificationCenter.current()` exige un **vrai bundle** (lit `bundleProxyForCurrentProcess`) :
+sous `swift run` (exécutable nu) il crasherait. Tout le code UN est donc gardé par
+`canUseUN = (Bundle.main.bundleURL.pathExtension == "app")` (même style que
+`AppDelegate.applyDockIcon`).
 
-   Le lecteur mappe `potofSessionId` → `Session.id` (l'app connaît ses sessions),
-   construit un `AppNotification` (`kind = .finished` si event `Stop`, sinon `.waiting`)
-   et appelle `NotificationBus.ingest(_:)` sur `main`.
-
-2. **Côté hook — patch de `claude-notify.js`.** Quand `process.env.POTOF_SESSION_ID`
-   est défini, en plus (ou au lieu) de `terminal-notifier`, écrire une ligne dans le
-   canal ci-dessus :
-   ```js
-   const sid = process.env.POTOF_SESSION_ID;
-   if (sid) {
-     // append JSONL, ou connect() au socket, puis write {potofSessionId, event, message}
-   }
-   ```
-   Garder le comportement `terminal-notifier` comme repli hors app.
-
-3. **Côté UI — focus au clic.** `NotificationSlot` (déjà en place) : au clic sur une
-   notif portant un `sessionID`, appeler `SessionStore.focus(id)` pour activer la
-   session dans le centre. (À câbler quand le bus sera alimenté.)
-
-## Pourquoi pas maintenant
-
-Décision produit (cf. plan) : stabiliser d'abord le terminal embarqué et l'UI. Les
-ancrages ci-dessus garantissent que le branchement sera **additif** (un lecteur qui
-appelle `ingest`, un patch de hook), sans retoucher l'architecture.
+- **`swift run`** : cloche + pastille + rebond Dock fonctionnent ; **bannières ignorées**.
+- **`.app` bundlée** (`./Scripts/build-app.sh` puis lancer l'app installée) : bannières
+  natives actives. Premier lancement = **prompt d'autorisation** macOS ; si refusé, pas de
+  bannière (cloche/Dock OK). Rappel machine : Réglages → Notifications → « Autoriser quand
+  l'écran est partagé/dupliqué », sinon les bannières sont masquées.

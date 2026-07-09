@@ -73,3 +73,12 @@ final class SessionStore: ObservableObject {
         URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
     }
 }
+
+// MARK: - Fournisseur de sessions pour les notifications
+
+extension SessionStore: NotificationSessionProviding {
+    func containsSession(_ id: UUID) -> Bool { sessions.contains { $0.id == id } }
+    var activeSessionID: UUID? { activeID }
+    /// Ignore une session déjà morte (sinon `activeID` pointerait dans le vide).
+    func focusSession(_ id: UUID) { if containsSession(id) { focus(id) } }
+}

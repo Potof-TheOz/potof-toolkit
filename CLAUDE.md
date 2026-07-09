@@ -37,10 +37,13 @@ App/
 Core/
   Tool.swift                  Abstraction d'un outil (id, title, subtitle, icon, view)
   ToolRegistry.swift          ⭐ Registre central = POINT D'EXTENSION UNIQUE
-  Notifications/              Ancrages notif internes (Phase 4, NON câblé) → docs/NOTIFICATIONS.md
+  Notifications/              Événements Claude branchés → docs/NOTIFICATIONS.md
     AppNotification.swift     Modèle d'event { sessionID?, kind, title, body, date }
-    NotificationBus.swift     Bus interne (ObservableObject) ; ingest(_:) = point d'entrée
-    NotificationSlot.swift    Cloche + popover dans le header
+    NotificationBus.swift     Bus de la cloche (ObservableObject) ; ingest(_:) = point d'entrée
+    NotificationSlot.swift    Cloche + popover dans le header (lignes cliquables → focus)
+    NotificationChannel.swift Tail du JSONL (DispatchSource vnode) ; décode ChannelEvent
+    NotificationCenterCoordinator.swift  ⭐ Propriétaire : bus + Dock + bannières UN + clics
+    NotificationSessionProviding.swift   Protocole de découplage (Core ↮ outil) + FocusRequest
 Tools/
   ClaudeLauncher/             Premier outil
     ClaudeLauncherView.swift  UI : HSplitView(sidebar sessions+dossiers/favoris | terminal central)
@@ -90,9 +93,15 @@ sont automatiques. L'outil occupe tout le cadre sous le header et gère sa propr
   Échappement shell de l'apostrophe (`'` → `'\''`) conservé.
 - **Quitter tue les sessions** (l'app possède les process) → `applicationShouldTerminate`
   confirme s'il reste des sessions actives. Garde-fou à conserver.
-- **`POTOF_SESSION_ID`** injecté dans l'env de chaque session = ancrage pour le futur
-  branchement des notifications. Les ancrages notif (`Core/Notifications/`) **ne sont PAS
-  câblés** à un canal ; ne rien y brancher sans suivre `docs/NOTIFICATIONS.md`.
+- **`POTOF_SESSION_ID`** injecté dans l'env de chaque session = clé de mapping des
+  notifications. Le hook `~/.claude/hooks/claude-notify.js` append un JSONL dans
+  `~/Library/Application Support/PotofToolkit/notifications.jsonl` quand cette variable est
+  présente ; l'app le tail (`NotificationChannel`) et le `NotificationCenterCoordinator`
+  alimente cloche + Dock + bannières natives. **Ne pas casser** ce contrat (nom de la
+  variable, chemin du canal, forme des lignes). Détails → `docs/NOTIFICATIONS.md`.
+- **Bannières natives gardées par `canUseUN`** (`Bundle.main.bundleURL.pathExtension == "app"`) :
+  `UNUserNotificationCenter` crash sous `swift run` (pas de bundle). En dev, seules cloche +
+  Dock marchent ; tester les bannières via l'app bundlée. Même logique que `applyDockIcon`.
 - **Persistance** : `@AppStorage("rootPath")` et `UserDefaults` clé `claudeLauncher.favorites`.
   Stockage par domaine = bundle id → voir LIFECYCLE (dev et app bundlée = 2 stores). L'état
   des sessions n'est **jamais** persisté (reflète les process vivants).

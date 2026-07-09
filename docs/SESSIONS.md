@@ -76,8 +76,16 @@ TerminalHostView (NSViewRepresentable)
 - **Quitter l'app tue les process** des sessions (l'app en est le parent).
   `AppDelegate.applicationShouldTerminate` **confirme** s'il reste des sessions
   actives (⌘Q ou fermeture de fenêtre). Ne pas retirer ce garde-fou.
-- **`POTOF_SESSION_ID`** est injecté dans l'environnement de chaque session : c'est le
-  point d'ancrage du futur branchement des notifications (`NOTIFICATIONS.md`).
+- **`POTOF_SESSION_ID`** est injecté dans l'environnement de chaque session : c'est la
+  clé qui relie un event Claude à sa session pour les notifications (`NOTIFICATIONS.md`).
+- **Mouse reporting coupé** (`EmbeddedTerminalView` + `allowMouseReporting = false`) :
+  un survol/clic de la souris sur le terminal **ne doit jamais** être transmis à la TUI
+  de Claude — sinon passer la souris sur un bouton « Yes »/« No » (ex. quand la fenêtre
+  passe au premier plan via une notif) **valide le prompt de permission à l'insu de
+  l'utilisateur**. `allowMouseReporting = false` gère clic/drag ; `EmbeddedTerminalView`
+  filtre en plus les reports SGR de **survol** (`ESC [ < … M/m`) dans `send(source:data:)`
+  (SwiftTerm ne garde pas `mouseMoved` derrière le drapeau). La sélection de texte native
+  et le clavier restent intacts. Ne pas réactiver le report souris.
 - **App Sandbox désactivée** : requise pour qu'un sous-process lancé dans un PTY ait
   accès au disque et aux commandes (cf. remarque SwiftTerm). Ne pas l'activer.
 

@@ -31,6 +31,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+
+        // Branchement des événements Claude : surveille le canal JSONL, alimente la
+        // cloche + le Dock, pose les bannières natives. Voir docs/NOTIFICATIONS.md.
+        NotificationCenterCoordinator.shared.start()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        NotificationCenterCoordinator.shared.stop()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

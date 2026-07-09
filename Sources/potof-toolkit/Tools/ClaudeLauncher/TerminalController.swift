@@ -42,8 +42,16 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     func start(id: UUID, folder: URL) -> LocalProcessTerminalView {
         if let existing = views[id] { return existing }
 
-        let term = LocalProcessTerminalView(frame: .zero)
+        let term = EmbeddedTerminalView(frame: .zero)
         term.processDelegate = self
+        // Coupe le *mouse reporting* vers la TUI : sinon un clic/survol de la souris sur
+        // le terminal (typiquement quand la fenêtre passe au premier plan via une notif,
+        // curseur au-dessus d'un bouton « Yes »/« No ») sélectionne le prompt de
+        // permission à l'insu de l'utilisateur. `allowMouseReporting=false` couvre
+        // clic/drag ; `EmbeddedTerminalView` couvre en plus le *survol* (mouseMoved, que
+        // SwiftTerm ne garde PAS derrière ce drapeau). Résultat : la souris fait de la
+        // sélection de texte native ; on navigue les prompts au clavier.
+        term.allowMouseReporting = false
         views[id] = term
         idByView[ObjectIdentifier(term)] = id
 
@@ -119,5 +127,30 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
             guard let self, let id = self.idByView[oid] else { return }
             self.onProcessExit?(id, exitCode)
         }
+    }
+}
+
+/// Terminal embarqué. Jette les **reports souris SGR** (`ESC [ < … M/m`) avant qu'ils
+/// n'atteignent le PTY : SwiftTerm envoie les événements `mouseMoved` (encodés comme un
+/// « release ») dès que la TUI active le suivi souris, **sans** les garder derrière
+/// `allowMouseReporting` (et `mouseMoved` n'est pas `open`, donc non surchargeable).
+/// Un simple survol d'un bouton « Yes »/« No » suffisait alors à valider/refuser un
+/// prompt de permission. `send(source:data:)` est le point de passage unique de tout
+/// ce qui part vers le process : on y filtre les reports souris. La sélection de texte
+/// native (clic/drag) reste intacte grâce à `allowMouseReporting=false` (les handlers
+/// clic/drag basculent en sélection locale au lieu de reporter).
+final class EmbeddedTerminalView: LocalProcessTerminalView {
+    override func send(source: TerminalView, data: ArraySlice<UInt8>) {
+        if Self.isSGRMouseReport(data) { return }
+        super.send(source: source, data: data)
+    }
+
+    /// Vrai si `data` est un report souris SGR : `ESC [ < … (M|m)`.
+    private static func isSGRMouseReport(_ data: ArraySlice<UInt8>) -> Bool {
+        guard data.count >= 4 else { return false }
+        var it = data.makeIterator()
+        guard it.next() == 0x1b, it.next() == 0x5b, it.next() == 0x3c else { return false }
+        let last = data[data.index(before: data.endIndex)]
+        return last == 0x4d || last == 0x6d   // 'M' (press) ou 'm' (release)
     }
 }

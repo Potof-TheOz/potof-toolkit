@@ -8,10 +8,15 @@ import SwiftUI
 /// la mécanique d'affichage.
 struct NotificationSlot: View {
     @ObservedObject var bus: NotificationBus
+    /// Appelé à l'ouverture du popover (l'utilisateur consulte → on vide la pastille Dock).
+    var onReveal: () -> Void = {}
+    /// Appelé au clic sur une notification (focus de la session concernée).
+    var onSelect: (AppNotification) -> Void = { _ in }
     @State private var showing = false
 
     var body: some View {
         Button {
+            if !showing { onReveal() }
             showing.toggle()
         } label: {
             Image(systemName: bus.count > 0 ? "bell.badge.fill" : "bell")
@@ -36,6 +41,14 @@ struct NotificationSlot: View {
         .popover(isPresented: $showing, arrowEdge: .bottom) {
             popoverContent
                 .frame(width: 320)
+        }
+    }
+
+    private func color(for kind: AppNotification.Kind) -> Color {
+        switch kind {
+        case .finished: return .green
+        case .permission: return .blue
+        case .waiting: return .orange
         }
     }
 
@@ -72,7 +85,7 @@ struct NotificationSlot: View {
                         ForEach(bus.items) { note in
                             HStack(alignment: .top, spacing: 10) {
                                 Image(systemName: note.symbol)
-                                    .foregroundStyle(note.kind == .finished ? .green : .orange)
+                                    .foregroundStyle(color(for: note.kind))
                                     .accessibilityHidden(true)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(note.title).font(.system(size: 12, weight: .semibold))
@@ -82,6 +95,11 @@ struct NotificationSlot: View {
                             }
                             .padding(.horizontal, 12)
                             .padding(.vertical, 8)
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                onSelect(note)
+                                showing = false
+                            }
                             Divider()
                         }
                     }

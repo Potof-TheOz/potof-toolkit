@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 
 /// Coquille de navigation du toolkit.
 ///
@@ -12,7 +13,11 @@ import SwiftUI
 /// notif interne (`NotificationSlot`, Phase 4).
 struct RootView: View {
     @State private var selection: Tool.ID? = ToolRegistry.all.first?.id
-    @StateObject private var notifications = NotificationBus()
+    /// Coordinateur des notifications Claude (possède le bus + le canal + le Dock).
+    /// `let` volontaire : la cloche observe `coordinator.bus` (via `NotificationSlot`),
+    /// le switch d'outil passe par `focusRequests` → pas besoin d'observer le
+    /// coordinateur lui-même.
+    private let coordinator = NotificationCenterCoordinator.shared
 
     private var selectedTool: Tool? {
         ToolRegistry.all.first { $0.id == selection }
@@ -25,6 +30,11 @@ struct RootView: View {
             detail
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        // Clic sur une notif (bannière ou cloche) → basculer sur l'outil concerné.
+        // RootView est le seul writer de `selection` (invariant : sélection = header).
+        .onReceive(coordinator.focusRequests) { req in
+            selection = req.toolID
+        }
     }
 
     // MARK: - Header
@@ -33,7 +43,11 @@ struct RootView: View {
         HStack(spacing: 12) {
             toolSwitcher
             Spacer(minLength: 0)
-            NotificationSlot(bus: notifications)
+            NotificationSlot(
+                bus: coordinator.bus,
+                onReveal: { coordinator.markNotificationsSeen() },
+                onSelect: { coordinator.handleClick(sessionID: $0.sessionID) }
+            )
         }
         .padding(.horizontal, 14)
         .frame(height: 44)

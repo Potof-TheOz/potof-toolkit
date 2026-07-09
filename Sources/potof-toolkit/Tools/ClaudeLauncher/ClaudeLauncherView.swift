@@ -9,6 +9,10 @@ import AppKit
 /// - **Centre** : le **terminal embarqué** de la session active (`claude` tourne
 ///   dans un PTY possédé par l'app). Fermer une session tue son process.
 struct ClaudeLauncherView: View {
+    /// Source unique de l'id de l'outil (réutilisée par `ToolRegistry` et par
+    /// l'enregistrement auprès du coordinateur de notifications).
+    static let toolID: Tool.ID = "claude-launcher"
+
     @AppStorage("rootPath") private var rootPath: String = ""
     @StateObject private var favorites = FavoritesStore()
     @StateObject private var sessions = SessionStore()
@@ -36,6 +40,12 @@ struct ClaudeLauncherView: View {
         }
         .frame(minWidth: sidebarVisible ? 760 : 460, minHeight: 480)
         .onAppear(perform: scan)
+        // Enregistre le store comme fournisseur de sessions pour le coordinateur de
+        // notifications (mapping sid→session, focus, anti-spam). L'id de l'outil est
+        // connu ici, pas dans SessionStore. Idempotent (dédup par identité).
+        .onAppear {
+            NotificationCenterCoordinator.shared.registerSessionProvider(sessions, toolID: Self.toolID)
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             scan()
         }
