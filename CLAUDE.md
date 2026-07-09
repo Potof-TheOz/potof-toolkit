@@ -3,7 +3,9 @@
 App macOS native (SwiftUI + AppKit) servant de **toolkit d'outils de dev locaux**.
 100 % local : aucun réseau, aucun compte, aucune télémétrie. Premier (et seul) outil
 à ce jour : **Claude Launcher** — liste les sous-dossiers d'un dossier racine et lance
-`claude` dans iTerm2 au clic. **Zéro dépendance tierce.**
+`claude` dans iTerm2 au clic. Il repère aussi les **sessions déjà ouvertes** dans iTerm2
+et permet d'y revenir en un clic (voir `docs/SESSIONS-OUVERTES.md`). **Zéro dépendance
+tierce.**
 
 > Le dépôt s'appelle encore `claude-launcher/` (dossier historique) mais le produit,
 > l'exécutable et l'app sont **`potof-toolkit`**.
@@ -35,10 +37,11 @@ Core/
   ToolRegistry.swift          ⭐ Registre central = POINT D'EXTENSION UNIQUE
 Tools/
   ClaudeLauncher/             Premier outil
-    ClaudeLauncherView.swift  UI : dossier racine, recherche, cartes, favoris
+    ClaudeLauncherView.swift  UI : dossier racine, recherche, cartes, favoris, sessions ouvertes
     FavoritesStore.swift      Favoris (chemins absolus, UserDefaults)
-    FolderItem.swift          Modèle (name + url)
-    ITermLauncher.swift       Lancement iTerm2 via AppleScript
+    FolderItem.swift          Modèle dossier (name + url)
+    ITermSession.swift        Modèle session iTerm2 (id + path + name), dérivé live
+    ITermLauncher.swift       iTerm2 via AppleScript : lancer / lister / refocaliser une session
 Resources/AppIcon.png         Icône 1024×1024 (→ Bundle.module en dev, → .icns en bundle)
 ```
 `Scripts/build-app.sh` : packaging en `.app` (voir LIFECYCLE).
@@ -71,6 +74,14 @@ Rien d'autre à câbler : la barre latérale, la sélection et le routage sont a
   Ne pas simplifier.
 - **Persistance** : `@AppStorage("rootPath")` et `UserDefaults` clé `claudeLauncher.favorites`.
   Stockage par domaine = bundle id → voir LIFECYCLE (dev et app bundlée = 2 stores).
-- **Icône** : `applyDockIcon()` pose `NSApp.applicationIconImage` via `Bundle.module`
-  (indispensable en `swift run`, non bundlé) ; l'app bundlée obtient aussi l'icône via
-  le `.icns` déclaré dans l'`Info.plist`.
+- **Sessions ouvertes = état live, jamais persisté** : dérivées d'iTerm2 à chaque
+  rafraîchissement (`ITermLauncher.listSessions`), rapprochées des dossiers par chemin
+  **exact**. `listSessions` ne doit **jamais** `activate` ni démarrer iTerm2 (garde
+  « iTerm déjà lancé »). Détails → `docs/SESSIONS-OUVERTES.md`.
+- **Icône / `Bundle.module`** : `applyDockIcon()` pose l'icône du Dock via `Bundle.module`
+  **uniquement en dev** (`swift run`, exécutable nu). En app bundlée (`.app`) il fait
+  **l'impasse** (`guard Bundle.main.bundleURL.pathExtension != "app"`) : l'accessor SwiftPM
+  résout le resource bundle à la **racine du `.app`** (hors structure signable, donc
+  absent) et déclencherait un `fatalError` au démarrage. L'app bundlée tire son icône du
+  `.icns` (Info.plist). ⚠️ Ne pas rappeler `Bundle.module` depuis un contexte bundlé, et
+  garder le resource bundle dans `Contents/Resources/` (signable) dans `build-app.sh`.

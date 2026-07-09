@@ -30,7 +30,10 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # 1. Exécutable
 cp "$BIN_PATH/$EXE_NAME" "$APP/Contents/MacOS/$EXE_NAME"
 
-# 2. Resource bundle(s) SPM (pour Bundle.module au runtime)
+# 2. Resource bundle(s) SPM, emplacement standard signable (Contents/Resources/).
+#    NB : l'app bundlée n'utilise PAS Bundle.module (AppDelegate.applyDockIcon en
+#    fait l'impasse en mode .app, l'icône venant du .icns) — cf. l'accessor SwiftPM
+#    qui, lui, chercherait le bundle à la racine du .app, hors structure signable.
 for b in "$BIN_PATH"/*.bundle; do
     [ -e "$b" ] && cp -R "$b" "$APP/Contents/Resources/"
 done

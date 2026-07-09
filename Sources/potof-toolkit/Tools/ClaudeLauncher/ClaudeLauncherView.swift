@@ -9,6 +9,8 @@ struct ClaudeLauncherView: View {
     @StateObject private var favorites = FavoritesStore()
     @State private var subfolders: [FolderItem] = []
     @State private var searchText: String = ""
+    /// Sessions iTerm2 ouvertes, rafraîchies en direct (jamais persistées).
+    @State private var openSessions: [ITermSession] = []
 
     // MARK: - Données dérivées
 
@@ -33,9 +35,43 @@ struct ClaudeLauncherView: View {
     private var filteredFavorites: [FolderItem] { filter(favoriteItems) }
     private var filteredAll: [FolderItem] { filter(subfolders) }
 
+    /// Chemin normalisé (liens symboliques résolus, sans slash final) pour comparer
+    /// le cwd d'une session au chemin d'un dossier de façon fiable.
+    private func normalizedPath(_ path: String) -> String {
+        URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
+    /// Index des dossiers listés (favoris + sous-dossiers) par chemin normalisé.
+    private var folderByNormalizedPath: [String: FolderItem] {
+        var map: [String: FolderItem] = [:]
+        for item in favoriteItems + subfolders {
+            map[normalizedPath(item.url.path)] = item
+        }
+        return map
+    }
+
+    /// Sessions iTerm2 dont le cwd correspond exactement à un dossier listé.
+    private var matchedSessions: [(session: ITermSession, folder: FolderItem)] {
+        let map = folderByNormalizedPath
+        return openSessions.compactMap { session in
+            guard let folder = map[normalizedPath(session.path)] else { return nil }
+            return (session, folder)
+        }
+    }
+
+    private var filteredSessions: [(session: ITermSession, folder: FolderItem)] {
+        guard !searchText.isEmpty else { return matchedSessions }
+        return matchedSessions.filter { $0.folder.name.localizedCaseInsensitiveContains(searchText) }
+    }
+
+    /// Chemins (tels qu'affichés) des dossiers ayant au moins une session ouverte.
+    private var openSessionPaths: Set<String> {
+        Set(matchedSessions.map { $0.folder.url.path })
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            TopBar(rootPath: rootPath, onChange: chooseFolder, onRefresh: scan)
+            TopBar(rootPath: rootPath, onChange: chooseFolder, onRefresh: refreshAll)
             Divider()
             Group {
                 if rootPath.isEmpty {
@@ -47,9 +83,9 @@ struct ClaudeLauncherView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: 480, minHeight: 420)
-        .onAppear(perform: scan)
+        .onAppear(perform: refreshAll)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            scan()
+            refreshAll()
         }
     }
 
@@ -73,6 +109,9 @@ struct ClaudeLauncherView: View {
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 24) {
+                        if !filteredSessions.isEmpty {
+                            sessionSection(items: filteredSessions)
+                        }
                         if !filteredFavorites.isEmpty {
                             folderSection(
                                 title: "Favoris",
@@ -157,8 +196,37 @@ struct ClaudeLauncherView: View {
                     FolderCard(
                         item: item,
                         isFavorite: favorites.isFavorite(item.url.path),
+                        hasOpenSession: openSessionPaths.contains(item.url.path),
                         onOpen: { ITermLauncher.launch(at: item.url.path) },
                         onToggleFavorite: { favorites.toggle(item.url.path) }
+                    )
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func sessionSection(items: [(session: ITermSession, folder: FolderItem)]) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 6) {
+                Image(systemName: "terminal.fill")
+                    .foregroundStyle(.green)
+                Text("Sessions ouvertes")
+                    .font(.headline)
+                Text("\(items.count)")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: 150, maximum: 210), spacing: 16)],
+                spacing: 16
+            ) {
+                ForEach(items, id: \.session.id) { pair in
+                    SessionCard(
+                        session: pair.session,
+                        folder: pair.folder,
+                        onFocus: { ITermLauncher.focus(sessionId: pair.session.id) }
                     )
                 }
             }
@@ -209,6 +277,26 @@ struct ClaudeLauncherView: View {
             .map { FolderItem(name: $0.lastPathComponent, url: $0) }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
+
+    /// Rafraîchit à la fois la liste des dossiers et celle des sessions iTerm2.
+    private func refreshAll() {
+        scan()
+        refreshSessions()
+    }
+
+    /// Interroge iTerm2 hors du thread principal (aller-retour Apple Event) puis
+    /// réaffecte la liste sur le thread principal. File série pour éviter deux
+    /// exécutions AppleScript concurrentes (onAppear + didBecomeActive rapprochés).
+    private func refreshSessions() {
+        Self.sessionQueue.async {
+            let sessions = ITermLauncher.listSessions()
+            DispatchQueue.main.async {
+                openSessions = sessions
+            }
+        }
+    }
+
+    private static let sessionQueue = DispatchQueue(label: "com.potof.iterm-sessions", qos: .userInitiated)
 
     private func chooseFolder() {
         let panel = NSOpenPanel()
@@ -310,6 +398,7 @@ private struct EmptyStateView: View {
 private struct FolderCard: View {
     let item: FolderItem
     let isFavorite: Bool
+    let hasOpenSession: Bool
     let onOpen: () -> Void
     let onToggleFavorite: () -> Void
     @State private var hovering = false
@@ -346,8 +435,56 @@ private struct FolderCard: View {
                 .help(isFavorite ? "Retirer des favoris" : "Ajouter aux favoris")
             }
         }
+        .overlay(alignment: .topLeading) {
+            if hasOpenSession {
+                Circle()
+                    .fill(Color.green)
+                    .frame(width: 9, height: 9)
+                    .overlay(Circle().strokeBorder(.background, lineWidth: 1.5))
+                    .padding(10)
+                    .help("Session Claude ouverte dans iTerm2")
+            }
+        }
         .onHover { hovering = $0 }
         .help(item.url.path)
+    }
+}
+
+// MARK: - Carte de session ouverte
+
+private struct SessionCard: View {
+    let session: ITermSession
+    let folder: FolderItem
+    let onFocus: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: onFocus) {
+            VStack(spacing: 8) {
+                Image(systemName: "terminal.fill")
+                    .font(.system(size: 32))
+                    .foregroundStyle(.green)
+                Text(folder.name)
+                    .font(.system(size: 13, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .foregroundStyle(.primary)
+                if !session.name.isEmpty {
+                    Text(session.name)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 120)
+            .padding(.horizontal, 10)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(CardButtonStyle(hovering: hovering))
+        .onHover { hovering = $0 }
+        .help("Aller à l'onglet iTerm2 — \(session.name.isEmpty ? folder.name : session.name)")
     }
 }
 

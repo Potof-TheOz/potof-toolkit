@@ -33,8 +33,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
-    /// Icône du Dock (exécutable non bundlé → on la définit au runtime).
+    /// Icône du Dock.
+    /// - App bundlée (`.app`) : l'icône provient déjà du `.icns` (Info.plist). On
+    ///   n'accède PAS à `Bundle.module` : l'accessor SwiftPM cherche le resource
+    ///   bundle à la racine du `.app` (hors structure signable, donc absent) et
+    ///   déclencherait un `fatalError` au démarrage.
+    /// - Dev (`swift run`, exécutable nu) : on charge `AppIcon.png` depuis le
+    ///   resource bundle SPM via `Bundle.module`.
     private func applyDockIcon() {
+        guard Bundle.main.bundleURL.pathExtension != "app" else { return }
         if let url = Bundle.module.url(forResource: "AppIcon", withExtension: "png"),
            let icon = NSImage(contentsOf: url) {
             NSApp.applicationIconImage = icon

@@ -140,8 +140,20 @@ mdfind -name "Potof Toolkit" | grep '\.app$'
   (Diagnostic possible : `nm -a …/pm/ManifestAPI/libPackageDescription.dylib | grep 7PackageC`
   doit renvoyer des symboles ; 0 = dylib corrompue.)
 
+- **L'app bundlée crashe au démarrage : `Fatal error: could not load resource bundle`**
+  → `Bundle.module` ne trouve pas le resource bundle SPM. L'accessor généré par SwiftPM le
+  cherche à `Bundle.main.bundleURL` (**racine du `.app`**, hors `Contents/`) puis, en repli,
+  à un **chemin de build absolu figé** à la compilation. En bundle, le premier n'existe pas
+  (on ne met rien à la racine, sinon `codesign` refuse : *unsealed contents present in the
+  bundle root*) et le repli casse dès que le dépôt/`.build` bouge. **Correctif en place** :
+  `applyDockIcon()` **n'appelle `Bundle.module` qu'en dev** (`guard bundleURL.pathExtension
+  != "app"`) — l'app bundlée tire son icône du `.icns`. Ne pas réintroduire d'accès
+  `Bundle.module` sur un chemin bundlé.
+
 - **La fenêtre n'apparaît pas / ne prend pas le focus** → vérifier
   `setActivationPolicy(.regular)` + `activate(ignoringOtherApps: true)` dans `AppDelegate`.
+  NB : en environnement multi-Spaces, la fenêtre peut s'ouvrir sur un **bureau (Space) non
+  affiché** — l'app tourne bien (`pgrep -x potof-toolkit`), il suffit de Cmd-Tab dessus.
 
 - **Rien ne se passe au clic sur un dossier** → permission Automation refusée (voir §4),
   ou iTerm2 non installé (`/Applications/iTerm.app`).
