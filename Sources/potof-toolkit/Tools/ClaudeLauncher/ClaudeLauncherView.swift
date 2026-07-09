@@ -20,6 +20,9 @@ struct ClaudeLauncherView: View {
     @State private var subfolders: [FolderItem] = []
     @State private var searchText: String = ""
     @State private var scope: FolderScope = .all
+    /// Garde-fou : n'appliquer l'onglet par défaut (Favoris) qu'une fois, sans écraser
+    /// un choix manuel ultérieur de l'utilisateur.
+    @State private var didApplyDefaultScope = false
     /// Visibilité de la sidebar, mémorisée entre les lancements.
     @AppStorage("claudeLauncher.sidebarVisible") private var sidebarVisible: Bool = true
 
@@ -40,6 +43,14 @@ struct ClaudeLauncherView: View {
         }
         .frame(minWidth: sidebarVisible ? 760 : 460, minHeight: 480)
         .onAppear(perform: scan)
+        // Ouvre sur l'onglet Favoris s'il existe au moins un favori (dossier encore
+        // présent). Une seule fois, pour ne pas écraser un basculement manuel.
+        .onAppear {
+            if !didApplyDefaultScope {
+                didApplyDefaultScope = true
+                if !favoriteItems.isEmpty { scope = .favorites }
+            }
+        }
         // Enregistre le store comme fournisseur de sessions pour le coordinateur de
         // notifications (mapping sid→session, focus, anti-spam). L'id de l'outil est
         // connu ici, pas dans SessionStore. Idempotent (dédup par identité).
