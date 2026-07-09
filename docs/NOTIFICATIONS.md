@@ -54,6 +54,24 @@ if (potofSid) {
 
 `appendFileSync` (`O_APPEND`) → chaque ligne JSON est écrite atomiquement. `ts` en **ms**.
 
+### Source de vérité & (ré)installation
+
+Le hook est un fichier **global** (`~/.claude/hooks/claude-notify.js`) qui notifie **toutes**
+tes sessions Claude, y compris hors Potof Toolkit (iTerm2 → `terminal-notifier`). Il n'est
+donc **pas** à sa place canonique dans le repo, mais on en garde une **copie versionnée**
+(`hooks/claude-notify.js`) pour ne pas le perdre et pouvoir le réinstaller ailleurs.
+
+Pour (ré)installer sur cette machine ou un autre poste :
+
+```bash
+./Scripts/install-hook.sh
+```
+
+Le script copie `hooks/claude-notify.js` → `~/.claude/hooks/`, le rend exécutable, et câble
+(idempotent, avec backup) les events `Notification` + `Stop` dans `~/.claude/settings.json`.
+⚠️ Après toute modif du hook, mettre à jour la copie du repo (`cp ~/.claude/hooks/claude-notify.js
+hooks/claude-notify.js`) — le repo reste la source de vérité.
+
 ## Côté app — les fichiers
 
 | Fichier | Rôle |

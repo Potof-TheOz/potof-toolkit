@@ -16,6 +16,7 @@ swift build                            # compiler
 swift run                              # lancer en dev (fenêtre au premier plan)
 ./Scripts/build-app.sh                 # packager + installer "Potof Toolkit.app" dans ~/Applications
 ./Scripts/build-app.sh /Applications   # variante (droits admin requis)
+./Scripts/install-hook.sh              # (ré)installer le hook de notifs Claude (voir docs/NOTIFICATIONS.md)
 ```
 Détails deploy / debug / données / permissions → **`docs/LIFECYCLE.md`**.
 
