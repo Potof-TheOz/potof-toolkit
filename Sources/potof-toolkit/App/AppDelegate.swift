@@ -15,6 +15,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         applyDockIcon()
         setupMainMenu()
 
+        // Pont IDE : log vierge + nettoyage des locks orphelins (crash précédent).
+        IDELog.startSession()
+        IDEServer.sweepStaleLocks()
+
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1040, height: 680),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],

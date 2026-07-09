@@ -10,6 +10,9 @@ import Combine
 final class SessionStore: ObservableObject {
     @Published private(set) var sessions: [Session] = []
     @Published var activeID: UUID?
+    /// Aperçus de diff en attente de décision, par session (intégration IDE).
+    /// L'UI en affiche un overlay au-dessus du terminal de la session active.
+    @Published private(set) var pendingDiffs: [UUID: DiffPresentation] = [:]
 
     let terminal = TerminalController.shared
 
@@ -19,6 +22,16 @@ final class SessionStore: ObservableObject {
         }
         terminal.onProcessExit = { [weak self] id, code in
             self?.handleExit(id, code)
+        }
+        // Intégration IDE : Claude propose un diff / ferme un onglet de diff.
+        terminal.onOpenDiff = { [weak self] id, req, done in
+            self?.presentDiff(id, req, done)
+        }
+        terminal.onCloseTab = { [weak self] id, tab in
+            self?.dismissDiff(id, matchingTab: tab)
+        }
+        terminal.onCloseAllTabs = { [weak self] id in
+            self?.dismissDiff(id, matchingTab: nil)
         }
     }
 
@@ -49,9 +62,82 @@ final class SessionStore: ObservableObject {
 
     func focus(_ id: UUID) { activeID = id }
 
+    // MARK: - Aperçu de diff (intégration IDE, cf. docs/IDE_BRIDGE.md)
+
+    /// Claude propose une modification (`openDiff`, bloquant côté CLI) : on calcule
+    /// le diff vs le disque, on le met en attente et on bascule sur la session
+    /// concernée pour le rendre visible. L'app **n'écrit rien** : c'est le verdict
+    /// (`resolveDiff`) qui, si accepté, laisse Claude écrire.
+    private func presentDiff(_ id: UUID, _ request: IDEDiffRequest,
+                             _ complete: @escaping (IDEDiffVerdict) -> Void) {
+        // Session déjà fermée entre-temps → refuse, sinon Claude resterait bloqué.
+        guard containsSession(id) else { complete(.rejected); return }
+        // Un aperçu déjà en attente (ne devrait pas arriver : les openDiff sont
+        // sérialisés) → on le refuse avant de le remplacer, pas de complétion perdue.
+        if let stale = pendingDiffs[id] { stale.complete(.rejected) }
+        let diff = DiffComputer.compute(oldPath: request.oldPath, newContent: request.newContents)
+        pendingDiffs[id] = DiffPresentation(sessionID: id, request: request, diff: diff, complete: complete)
+        IDELog.log("présente diff (+\(diff.addedCount)/−\(diff.removedCount)) : \(request.tabName)")
+        focus(id)
+    }
+
+    /// Décision de l'utilisateur (clic Accepter/Refuser dans le panneau).
+    ///
+    /// Subtilité clé (cf. docs/IDE_BRIDGE.md) : `openDiff` n'est qu'un **aperçu**.
+    /// En mode permission par défaut, Claude affiche APRÈS un prompt terminal
+    /// « Do you want to make this edit? 1. Yes / 3. No ». C'est LUI la vraie porte.
+    /// Donc : Refuser → `DIFF_REJECTED` (Claude abandonne, aucun prompt) ; Accepter →
+    /// `FILE_SAVED` puis on répond « Yes » à ce prompt (`confirmEditInTerminal`).
+    func resolveDiff(_ id: UUID, _ verdict: IDEDiffVerdict) {
+        guard let pres = pendingDiffs[id] else { return }
+        pendingDiffs[id] = nil          // ferme le panneau ; `remove` ne re-votera pas
+        IDELog.log("verdict utilisateur : \(verdict.rawValue)")
+        pres.complete(verdict)
+        if verdict == .saved { confirmEditInTerminal(id, attempt: 0) }
+    }
+
+    /// Répond « Yes » (Entrée) au prompt de permission terminal qui suit `FILE_SAVED`.
+    /// On **détecte** l'apparition du prompt dans le buffer rendu (robuste au timing :
+    /// il apparaît généralement en < 1 s, mais on tolère un délai) ; en dernier
+    /// recours (~6 s) on envoie quand même Entrée (le prompt est alors forcément là).
+    private func confirmEditInTerminal(_ id: UUID, attempt: Int) {
+        guard containsSession(id) else { return }
+        let screen = terminal.screenText(id: id)
+        let promptUp = screen.contains("Do you want")
+            || screen.contains("make this edit")
+            || screen.contains("1. Yes")
+        if promptUp {
+            terminal.sendKeys(id: id, "\r")   // « ❯ 1. Yes » est le défaut → Entrée = Yes
+            IDELog.log("prompt de permission détecté → Entrée (Yes)")
+            return
+        }
+        guard attempt < 40 else {             // ~6 s : dernier recours (best effort)
+            terminal.sendKeys(id: id, "\r")
+            IDELog.log("prompt non détecté après délai → Entrée (best effort)")
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.confirmEditInTerminal(id, attempt: attempt + 1)
+        }
+    }
+
+    /// Claude a fermé l'onglet (annulation, ex. Ctrl-C) alors que l'aperçu était
+    /// encore ouvert → on le retire en refusant. `matchingTab == nil` ⇒ tout fermer.
+    private func dismissDiff(_ id: UUID, matchingTab tab: String?) {
+        guard let pres = pendingDiffs[id] else { return }
+        if let tab, pres.request.tabName != tab { return }
+        pendingDiffs[id] = nil
+        pres.complete(.rejected)
+    }
+
     // MARK: - Privé
 
     private func remove(_ id: UUID) {
+        // Session fermée avec un diff en attente → on refuse (libère le CLI).
+        if let pres = pendingDiffs[id] {
+            pendingDiffs[id] = nil
+            pres.complete(.rejected)
+        }
         sessions.removeAll { $0.id == id }
         if activeID == id { activeID = sessions.last?.id }
     }
@@ -72,6 +158,19 @@ final class SessionStore: ObservableObject {
     static func normalized(_ path: String) -> String {
         URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
     }
+}
+
+// MARK: - Aperçu de diff en attente
+
+/// Un `openDiff` en attente de décision, pour une session. Porte la complétion à
+/// rappeler avec le verdict (renvoyé au CLI Claude via le pont IDE). Le `diff` est
+/// pré-calculé à la réception ; la vue ne fait que l'afficher.
+struct DiffPresentation: Identifiable {
+    let id = UUID()
+    let sessionID: UUID
+    let request: IDEDiffRequest
+    let diff: FileDiff
+    let complete: (IDEDiffVerdict) -> Void
 }
 
 // MARK: - Fournisseur de sessions pour les notifications

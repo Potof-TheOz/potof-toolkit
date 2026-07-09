@@ -236,8 +236,25 @@ struct ClaudeLauncherView: View {
             VStack(spacing: 0) {
                 sessionBar(session)
                 Divider()
-                TerminalHostView(controller: sessions.terminal, sessionID: session.id)
+                // Aperçu d'un diff proposé par Claude (openDiff) pour CETTE session.
+                // On affiche le panneau **à la place** du terminal (pas en overlay) :
+                // le terminal est un NSView (SwiftTerm) qui capterait les clics d'un
+                // overlay SwiftUI posé au-dessus (fall-through du hit-test) → les
+                // boutons paraîtraient morts. Le NSView reste vivant dans le
+                // contrôleur (process + scrollback préservés) et revient au verdict.
+                // Accepter → Claude écrit ; Refuser → fichier inchangé. Cf. IDE_BRIDGE.
+                if let pres = sessions.pendingDiffs[session.id] {
+                    DiffOverlayView(
+                        request: pres.request,
+                        diff: pres.diff,
+                        onAccept: { sessions.resolveDiff(session.id, .saved) },
+                        onReject: { sessions.resolveDiff(session.id, .rejected) }
+                    )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    TerminalHostView(controller: sessions.terminal, sessionID: session.id)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             }
         } else {
             centerEmptyState

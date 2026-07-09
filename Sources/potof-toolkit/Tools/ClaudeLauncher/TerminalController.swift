@@ -21,13 +21,34 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     private var views: [UUID: LocalProcessTerminalView] = [:]
     /// id de session par vue (retrouver la session dans les callbacks delegate).
     private var idByView: [ObjectIdentifier: UUID] = [:]
+    /// Serveur d'intégration IDE par session (aperçu des diffs Claude). Cf.
+    /// `docs/IDE_BRIDGE.md`. Cycle de vie collé à celui du process.
+    private var ideServers: [UUID: IDEServer] = [:]
 
     /// Relais vers le store (appelés sur le thread principal).
     var onTitleChange: ((UUID, String) -> Void)?
     var onProcessExit: ((UUID, Int32?) -> Void)?
+    /// Intégration IDE : Claude demande un aperçu de diff (openDiff) dans une session.
+    /// La complétion renvoie le verdict au CLI. Ferme d'onglet(s) = annulation Claude.
+    var onOpenDiff: ((UUID, IDEDiffRequest, @escaping (IDEDiffVerdict) -> Void) -> Void)?
+    var onCloseTab: ((UUID, String) -> Void)?
+    var onCloseAllTabs: ((UUID) -> Void)?
 
     /// Vue terminal d'une session (nil si aucune / déjà libérée).
     func view(for id: UUID) -> LocalProcessTerminalView? { views[id] }
+
+    /// Écrit des octets bruts dans le PTY d'une session (ex. répondre `Entrée` à un
+    /// prompt de permission). No-op si la session n'existe pas.
+    func sendKeys(id: UUID, _ text: String) {
+        views[id]?.send(txt: text)
+    }
+
+    /// Texte **rendu** de l'écran actif du terminal (buffer alterné de la TUI Claude).
+    /// Sert à détecter un prompt de permission avant d'y répondre. Vide si absent.
+    func screenText(id: UUID) -> String {
+        guard let term = views[id] else { return "" }
+        return String(data: term.getTerminal().getBufferAsData(kind: .active), encoding: .utf8) ?? ""
+    }
 
     /// Nombre de sessions dont le process (shell + éventuel `claude`) tourne encore.
     /// Utilisé par la confirmation de fermeture de l'app.
@@ -62,6 +83,21 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
         var env = Terminal.getEnvironmentVariables(termName: "xterm-256color", trueColor: true)
         env.append("POTOF_SESSION_ID=\(id.uuidString)")   // ancrage notif (Phase 4)
 
+        // Intégration IDE : un serveur MCP par session. On l'ouvre AVANT le spawn
+        // pour injecter `CLAUDE_CODE_SSE_PORT`/`ENABLE_IDE_INTEGRATION` dans l'env →
+        // `claude` route alors ses éditions vers l'app via `openDiff` (aperçu +
+        // accepter/refuser) au lieu d'écrire directement. L'env prime sur le scan
+        // des locks, donc gagne sur un WebStorm ouvert. Voir docs/IDE_BRIDGE.md.
+        let ide = IDEServer(sessionID: id, workspace: folder)
+        if ide.isAvailable {
+            ide.onOpenDiff = { [weak self] req, done in self?.onOpenDiff?(id, req, done) }
+            ide.onCloseTab = { [weak self] tab in self?.onCloseTab?(id, tab) }
+            ide.onCloseAllTabs = { [weak self] in self?.onCloseAllTabs?(id) }
+            ide.start()
+            env.append(contentsOf: ide.environment)
+            ideServers[id] = ide
+        }
+
         term.startProcess(
             executable: Self.userShell(),
             args: ["-l", "-i"],
@@ -81,6 +117,8 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     /// Termine le process d'une session (fermeture **volontaire**) et libère sa vue.
     /// On coupe le delegate d'abord pour ne pas déclencher `onProcessExit`.
     func terminate(id: UUID) {
+        ideServers[id]?.stop()          // ferme le serveur IDE + supprime son lock
+        ideServers[id] = nil
         guard let term = views[id] else { return }
         term.processDelegate = nil
         term.terminate()

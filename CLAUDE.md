@@ -54,6 +54,12 @@ Tools/
     TerminalHostView.swift    NSViewRepresentable : affiche la session active (vues gardées vivantes)
     FavoritesStore.swift      Favoris (chemins absolus, UserDefaults)
     FolderItem.swift          Modèle dossier (name + url)
+    IDE/                      Pont IDE : aperçu des diffs Claude → docs/IDE_BRIDGE.md
+      IDEBridge.swift         Types (IDEDiffRequest/Verdict, IDEDiffHandlers) + logger IDELog
+      IDEServer.swift         Serveur MCP WebSocket + lock file ~/.claude/ide (1 par session)
+      IDEConnection.swift     Handshake WebSocket + framing RFC 6455 + JSON-RPC/MCP (openDiff)
+      DiffModel.swift         Diff ligne-à-ligne (rognage préfixe/suffixe + LCS + garde-fou)
+      DiffOverlayView.swift   Panneau SwiftUI : diff unifié + Accepter/Refuser
 Resources/AppIcon.png         Icône 1024×1024 (→ Bundle.module en dev, → .icns en bundle)
 ```
 `Scripts/build-app.sh` : packaging en `.app` (voir LIFECYCLE). Détails du modèle de
@@ -113,3 +119,15 @@ sont automatiques. L'outil occupe tout le cadre sous le header et gère sa propr
   absent) et déclencherait un `fatalError` au démarrage. L'app bundlée tire son icône du
   `.icns` (Info.plist). ⚠️ Ne pas rappeler `Bundle.module` depuis un contexte bundlé, et
   garder le resource bundle dans `Contents/Resources/` (signable) dans `build-app.sh`.
+- **Pont IDE = aperçu des diffs, PAS l'écriture** (détails → `docs/IDE_BRIDGE.md`).
+  `TerminalController` ouvre un serveur MCP WebSocket par session et injecte
+  `CLAUDE_CODE_SSE_PORT` + `ENABLE_IDE_INTEGRATION` → `claude` route ses éditions via
+  l'outil `openDiff`. **Contrat non-officiel, vérifié empiriquement** (framing WebSocket
+  fait main via `Network.framework` — pas de dépendance ajoutée). Deux pièges à retenir :
+  (1) `openDiff` n'est qu'un **aperçu** ; en mode permission par défaut l'approbation
+  réelle est un **prompt de permission dans le terminal** → « Accepter » renvoie
+  `FILE_SAVED` **puis** répond « Yes » au prompt (`SessionStore.confirmEditInTerminal`).
+  (2) **Ne PAS lancer `claude` en `--permission-mode acceptEdits`** (Claude n'appelle
+  alors plus `openDiff` → plus d'aperçu). Le panneau **remplace** le terminal (pas un
+  overlay : au-dessus du `NSView` SwiftTerm, un overlay SwiftUI ne capte pas les clics).
+  L'app **n'écrit jamais** sur disque. `POTOF_SESSION_ID` reste la clé notifs, distincte.
