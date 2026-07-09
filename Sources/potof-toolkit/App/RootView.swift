@@ -2,13 +2,17 @@ import SwiftUI
 
 /// Coquille de navigation du toolkit.
 ///
-/// Disposition custom (plutôt que NavigationSplitView) : une barre supérieure
-/// fixe contenant le bouton de bascule de la barre latérale — sa position ne
-/// dépend donc pas de l'état ouvert/fermé et il ne « saute » jamais. En dessous :
-/// barre latérale (liste des outils) + panneau de détail.
+/// Plus de barre latérale au niveau racine : la **sélection d'outil se fait dans
+/// le header** (bouton « Claude Launcher ▾ » ouvrant la liste des outils). En
+/// dessous, l'outil sélectionné occupe tout le cadre et gère sa propre chrome
+/// interne (sidebar, etc.).
+///
+/// Toujours PAS de `NavigationSplitView` (voir CLAUDE.md) : disposition manuelle,
+/// barre supérieure fixe. Le header réserve aussi la place de la future barre de
+/// notif interne (`NotificationSlot`, Phase 4).
 struct RootView: View {
     @State private var selection: Tool.ID? = ToolRegistry.all.first?.id
-    @State private var sidebarVisible = true
+    @StateObject private var notifications = NotificationBus()
 
     private var selectedTool: Tool? {
         ToolRegistry.all.first { $0.id == selection }
@@ -16,69 +20,60 @@ struct RootView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            toolbar
+            header
             Divider()
-            HStack(spacing: 0) {
-                if sidebarVisible {
-                    sidebar
-                        .frame(width: 244)
-                        .transition(.move(edge: .leading).combined(with: .opacity))
-                    Divider()
-                }
-                detail
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
+            detail
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
-    // MARK: - Barre supérieure (toggle fixe)
+    // MARK: - Header
 
-    private var toolbar: some View {
+    private var header: some View {
         HStack(spacing: 12) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.22)) { sidebarVisible.toggle() }
-            } label: {
-                Image(systemName: "sidebar.leading")
-                    .font(.system(size: 15, weight: .medium))
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Afficher ou masquer la barre latérale")
-
-            if let tool = selectedTool {
-                Divider().frame(height: 16)
-                Image(systemName: tool.icon)
-                    .foregroundStyle(.tint)
-                Text(tool.title)
-                    .font(.headline)
-            }
-
+            toolSwitcher
             Spacer(minLength: 0)
+            NotificationSlot(bus: notifications)
         }
         .padding(.horizontal, 14)
-        .frame(height: 42)
+        .frame(height: 44)
         .background(.bar)
     }
 
-    // MARK: - Barre latérale
-
-    private var sidebar: some View {
-        List(ToolRegistry.all, selection: $selection) { tool in
-            Label {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(tool.title)
-                    Text(tool.subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
+    /// Sélecteur d'outil : menu déroulant listant `ToolRegistry.all`.
+    private var toolSwitcher: some View {
+        Menu {
+            ForEach(ToolRegistry.all) { tool in
+                Button {
+                    selection = tool.id
+                } label: {
+                    Label(tool.title, systemImage: tool.icon)
                 }
-            } icon: {
-                Image(systemName: tool.icon)
-                    .foregroundStyle(.tint)
             }
-            .padding(.vertical, 4)
+        } label: {
+            HStack(spacing: 8) {
+                if let tool = selectedTool {
+                    Image(systemName: tool.icon)
+                        .foregroundStyle(.tint)
+                        .accessibilityHidden(true)
+                    Text(tool.title)
+                        .font(.headline)
+                } else {
+                    Text("Outils")
+                        .font(.headline)
+                }
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+            }
+            .contentShape(Rectangle())
         }
-        .listStyle(.sidebar)
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Changer d'outil")
+        .accessibilityLabel(selectedTool.map { "Outil : \($0.title). Changer d'outil" } ?? "Choisir un outil")
     }
 
     // MARK: - Détail
@@ -98,9 +93,10 @@ struct RootView: View {
             Image(systemName: "square.grid.2x2")
                 .font(.system(size: 48))
                 .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
             Text("Sélectionnez un outil")
                 .font(.title3.weight(.semibold))
-            Text("Choisissez un outil dans la barre latérale pour commencer.")
+            Text("Choisissez un outil dans le menu en haut à gauche.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }

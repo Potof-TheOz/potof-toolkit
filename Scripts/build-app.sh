@@ -67,8 +67,6 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>LSMinimumSystemVersion</key>    <string>13.0</string>
     <key>LSApplicationCategoryType</key> <string>public.app-category.developer-tools</string>
     <key>NSHighResolutionCapable</key>   <true/>
-    <key>NSAppleEventsUsageDescription</key>
-    <string>Potof Toolkit contrôle iTerm2 pour lancer Claude Code dans le dossier choisi.</string>
 </dict>
 </plist>
 PLIST

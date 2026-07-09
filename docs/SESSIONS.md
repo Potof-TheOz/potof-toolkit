@@ -1,0 +1,102 @@
+# Sessions Claude embarquées
+
+Cœur du **Claude Launcher** : l'app **héberge elle-même** les sessions `claude`
+dans un **terminal embarqué** (SwiftTerm), au lieu de piloter iTerm2 depuis
+l'extérieur. Chaque session est un process `claude` tournant dans un **PTY dont
+l'app est le parent**.
+
+> Remplace l'ancien modèle iTerm2 (AppleScript + sessions « dérivées en direct »).
+> Conséquence directe : **fermer une session = tuer son process** (l'app le possède).
+
+## Vue d'ensemble
+
+```
+ClaudeLauncherView (SwiftUI)
+   │  clic sur un dossier → SessionStore.launch(folder:)
+   ▼
+SessionStore (ObservableObject, source de vérité UI)
+   │  possède
+   ▼
+TerminalController (NSObject, délégué SwiftTerm)
+   │  possède [UUID: LocalProcessTerminalView]  (une vue/PTY par session)
+   ▼
+LocalProcessTerminalView (SwiftTerm)  ── PTY ──▶  $SHELL -l  ──▶  claude
+   ▲
+   │  affichée (jamais recréée) par
+TerminalHostView (NSViewRepresentable)
+```
+
+## Cycle de vie d'une session
+
+### Lancer — `SessionStore.launch(folder:)`
+1. Crée une `Session { id: UUID, folderURL, title, status: .running }` et l'ajoute
+   à `sessions` (publié → la sidebar s'actualise), puis l'active (`activeID`).
+2. `TerminalController.start(id:folder:)` crée un `LocalProcessTerminalView` et
+   lance **`$SHELL -l -i`** (login + interactif) via `startProcess`, avec :
+   - `currentDirectory` = le dossier,
+   - `environment` = les défauts SwiftTerm (`TERM=xterm-256color`,
+     `COLORTERM=truecolor`, `LANG`…) **+ `POTOF_SESSION_ID=<uuid>`** (ancrage notif,
+     cf. `NOTIFICATIONS.md`).
+3. Un shell **login + interactif** source les rc de l'utilisateur (`.zprofile`,
+   `.zshrc`, Homebrew, nvm…) → **PATH complet**, donc `claude` est résolu comme il
+   l'était dans iTerm2. Le `-i` explicite couvre les shells (ex. bash) qui ne
+   sourcent `.*rc` qu'en mode interactif.
+4. Après un court délai (~0,35 s, le temps que le shell s'initialise), on **écrit**
+   `cd '<dossier>' && claude⏎` dans le terminal — équivalent du `write text` d'iTerm2.
+
+### Afficher — `TerminalHostView`
+- N'affiche **jamais** deux fois la même vue et **ne recrée pas** les vues : elle
+  demande au `TerminalController` la vue de la session active et la place dans un
+  conteneur (contraintes plein cadre). Changer de session = échanger la sous-vue,
+  **sans perdre scrollback ni process**.
+- Donne le focus clavier au terminal affiché (`makeFirstResponder`).
+
+### Fermer — `SessionStore.close(id:)`
+- `TerminalController.terminate(id:)` **coupe d'abord le delegate** (pour ne pas
+  déclencher le chemin « exit spontané »), appelle `terminate()` (tue le process du
+  PTY) puis libère la vue. La session est retirée de `sessions` ; si c'était
+  l'active, on bascule sur la dernière restante.
+
+### Sortie spontanée (Claude quitte tout seul)
+- Le delegate `processTerminated` remonte `onProcessExit(id, code)` **sur le thread
+  principal** → `SessionStore.handleExit` libère la vue et retire la session.
+  Fidèle à l'esprit « pas de session fantôme » : la liste reflète les process vivants.
+
+## Invariants (à ne pas casser)
+
+- **Les `LocalProcessTerminalView` sont possédées par `TerminalController`**, une par
+  session, **conservées vivantes** tant que la session existe. `TerminalHostView` ne
+  fait que les *placer*. Les recréer perdrait le process et le scrollback.
+- **Toutes les mutations d'état** (`views`, `idByView`, `@Published sessions/activeID`)
+  se font **sur le thread principal**. Les callbacks du delegate SwiftTerm y sont
+  remarshalés (`DispatchQueue.main.async`) pour éviter les data races.
+- **Login shell interactif (`$SHELL -l -i`) obligatoire** pour hériter du PATH
+  utilisateur. Ne pas lancer `claude` en direct (le PATH par défaut de SwiftTerm
+  **exclut** `PATH`).
+- **Quitter l'app tue les process** des sessions (l'app en est le parent).
+  `AppDelegate.applicationShouldTerminate` **confirme** s'il reste des sessions
+  actives (⌘Q ou fermeture de fenêtre). Ne pas retirer ce garde-fou.
+- **`POTOF_SESSION_ID`** est injecté dans l'environnement de chaque session : c'est le
+  point d'ancrage du futur branchement des notifications (`NOTIFICATIONS.md`).
+- **App Sandbox désactivée** : requise pour qu'un sous-process lancé dans un PTY ait
+  accès au disque et aux commandes (cf. remarque SwiftTerm). Ne pas l'activer.
+
+## Fichiers
+
+| Fichier | Rôle |
+|---|---|
+| `Tools/ClaudeLauncher/Session.swift` | Modèle `{ id, folderURL, title, status }` |
+| `Tools/ClaudeLauncher/SessionStore.swift` | Source de vérité UI : `launch` / `close` / `focus` |
+| `Tools/ClaudeLauncher/TerminalController.swift` | Possède les vues/PTY, spawn/kill, délégué SwiftTerm |
+| `Tools/ClaudeLauncher/TerminalHostView.swift` | `NSViewRepresentable` : affiche la session active |
+| `Tools/ClaudeLauncher/ClaudeLauncherView.swift` | UI : sidebar (sessions + dossiers/favoris) + terminal central |
+
+## Limites connues
+
+- Le PATH dépend du sourcing des rc par `$SHELL -l -i`. Une config qui ne pose le
+  PATH ni en login ni en interactif (rare) empêcherait de résoudre `claude`.
+- Le délai fixe (~0,35 s) avant l'auto-`cd && claude` est empirique. Si la commande
+  s'écrit trop tôt sur des machines lentes (rc lourds : nvm, conda…), l'augmenter
+  dans `TerminalController`.
+- Le rendu dépend des capacités de SwiftTerm (alt-screen, couleurs vraies, resize) —
+  validé avec la TUI plein écran de Claude.

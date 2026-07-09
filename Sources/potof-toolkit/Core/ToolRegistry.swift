@@ -9,7 +9,7 @@ enum ToolRegistry {
         Tool(
             id: "claude-launcher",
             title: "Claude Launcher",
-            subtitle: "Lancer Claude Code dans un dossier via iTerm2",
+            subtitle: "Lancer Claude Code dans un terminal embarqué",
             icon: "terminal.fill",
             view: { ClaudeLauncherView() }
         )

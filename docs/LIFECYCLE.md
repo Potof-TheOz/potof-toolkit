@@ -21,6 +21,10 @@ swift run            # compiler + lancer (produit unique, pas besoin du nom)
 - La fenêtre apparaît **au premier plan** (via `setActivationPolicy(.regular)` + `activate`).
 - ⚠️ En `swift run`, l'exécutable est **nu** (dans `.build/…/debug/`) : **pas une `.app`**
   → invisible dans Spotlight, l'icône du Dock est posée au runtime via `Bundle.module`.
+- ⚠️ **Infobulles (`.help`) absentes en `swift run`** : le panneau de tooltip macOS est
+  supprimé pour un exécutable nu (non enregistré Launch Services). Elles s'affichent
+  normalement en **app bundlée**. Le délai d'apparition est réglé à **512 ms** via
+  `NSInitialToolTipDelay` (registré dans `AppDelegate`) — défaut macOS (~2 s) trop long.
 - Domaine UserDefaults en dev : **`potof-toolkit`** (dérivé du nom de process).
 
 Astuce : pour tuer une instance lancée en arrière-plan →
@@ -48,7 +52,11 @@ Le script enchaîne :
 Après ça : **Cmd+Espace → « Potof »**, ou `open -a "Potof Toolkit"`.
 
 L'`Info.plist` porte notamment : `CFBundleIdentifier`, `CFBundleIconFile=AppIcon`,
-`LSMinimumSystemVersion=13.0`, et `NSAppleEventsUsageDescription` (voir §4).
+`LSMinimumSystemVersion=13.0`.
+
+> Dépendance : `swift build` récupère **SwiftTerm** (émulateur de terminal, MIT). SPM
+> le **link statiquement** dans l'exécutable → aucun framework à copier dans le bundle,
+> `build-app.sh` reste inchangé sur ce point.
 
 ---
 
@@ -82,14 +90,17 @@ defaults delete com.potof.potof-toolkit                 # tout réinitialiser
 
 ---
 
-## 4. Permissions — Automation / TCC (iTerm2)
+## 4. Permissions — sous-process & PTY (plus d'Automation)
 
-- L'app pilote iTerm2 via Apple Events. Au **1er clic** sur un dossier, macOS demande
-  *« Potof Toolkit souhaite contrôler iTerm »* → **Autoriser**.
-- Le message provient de `NSAppleEventsUsageDescription` (Info.plist).
-- ⚠️ La signature **ad-hoc** change d'empreinte (cdhash) à chaque build → macOS **peut**
-  redemander l'autorisation après un rebuild. C'est juste un clic, aucune donnée perdue.
-- Réinitialiser l'autorisation Automation :
+- L'app **n'utilise plus Apple Events / Automation** : elle ne pilote plus iTerm2.
+  `NSAppleEventsUsageDescription` a été retiré de l'`Info.plist`.
+- Elle lance `claude` dans un **PTY** via SwiftTerm (`LocalProcessTerminalView`). Pour
+  qu'un sous-process ait accès au disque et aux commandes, **l'App Sandbox doit rester
+  désactivée** (cf. CLAUDE.md, invariant). Aucune autorisation TCC particulière n'est
+  demandée pour ça.
+- Selon les dossiers ouverts, macOS **peut** demander l'accès à des zones protégées
+  (Bureau/Documents/Téléchargements) au premier accès — comportement standard, un clic.
+- Nettoyer d'anciennes autorisations Automation résiduelles (versions iTerm2 précédentes) :
   ```bash
   tccutil reset AppleEvents com.potof.potof-toolkit
   ```
@@ -114,7 +125,7 @@ defaults delete com.potof.potof-toolkit                 # tout réinitialiser
 # Processus en cours
 pgrep -fl potof-toolkit
 
-# Logs (NSLog, ex. erreurs iTerm dans ITermLauncher) — via unified logging
+# Logs (NSLog) — via unified logging
 log stream --predicate 'process == "potof-toolkit"' --level debug
 
 # Lancer la version bundlée depuis le terminal pour voir stdout/stderr directement
@@ -155,11 +166,17 @@ mdfind -name "Potof Toolkit" | grep '\.app$'
   NB : en environnement multi-Spaces, la fenêtre peut s'ouvrir sur un **bureau (Space) non
   affiché** — l'app tourne bien (`pgrep -x potof-toolkit`), il suffit de Cmd-Tab dessus.
 
-- **Rien ne se passe au clic sur un dossier** → permission Automation refusée (voir §4),
-  ou iTerm2 non installé (`/Applications/iTerm.app`).
+- **Le terminal reste vide / `claude: command not found`** → le login shell ne résout
+  pas `claude`. Vérifier : `"$SHELL" -l -i -c 'command -v claude'`. Le PATH doit être
+  posé par `.zprofile`/`.zshrc` (Homebrew, `~/.local/bin`…). On lance bien `$SHELL -l`
+  (login) et non `claude` en direct (cf. `docs/SESSIONS.md`).
 
-- **Le bouton de bascule de la barre latérale « saute »** → ne PAS réintroduire
-  `NavigationSplitView` (cf. invariants dans `CLAUDE.md`). Garder la barre supérieure custom.
+- **La commande `cd && claude` s'écrit avant le prompt** (machine lente) → augmenter le
+  délai (~0,35 s) dans `TerminalController.start`.
+
+- **Navigation qui « saute » / disposition instable** → ne PAS réintroduire
+  `NavigationSplitView` (cf. invariants dans `CLAUDE.md`). La sélection d'outil est un
+  menu dans le header fixe ; le split de l'outil est un `HSplitView` interne.
 
 - **L'app n'apparaît pas dans Spotlight** → relancer `build-app.sh` (qui fait `lsregister -f`),
   ou forcer : `lsregister -f "$HOME/Applications/Potof Toolkit.app"`.

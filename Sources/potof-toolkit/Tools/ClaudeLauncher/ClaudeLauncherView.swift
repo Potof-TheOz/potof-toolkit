@@ -1,20 +1,332 @@
 import SwiftUI
 import AppKit
 
-/// Outil « Claude Launcher » : liste les sous-dossiers d'un dossier racine et
-/// lance `claude` dans iTerm2 au clic sur une carte. Les dossiers peuvent être
-/// ajoutés aux favoris, mis en avant en tête de liste.
+/// Outil « Claude Launcher ».
+///
+/// Disposition en deux volets (`HSplitView`) :
+/// - **Sidebar gauche** : sessions Claude en cours (haut) + un sélecteur
+///   `Dossiers / Favoris` listant les dossiers d'où lancer une nouvelle session.
+/// - **Centre** : le **terminal embarqué** de la session active (`claude` tourne
+///   dans un PTY possédé par l'app). Fermer une session tue son process.
 struct ClaudeLauncherView: View {
     @AppStorage("rootPath") private var rootPath: String = ""
     @StateObject private var favorites = FavoritesStore()
+    @StateObject private var sessions = SessionStore()
+
     @State private var subfolders: [FolderItem] = []
     @State private var searchText: String = ""
-    /// Sessions iTerm2 ouvertes, rafraîchies en direct (jamais persistées).
-    @State private var openSessions: [ITermSession] = []
+    @State private var scope: FolderScope = .all
+    /// Visibilité de la sidebar, mémorisée entre les lancements.
+    @AppStorage("claudeLauncher.sidebarVisible") private var sidebarVisible: Bool = true
+
+    enum FolderScope: String, CaseIterable, Identifiable {
+        case all = "Dossiers"
+        case favorites = "Favoris"
+        var id: String { rawValue }
+    }
+
+    var body: some View {
+        HSplitView {
+            if sidebarVisible {
+                sidebar
+                    .frame(minWidth: 240, idealWidth: 280, maxWidth: 360)
+            }
+            center
+                .frame(minWidth: 460, maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(minWidth: sidebarVisible ? 760 : 460, minHeight: 480)
+        .onAppear(perform: scan)
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            scan()
+        }
+    }
+
+    /// Bouton unique masquer/afficher la sidebar. Vit dans le centre (barre de
+    /// session ou état vide) : toujours atteignable, y compris sidebar cachée.
+    private func sidebarToggle() -> some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.2)) { sidebarVisible.toggle() }
+        } label: {
+            Image(systemName: "sidebar.leading")
+                .font(.system(size: 14, weight: .medium))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .keyboardShortcut("s", modifiers: [.command, .option])
+        .help(sidebarVisible ? "Masquer la barre latérale (⌥⌘S)" : "Afficher la barre latérale (⌥⌘S)")
+        .accessibilityLabel(sidebarVisible ? "Masquer la barre latérale" : "Afficher la barre latérale")
+    }
+
+    // MARK: - Sidebar
+
+    private var sidebar: some View {
+        VStack(spacing: 0) {
+            if !sessions.sessions.isEmpty {
+                sessionsSection
+                Divider()
+            }
+            folderControls
+            Divider()
+            folderList
+            Divider()
+            sidebarFooter
+        }
+        .frame(maxHeight: .infinity)
+        .background(.background)
+    }
+
+    private var sessionsSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            sectionHeader(title: "Sessions actives", systemImage: "terminal.fill",
+                          tint: .green, count: sessions.sessions.count)
+            ScrollView {
+                VStack(spacing: 4) {
+                    ForEach(sessions.sessions) { session in
+                        SessionRow(
+                            session: session,
+                            isActive: session.id == sessions.activeID,
+                            onSelect: { sessions.focus(session.id) },
+                            onClose: { sessions.close(session.id) }
+                        )
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.bottom, 8)
+            }
+            .frame(maxHeight: 220)
+        }
+    }
+
+    private var folderControls: some View {
+        VStack(spacing: 10) {
+            Picker("", selection: $scope) {
+                ForEach(FolderScope.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+
+            searchField
+        }
+        .padding(12)
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+                .font(.system(size: 12))
+                .accessibilityHidden(true)
+            TextField("Rechercher", text: $searchText)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+            if !searchText.isEmpty {
+                Button { searchText = "" } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Effacer la recherche")
+                .accessibilityLabel("Effacer la recherche")
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(Color.primary.opacity(0.06))
+        )
+    }
+
+    @ViewBuilder
+    private var folderList: some View {
+        if rootPath.isEmpty {
+            emptyRootPrompt
+        } else if displayedFolders.isEmpty {
+            emptyMessage(
+                icon: searchText.isEmpty ? "tray" : "magnifyingglass",
+                text: searchText.isEmpty
+                    ? (scope == .favorites ? "Aucun favori." : "Aucun sous-dossier visible.")
+                    : "Aucun résultat pour « \(searchText) »."
+            )
+        } else {
+            // Le Set (résolution de liens symboliques par session) est calculé une
+            // seule fois ici, pas une fois par ligne de dossier.
+            folderScroll(running: runningFolderPaths)
+        }
+    }
+
+    private func folderScroll(running: Set<String>) -> some View {
+        ScrollView {
+            VStack(spacing: 2) {
+                ForEach(displayedFolders) { item in
+                    FolderRow(
+                        item: item,
+                        isFavorite: favorites.isFavorite(item.url.path),
+                        hasRunningSession: running.contains(SessionStore.normalized(item.url.path)),
+                        onLaunch: { sessions.launch(folder: item.url) },
+                        onToggleFavorite: { favorites.toggle(item.url.path) }
+                    )
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 8)
+        }
+        .frame(maxHeight: .infinity)
+    }
+
+    private var sidebarFooter: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "folder.fill")
+                .foregroundStyle(.tint)
+                .font(.system(size: 12))
+                .accessibilityHidden(true)
+            Text(rootPath.isEmpty ? "Aucun dossier racine" : (rootPath as NSString).abbreviatingWithTildeInPath)
+                .font(.system(size: 11))
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .foregroundStyle(.secondary)
+                .help(rootPath.isEmpty ? "Aucun dossier racine sélectionné" : "Dossier racine : \(rootPath)")
+                .accessibilityLabel(rootPath.isEmpty ? "Aucun dossier racine" : "Dossier racine \(rootPath)")
+            Spacer(minLength: 4)
+            Button(action: chooseFolder) {
+                Image(systemName: "folder.badge.gearshape")
+            }
+            .buttonStyle(.plain)
+            .help("Changer de dossier racine (⌘O)")
+            .accessibilityLabel("Changer de dossier racine")
+            .keyboardShortcut("o", modifiers: .command)
+            Button(action: scan) {
+                Image(systemName: "arrow.clockwise")
+            }
+            .buttonStyle(.plain)
+            .help("Rafraîchir la liste des dossiers (⌘R)")
+            .accessibilityLabel("Rafraîchir la liste des dossiers")
+            .keyboardShortcut("r", modifiers: .command)
+            .disabled(rootPath.isEmpty)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    // MARK: - Centre
+
+    @ViewBuilder
+    private var center: some View {
+        if let session = sessions.activeSession {
+            VStack(spacing: 0) {
+                sessionBar(session)
+                Divider()
+                TerminalHostView(controller: sessions.terminal, sessionID: session.id)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        } else {
+            centerEmptyState
+        }
+    }
+
+    private func sessionBar(_ session: Session) -> some View {
+        HStack(spacing: 10) {
+            sidebarToggle()
+            Divider().frame(height: 16)
+            Image(systemName: "terminal.fill")
+                .foregroundStyle(.green)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(session.folderName)
+                    .font(.system(size: 13, weight: .semibold))
+                Text(session.folderURL.path)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer(minLength: 12)
+            Button(role: .destructive) {
+                sessions.close(session.id)
+            } label: {
+                Label("Fermer la session", systemImage: "xmark.circle.fill")
+            }
+            .help("Ferme la session et arrête le process Claude")
+            .accessibilityLabel("Fermer la session et arrêter Claude")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.bar)
+    }
+
+    private var centerEmptyState: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "terminal")
+                .font(.system(size: 54))
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Text("Aucune session active")
+                .font(.title3.weight(.semibold))
+            Text(rootPath.isEmpty
+                 ? "Choisissez un dossier racine, puis lancez Claude dans l'un de ses sous-dossiers."
+                 : "Sélectionnez un dossier dans la barre latérale pour lancer Claude ici.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 380)
+            if rootPath.isEmpty {
+                Button(action: chooseFolder) {
+                    Label("Choisir un dossier", systemImage: "folder")
+                }
+                .controlSize(.large)
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding()
+        .background(.background)
+        .overlay(alignment: .topLeading) {
+            sidebarToggle().padding(12)
+        }
+    }
+
+    // MARK: - Petits éléments
+
+    private func sectionHeader(title: String, systemImage: String, tint: Color, count: Int) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: systemImage).foregroundStyle(tint).font(.system(size: 12))
+                .accessibilityHidden(true)
+            Text(title).font(.system(size: 12, weight: .semibold))
+            Text("\(count)").font(.system(size: 11)).foregroundStyle(.secondary).monospacedDigit()
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 12)
+        .padding(.bottom, 6)
+    }
+
+    private var emptyRootPrompt: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "folder.badge.plus").font(.system(size: 30)).foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Text("Choisissez un dossier racine")
+                .font(.system(size: 12, weight: .medium))
+                .multilineTextAlignment(.center)
+            Button(action: chooseFolder) { Text("Choisir…") }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding()
+    }
+
+    private func emptyMessage(icon: String, text: String) -> some View {
+        VStack(spacing: 8) {
+            Image(systemName: icon).font(.system(size: 24)).foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Text(text)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding()
+    }
 
     // MARK: - Données dérivées
 
-    /// Favoris existants sur le disque (indépendants du dossier racine).
     private var favoriteItems: [FolderItem] {
         favorites.paths
             .compactMap { path -> FolderItem? in
@@ -27,228 +339,13 @@ struct ClaudeLauncherView: View {
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
-    private func filter(_ items: [FolderItem]) -> [FolderItem] {
-        guard !searchText.isEmpty else { return items }
-        return items.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+    private var displayedFolders: [FolderItem] {
+        let base = scope == .favorites ? favoriteItems : subfolders
+        guard !searchText.isEmpty else { return base }
+        return base.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
     }
 
-    private var filteredFavorites: [FolderItem] { filter(favoriteItems) }
-    private var filteredAll: [FolderItem] { filter(subfolders) }
-
-    /// Chemin normalisé (liens symboliques résolus, sans slash final) pour comparer
-    /// le cwd d'une session au chemin d'un dossier de façon fiable.
-    private func normalizedPath(_ path: String) -> String {
-        URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
-    }
-
-    /// Index des dossiers listés (favoris + sous-dossiers) par chemin normalisé.
-    private var folderByNormalizedPath: [String: FolderItem] {
-        var map: [String: FolderItem] = [:]
-        for item in favoriteItems + subfolders {
-            map[normalizedPath(item.url.path)] = item
-        }
-        return map
-    }
-
-    /// Sessions iTerm2 dont le cwd correspond exactement à un dossier listé.
-    private var matchedSessions: [(session: ITermSession, folder: FolderItem)] {
-        let map = folderByNormalizedPath
-        return openSessions.compactMap { session in
-            guard let folder = map[normalizedPath(session.path)] else { return nil }
-            return (session, folder)
-        }
-    }
-
-    private var filteredSessions: [(session: ITermSession, folder: FolderItem)] {
-        guard !searchText.isEmpty else { return matchedSessions }
-        return matchedSessions.filter { $0.folder.name.localizedCaseInsensitiveContains(searchText) }
-    }
-
-    /// Chemins (tels qu'affichés) des dossiers ayant au moins une session ouverte.
-    private var openSessionPaths: Set<String> {
-        Set(matchedSessions.map { $0.folder.url.path })
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            TopBar(rootPath: rootPath, onChange: chooseFolder, onRefresh: refreshAll)
-            Divider()
-            Group {
-                if rootPath.isEmpty {
-                    EmptyStateView(onChoose: chooseFolder)
-                } else {
-                    folderBrowser
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-        .frame(minWidth: 480, minHeight: 420)
-        .onAppear(perform: refreshAll)
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            refreshAll()
-        }
-    }
-
-    // MARK: - Sous-vues
-
-    private var folderBrowser: some View {
-        VStack(spacing: 0) {
-            searchBar
-            if subfolders.isEmpty && favoriteItems.isEmpty {
-                messageView(
-                    icon: "tray",
-                    title: "Aucun sous-dossier",
-                    subtitle: "Ce dossier racine ne contient aucun sous-dossier visible."
-                )
-            } else if filteredAll.isEmpty && filteredFavorites.isEmpty {
-                messageView(
-                    icon: "magnifyingglass",
-                    title: "Aucun résultat",
-                    subtitle: "Aucun dossier ne correspond à « \(searchText) »."
-                )
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 24) {
-                        if !filteredSessions.isEmpty {
-                            sessionSection(items: filteredSessions)
-                        }
-                        if !filteredFavorites.isEmpty {
-                            folderSection(
-                                title: "Favoris",
-                                systemImage: "star.fill",
-                                tint: .yellow,
-                                items: filteredFavorites
-                            )
-                        }
-                        if !filteredAll.isEmpty {
-                            folderSection(
-                                title: favoriteItems.isEmpty ? nil : "Tous les dossiers",
-                                systemImage: nil,
-                                tint: .secondary,
-                                items: filteredAll
-                            )
-                        }
-                    }
-                    .padding(20)
-                }
-            }
-        }
-    }
-
-    private var searchBar: some View {
-        HStack(spacing: 12) {
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.secondary)
-                TextField("Rechercher un dossier", text: $searchText)
-                    .textFieldStyle(.plain)
-                if !searchText.isEmpty {
-                    Button {
-                        searchText = ""
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(Color.primary.opacity(0.06))
-            )
-            .frame(maxWidth: 340, alignment: .leading)
-
-            Spacer(minLength: 0)
-
-            Text("\(filteredAll.count) dossier\(filteredAll.count > 1 ? "s" : "")")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .monospacedDigit()
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 12)
-    }
-
-    @ViewBuilder
-    private func folderSection(title: String?, systemImage: String?, tint: Color, items: [FolderItem]) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if let title {
-                HStack(spacing: 6) {
-                    if let systemImage {
-                        Image(systemName: systemImage)
-                            .foregroundStyle(tint)
-                    }
-                    Text(title)
-                        .font(.headline)
-                    Text("\(items.count)")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                }
-            }
-            LazyVGrid(
-                columns: [GridItem(.adaptive(minimum: 150, maximum: 210), spacing: 16)],
-                spacing: 16
-            ) {
-                ForEach(items) { item in
-                    FolderCard(
-                        item: item,
-                        isFavorite: favorites.isFavorite(item.url.path),
-                        hasOpenSession: openSessionPaths.contains(item.url.path),
-                        onOpen: { ITermLauncher.launch(at: item.url.path) },
-                        onToggleFavorite: { favorites.toggle(item.url.path) }
-                    )
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func sessionSection(items: [(session: ITermSession, folder: FolderItem)]) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 6) {
-                Image(systemName: "terminal.fill")
-                    .foregroundStyle(.green)
-                Text("Sessions ouvertes")
-                    .font(.headline)
-                Text("\(items.count)")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-            }
-            LazyVGrid(
-                columns: [GridItem(.adaptive(minimum: 150, maximum: 210), spacing: 16)],
-                spacing: 16
-            ) {
-                ForEach(items, id: \.session.id) { pair in
-                    SessionCard(
-                        session: pair.session,
-                        folder: pair.folder,
-                        onFocus: { ITermLauncher.focus(sessionId: pair.session.id) }
-                    )
-                }
-            }
-        }
-    }
-
-    private func messageView(icon: String, title: String, subtitle: String) -> some View {
-        VStack(spacing: 12) {
-            Image(systemName: icon)
-                .font(.system(size: 40))
-                .foregroundStyle(.secondary)
-            Text(title)
-                .font(.headline)
-            Text(subtitle)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 340)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding()
-    }
+    private var runningFolderPaths: Set<String> { sessions.runningFolderPaths }
 
     // MARK: - Actions
 
@@ -269,7 +366,6 @@ struct ClaudeLauncherView: View {
         }
         subfolders = contents
             .filter { url in
-                // Dossiers uniquement, jamais rien commençant par "." (double garde).
                 guard !url.lastPathComponent.hasPrefix(".") else { return false }
                 let values = try? url.resourceValues(forKeys: [.isDirectoryKey])
                 return values?.isDirectory == true
@@ -277,26 +373,6 @@ struct ClaudeLauncherView: View {
             .map { FolderItem(name: $0.lastPathComponent, url: $0) }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
-
-    /// Rafraîchit à la fois la liste des dossiers et celle des sessions iTerm2.
-    private func refreshAll() {
-        scan()
-        refreshSessions()
-    }
-
-    /// Interroge iTerm2 hors du thread principal (aller-retour Apple Event) puis
-    /// réaffecte la liste sur le thread principal. File série pour éviter deux
-    /// exécutions AppleScript concurrentes (onAppear + didBecomeActive rapprochés).
-    private func refreshSessions() {
-        Self.sessionQueue.async {
-            let sessions = ITermLauncher.listSessions()
-            DispatchQueue.main.async {
-                openSessions = sessions
-            }
-        }
-    }
-
-    private static let sessionQueue = DispatchQueue(label: "com.potof.iterm-sessions", qos: .userInitiated)
 
     private func chooseFolder() {
         let panel = NSOpenPanel()
@@ -317,195 +393,117 @@ struct ClaudeLauncherView: View {
     }
 }
 
-// MARK: - Barre supérieure
+// MARK: - Ligne de session
 
-private struct TopBar: View {
-    let rootPath: String
-    let onChange: () -> Void
-    let onRefresh: () -> Void
-
-    private var displayPath: String {
-        (rootPath as NSString).abbreviatingWithTildeInPath
-    }
+private struct SessionRow: View {
+    let session: Session
+    let isActive: Bool
+    let onSelect: () -> Void
+    let onClose: () -> Void
+    @State private var hovering = false
 
     var body: some View {
-        HStack(spacing: 14) {
-            Image(systemName: "folder.fill")
-                .font(.system(size: 20))
-                .foregroundStyle(.tint)
-
+        HStack(spacing: 8) {
+            Image(systemName: "terminal.fill")
+                .font(.system(size: 13))
+                .foregroundStyle(isActive ? Color.green : .secondary)
+                .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 1) {
-                Text("Dossier racine")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text(rootPath.isEmpty ? "Aucun dossier sélectionné" : displayPath)
-                    .font(.system(size: 13, weight: .medium))
+                Text(session.folderName)
+                    .font(.system(size: 12, weight: .medium))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .help(rootPath)
-            }
-
-            Spacer(minLength: 12)
-
-            Button(action: onRefresh) {
-                Label("Rafraîchir", systemImage: "arrow.clockwise")
-            }
-            .disabled(rootPath.isEmpty)
-            .keyboardShortcut("r", modifiers: .command)
-
-            Button(action: onChange) {
-                Label("Changer de dossier", systemImage: "folder")
-            }
-            .keyboardShortcut("o", modifiers: .command)
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 14)
-        .background(.bar)
-    }
-}
-
-// MARK: - État vide (aucun dossier racine)
-
-private struct EmptyStateView: View {
-    let onChoose: () -> Void
-
-    var body: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "folder.badge.plus")
-                .font(.system(size: 56))
-                .foregroundStyle(.secondary)
-            Text("Choisissez un dossier pour commencer")
-                .font(.title3.weight(.semibold))
-            Text("Sélectionnez un dossier racine : ses sous-dossiers apparaîtront ici sous forme de cartes.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 360)
-            Button(action: onChoose) {
-                Label("Choisir un dossier", systemImage: "folder")
-            }
-            .controlSize(.large)
-            .buttonStyle(.borderedProminent)
-            .keyboardShortcut(.defaultAction)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding()
-    }
-}
-
-// MARK: - Carte de dossier
-
-private struct FolderCard: View {
-    let item: FolderItem
-    let isFavorite: Bool
-    let hasOpenSession: Bool
-    let onOpen: () -> Void
-    let onToggleFavorite: () -> Void
-    @State private var hovering = false
-
-    var body: some View {
-        Button(action: onOpen) {
-            VStack(spacing: 12) {
-                Image(systemName: "folder.fill")
-                    .font(.system(size: 36))
-                    .foregroundStyle(.tint)
-                Text(item.name)
-                    .font(.system(size: 13, weight: .medium))
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
-                    .foregroundStyle(.primary)
-            }
-            .frame(maxWidth: .infinity)
-            .frame(height: 120)
-            .padding(.horizontal, 10)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(CardButtonStyle(hovering: hovering))
-        .overlay(alignment: .topTrailing) {
-            if hovering || isFavorite {
-                Button(action: onToggleFavorite) {
-                    Image(systemName: isFavorite ? "star.fill" : "star")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(isFavorite ? Color.yellow : Color.secondary)
-                        .padding(6)
-                        .background(.thinMaterial, in: Circle())
-                }
-                .buttonStyle(.plain)
-                .padding(8)
-                .help(isFavorite ? "Retirer des favoris" : "Ajouter aux favoris")
-            }
-        }
-        .overlay(alignment: .topLeading) {
-            if hasOpenSession {
-                Circle()
-                    .fill(Color.green)
-                    .frame(width: 9, height: 9)
-                    .overlay(Circle().strokeBorder(.background, lineWidth: 1.5))
-                    .padding(10)
-                    .help("Session Claude ouverte dans iTerm2")
-            }
-        }
-        .onHover { hovering = $0 }
-        .help(item.url.path)
-    }
-}
-
-// MARK: - Carte de session ouverte
-
-private struct SessionCard: View {
-    let session: ITermSession
-    let folder: FolderItem
-    let onFocus: () -> Void
-    @State private var hovering = false
-
-    var body: some View {
-        Button(action: onFocus) {
-            VStack(spacing: 8) {
-                Image(systemName: "terminal.fill")
-                    .font(.system(size: 32))
-                    .foregroundStyle(.green)
-                Text(folder.name)
-                    .font(.system(size: 13, weight: .medium))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .foregroundStyle(.primary)
-                if !session.name.isEmpty {
-                    Text(session.name)
+                if session.title != session.folderName && !session.title.isEmpty {
+                    Text(session.title)
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
             }
-            .frame(maxWidth: .infinity)
-            .frame(height: 120)
-            .padding(.horizontal, 10)
-            .contentShape(Rectangle())
+            Spacer(minLength: 4)
+            if hovering || isActive {
+                Button(action: onClose) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Fermer la session (arrête Claude)")
+                .accessibilityLabel("Fermer la session « \(session.folderName) »")
+            }
         }
-        .buttonStyle(CardButtonStyle(hovering: hovering))
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.accentColor.opacity(isActive ? 0.16 : (hovering ? 0.07 : 0)))
+        )
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onSelect)
         .onHover { hovering = $0 }
-        .help("Aller à l'onglet iTerm2 — \(session.name.isEmpty ? folder.name : session.name)")
+        .help(isActive
+              ? "Session active « \(session.folderName) »"
+              : "Afficher la session « \(session.folderName) » au centre")
     }
 }
 
-private struct CardButtonStyle: ButtonStyle {
-    let hovering: Bool
+// MARK: - Ligne de dossier
 
-    func makeBody(configuration: Configuration) -> some View {
-        let fillOpacity: Double = configuration.isPressed ? 0.16 : (hovering ? 0.09 : 0.035)
-        let strokeOpacity: Double = hovering ? 0.14 : 0.06
+private struct FolderRow: View {
+    let item: FolderItem
+    let isFavorite: Bool
+    let hasRunningSession: Bool
+    let onLaunch: () -> Void
+    let onToggleFavorite: () -> Void
+    @State private var hovering = false
 
-        return configuration.label
-            .background(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(Color.primary.opacity(fillOpacity))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(strokeOpacity), lineWidth: 1)
-            )
-            .scaleEffect(configuration.isPressed ? 0.96 : 1.0)
-            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
-            .animation(.easeOut(duration: 0.12), value: hovering)
+    var body: some View {
+        HStack(spacing: 8) {
+            ZStack(alignment: .topLeading) {
+                Image(systemName: "folder.fill")
+                    .font(.system(size: 14))
+                    .foregroundStyle(.tint)
+                    .accessibilityHidden(true)
+                if hasRunningSession {
+                    Circle()
+                        .fill(Color.green)
+                        .frame(width: 7, height: 7)
+                        .overlay(Circle().strokeBorder(.background, lineWidth: 1.5))
+                        .offset(x: -3, y: -3)
+                        .help("Une session Claude tourne déjà dans ce dossier")
+                        .accessibilityLabel("Session en cours")
+                }
+            }
+            .frame(width: 20)
+
+            Text(item.name)
+                .font(.system(size: 12))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 4)
+            if hovering || isFavorite {
+                Button(action: onToggleFavorite) {
+                    Image(systemName: isFavorite ? "star.fill" : "star")
+                        .font(.system(size: 11))
+                        .foregroundStyle(isFavorite ? Color.yellow : .secondary)
+                }
+                .buttonStyle(.plain)
+                .help(isFavorite ? "Retirer des favoris" : "Ajouter aux favoris")
+                .accessibilityLabel(isFavorite ? "Retirer « \(item.name) » des favoris" : "Ajouter « \(item.name) » aux favoris")
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.primary.opacity(hovering ? 0.07 : 0))
+        )
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onLaunch)
+        .onHover { hovering = $0 }
+        .help(hasRunningSession
+              ? "Lancer une nouvelle session Claude dans « \(item.name) » (une session y tourne déjà)"
+              : "Lancer Claude dans « \(item.name) »")
     }
 }

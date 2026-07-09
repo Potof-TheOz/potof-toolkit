@@ -8,6 +8,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        // Délai d'apparition des infobulles (`.help`) en millisecondes. Le défaut
+        // macOS (~2 s) est jugé trop long. `register` = valeur de repli, ne pollue
+        // pas les préférences persistées. Doit être posé avant le 1er survol.
+        UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 512])
         applyDockIcon()
         setupMainMenu()
 
@@ -31,6 +35,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    /// Comme l'app **possède** les process des sessions Claude (contrairement à
+    /// l'ancienne intégration iTerm2 où les onglets survivaient), quitter les tue.
+    /// On confirme s'il reste des sessions actives, pour éviter de perdre un travail
+    /// en cours par ⌘Q ou fermeture de fenêtre réflexe. Sur annulation, on ré-affiche
+    /// la fenêtre (cas où elle venait d'être fermée).
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let count = TerminalController.shared.runningProcessCount
+        guard count > 0 else { return .terminateNow }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = count == 1
+            ? "Une session Claude est active"
+            : "\(count) sessions Claude sont actives"
+        alert.informativeText = count == 1
+            ? "Quitter fermera cette session et arrêtera le process Claude."
+            : "Quitter fermera ces sessions et arrêtera les process Claude."
+        alert.addButton(withTitle: "Quitter")
+        alert.addButton(withTitle: "Annuler")
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            return .terminateNow
+        }
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        return .terminateCancel
     }
 
     /// Icône du Dock.

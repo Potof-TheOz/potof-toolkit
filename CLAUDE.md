@@ -3,9 +3,9 @@
 App macOS native (SwiftUI + AppKit) servant de **toolkit d'outils de dev locaux**.
 100 % local : aucun réseau, aucun compte, aucune télémétrie. Premier (et seul) outil
 à ce jour : **Claude Launcher** — liste les sous-dossiers d'un dossier racine et lance
-`claude` dans iTerm2 au clic. Il repère aussi les **sessions déjà ouvertes** dans iTerm2
-et permet d'y revenir en un clic (voir `docs/SESSIONS-OUVERTES.md`). **Zéro dépendance
-tierce.**
+`claude` dans un **terminal embarqué** (SwiftTerm) affiché **au centre de l'app**. Les
+sessions sont **possédées par l'app** (process enfant dans un PTY) : les fermer **tue**
+le process. Voir `docs/SESSIONS.md`.
 
 > Le dépôt s'appelle encore `claude-launcher/` (dossier historique) mais le produit,
 > l'exécutable et l'app sont **`potof-toolkit`**.
@@ -20,9 +20,11 @@ swift run                              # lancer en dev (fenêtre au premier plan
 Détails deploy / debug / données / permissions → **`docs/LIFECYCLE.md`**.
 
 ## Contraintes du projet (à respecter)
-- macOS **13+**, `swift-tools-version:5.7`, **zéro dépendance externe**.
-- **App Sandbox désactivée** — nécessaire pour lister des dossiers arbitraires et piloter
-  iTerm2. Ne PAS l'activer.
+- macOS **13+**, `swift-tools-version:5.7`.
+- **Une seule dépendance externe : SwiftTerm** (émulateur de terminal xterm, MIT),
+  qui héberge les sessions `claude`. Ne pas en ajouter d'autres sans raison forte.
+- **App Sandbox désactivée** — nécessaire pour lister des dossiers arbitraires ET pour
+  qu'un sous-process lancé dans un PTY ait accès au disque/commandes. Ne PAS l'activer.
 - Package **exécutable** buildable/lançable en terminal (sans Xcode).
 - Structure volontairement simple, pas de MVVM lourd.
 
@@ -31,20 +33,27 @@ Détails deploy / debug / données / permissions → **`docs/LIFECYCLE.md`**.
 main.swift                    Entrée : NSApplication piloté à la main (pas de @main)
 App/
   AppDelegate.swift           Fenêtre "Potof Toolkit", menu minimal, icône du Dock
-  RootView.swift              Coquille de navigation (barre latérale custom)
+  RootView.swift              Coquille : header = sélecteur d'outil (menu) + slot notif
 Core/
   Tool.swift                  Abstraction d'un outil (id, title, subtitle, icon, view)
   ToolRegistry.swift          ⭐ Registre central = POINT D'EXTENSION UNIQUE
+  Notifications/              Ancrages notif internes (Phase 4, NON câblé) → docs/NOTIFICATIONS.md
+    AppNotification.swift     Modèle d'event { sessionID?, kind, title, body, date }
+    NotificationBus.swift     Bus interne (ObservableObject) ; ingest(_:) = point d'entrée
+    NotificationSlot.swift    Cloche + popover dans le header
 Tools/
   ClaudeLauncher/             Premier outil
-    ClaudeLauncherView.swift  UI : dossier racine, recherche, cartes, favoris, sessions ouvertes
+    ClaudeLauncherView.swift  UI : HSplitView(sidebar sessions+dossiers/favoris | terminal central)
+    Session.swift             Modèle session possédée { id, folderURL, title, status }
+    SessionStore.swift        Source de vérité UI : launch / close / focus
+    TerminalController.swift  Possède les LocalProcessTerminalView (PTY), spawn/kill, délégué SwiftTerm
+    TerminalHostView.swift    NSViewRepresentable : affiche la session active (vues gardées vivantes)
     FavoritesStore.swift      Favoris (chemins absolus, UserDefaults)
     FolderItem.swift          Modèle dossier (name + url)
-    ITermSession.swift        Modèle session iTerm2 (id + path + name), dérivé live
-    ITermLauncher.swift       iTerm2 via AppleScript : lancer / lister / refocaliser une session
 Resources/AppIcon.png         Icône 1024×1024 (→ Bundle.module en dev, → .icns en bundle)
 ```
-`Scripts/build-app.sh` : packaging en `.app` (voir LIFECYCLE).
+`Scripts/build-app.sh` : packaging en `.app` (voir LIFECYCLE). Détails du modèle de
+session (spawn, PATH, cycle de vie) → **`docs/SESSIONS.md`**.
 
 ## Ajouter un outil (le geste clé)
 1. Créer `Tools/<MonOutil>/<MonOutil>View.swift` — n'importe quelle `View` SwiftUI.
@@ -58,26 +67,35 @@ Resources/AppIcon.png         Icône 1024×1024 (→ Bundle.module en dev, → .
        view: { MonOutilView() }
    )
    ```
-Rien d'autre à câbler : la barre latérale, la sélection et le routage sont automatiques.
+Rien d'autre à câbler : le **menu sélecteur d'outil** (dans le header) et le routage
+sont automatiques. L'outil occupe tout le cadre sous le header et gère sa propre chrome.
 
 ## Invariants à NE PAS casser (et pourquoi)
 - **`NSHostingController`** (jamais `NSHostingView`) comme `contentViewController` de la fenêtre
   → intégration correcte titlebar/toolbar de SwiftUI en hébergement manuel.
-- **Navigation custom, PAS `NavigationSplitView`** dans `RootView`. Raison : le bouton de
-  bascule automatique de `NavigationSplitView` ne s'ancre pas dans une fenêtre hébergée
-  manuellement et « saute » de position à chaque clic. Le toggle actuel est dans une barre
-  supérieure fixe, volontairement. Ne pas « simplifier » en revenant à NavigationSplitView.
+- **PAS de `NavigationSplitView`** pour la navigation racine. La sélection d'outil est un
+  **menu dans une barre supérieure fixe** (le toggle auto de `NavigationSplitView` ne
+  s'ancre pas dans une fenêtre hébergée manuellement et « saute »). Le split interne du
+  Claude Launcher est un **`HSplitView`** (redimensionnable), c'est OK.
 - **Focus fenêtre** : `NSApp.setActivationPolicy(.regular)` + `NSApp.activate(ignoringOtherApps: true)`
   sont requis pour que la fenêtre s'affiche et prenne le focus via `swift run`.
-- **Double échappement dans `ITermLauncher`** : chemin échappé pour le shell (apostrophe → `'\''`)
-  PUIS pour la chaîne AppleScript (`\` → `\\`, `"` → `\"`). Gère espaces/apostrophes/guillemets.
-  Ne pas simplifier.
+- **Sessions = terminaux SwiftTerm possédés** : `TerminalController` possède un
+  `LocalProcessTerminalView` par session, **conservé vivant** (jamais recréé au changement
+  de session — sinon perte du process + scrollback). `TerminalHostView` ne fait que placer
+  la vue. Toutes les mutations d'état passent par le **thread principal** (callbacks du
+  delegate SwiftTerm remarshalés). Détails → `docs/SESSIONS.md`.
+- **Login shell interactif pour le PATH** : on lance **`$SHELL -l -i`** (login + interactif
+  → source `.zprofile`/`.zshrc`… → PATH complet), puis on écrit `cd '<dossier>' && claude⏎`.
+  Ne PAS lancer `claude` en direct (le PATH par défaut de SwiftTerm exclut `PATH`).
+  Échappement shell de l'apostrophe (`'` → `'\''`) conservé.
+- **Quitter tue les sessions** (l'app possède les process) → `applicationShouldTerminate`
+  confirme s'il reste des sessions actives. Garde-fou à conserver.
+- **`POTOF_SESSION_ID`** injecté dans l'env de chaque session = ancrage pour le futur
+  branchement des notifications. Les ancrages notif (`Core/Notifications/`) **ne sont PAS
+  câblés** à un canal ; ne rien y brancher sans suivre `docs/NOTIFICATIONS.md`.
 - **Persistance** : `@AppStorage("rootPath")` et `UserDefaults` clé `claudeLauncher.favorites`.
-  Stockage par domaine = bundle id → voir LIFECYCLE (dev et app bundlée = 2 stores).
-- **Sessions ouvertes = état live, jamais persisté** : dérivées d'iTerm2 à chaque
-  rafraîchissement (`ITermLauncher.listSessions`), rapprochées des dossiers par chemin
-  **exact**. `listSessions` ne doit **jamais** `activate` ni démarrer iTerm2 (garde
-  « iTerm déjà lancé »). Détails → `docs/SESSIONS-OUVERTES.md`.
+  Stockage par domaine = bundle id → voir LIFECYCLE (dev et app bundlée = 2 stores). L'état
+  des sessions n'est **jamais** persisté (reflète les process vivants).
 - **Icône / `Bundle.module`** : `applyDockIcon()` pose l'icône du Dock via `Bundle.module`
   **uniquement en dev** (`swift run`, exécutable nu). En app bundlée (`.app`) il fait
   **l'impasse** (`guard Bundle.main.bundleURL.pathExtension != "app"`) : l'accessor SwiftPM
