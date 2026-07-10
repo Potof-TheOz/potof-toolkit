@@ -28,7 +28,7 @@ TerminalHostView (NSViewRepresentable)
 
 ## Cycle de vie d'une session
 
-### Lancer — `SessionStore.launch(folder:)`
+### Lancer — `SessionStore.launch(folder:resume:)`
 1. Crée une `Session { id: UUID, folderURL, title, status: .running }` et l'ajoute
    à `sessions` (publié → la sidebar s'actualise), puis l'active (`activeID`).
 2. `TerminalController.start(id:folder:)` crée un `LocalProcessTerminalView` et
@@ -43,6 +43,9 @@ TerminalHostView (NSViewRepresentable)
    sourcent `.*rc` qu'en mode interactif.
 4. Après un court délai (~0,35 s, le temps que le shell s'initialise), on **écrit**
    `cd '<dossier>' && claude⏎` dans le terminal — équivalent du `write text` d'iTerm2.
+   Si `resume` (id de conversation Claude) est fourni — reprise d'une **session
+   précédente** —, la commande devient `cd '<dossier>' && claude --resume '<id>'⏎`
+   (cf. section « Sessions précédentes »).
 
 ### Afficher — `TerminalHostView`
 - N'affiche **jamais** deux fois la même vue et **ne recrée pas** les vues : elle
@@ -100,12 +103,49 @@ TerminalHostView (NSViewRepresentable)
 - **App Sandbox désactivée** : requise pour qu'un sous-process lancé dans un PTY ait
   accès au disque et aux commandes (cf. remarque SwiftTerm). Ne pas l'activer.
 
+## Sessions précédentes (reprise)
+
+La sidebar propose un bouton **« Voir les sessions précédentes »** (visible s'il y
+en a) qui ouvre une **popover** listant les conversations Claude passées des
+**dossiers visibles** (sous-dossiers du root + favoris). Un clic **reprend** la
+session : `SessionStore.launch(folder:resume:)` → une nouvelle session possédée qui
+exécute `claude --resume '<id>'` (nouveau `POTOF_SESSION_ID`, la reprise ne
+réutilise pas l'ancien).
+
+Source des données : les fichiers `.jsonl` que Claude Code range dans
+`~/.claude/projects/<dossier-encodé>/`. **Contrat non-officiel** (comme le pont IDE),
+**vérifié empiriquement** — donc traité en **lecture seule et tolérant** (un titre
+absent ou un dossier introuvable ne casse rien).
+
+- **Encodage du dossier** : `<dossier-encodé>` = le chemin absolu du `cwd` avec
+  `/`, `.` et `_` remplacés par `-`. `PreviousSessionsStore` fait cet **encodage
+  forward** (rapide) pour localiser le bucket d'un dossier visible.
+- **`cwd` = clé d'appartenance, pas le nom du dossier.** Le nom encodé peut
+  **mentir** (ex. le bucket `…-claude-launcher` contient en réalité des sessions
+  dont le `cwd` est `…/potof-toolkit`, séquelle d'un renommage). On lit donc le
+  `cwd` **dans** chaque fichier et on ne garde la session que si son `cwd` résolu
+  **matche** le dossier visible ciblé (rejette les buckets « mixtes »).
+- **Titre** : dernier `aiTitle` du JSONL (réécrit au fil de la session, donc pas
+  en tête → parsing complet en une passe), à défaut `lastPrompt` tronqué, à défaut
+  le nom du dossier. **Récence** = `mtime` du fichier (gratuit).
+- **Perf** : parsing sur une **queue de fond**, cache par `(chemin, mtime)`
+  (re-parse seulement si le fichier change), refresh sur événements discrets
+  (apparition, retour au premier plan, changement de dossiers/favoris).
+
+Limite connue : une session stockée dans un **bucket renommé** (nom encodé ≠ cwd)
+n'apparaît que si l'on scanne ce bucket — l'encodage forward part du dossier
+visible, donc un vieux bucket orphelin peut être manqué. Acceptable (historique
+ancien) ; un scan inverse de tout `~/.claude/projects` serait plus complet mais
+bien plus coûteux.
+
 ## Fichiers
 
 | Fichier | Rôle |
 |---|---|
 | `Tools/ClaudeLauncher/Session.swift` | Modèle `{ id, folderURL, title, status }` |
 | `Tools/ClaudeLauncher/SessionStore.swift` | Source de vérité UI : `launch` / `close` / `focus` |
+| `Tools/ClaudeLauncher/PreviousSession.swift` | Modèle d'une session passée `{ id, folderURL, title, lastUsed, gitBranch }` |
+| `Tools/ClaudeLauncher/PreviousSessionsStore.swift` | Lit/parse `~/.claude/projects` (fond + cache `mtime`), matche par `cwd` |
 | `Tools/ClaudeLauncher/TerminalController.swift` | Possède les vues/PTY, spawn/kill, délégué SwiftTerm |
 | `Tools/ClaudeLauncher/TerminalHostView.swift` | `NSViewRepresentable` : affiche la session active |
 | `Tools/ClaudeLauncher/ClaudeLauncherView.swift` | UI : sidebar (sessions + dossiers/favoris) + terminal central |

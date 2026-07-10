@@ -59,8 +59,9 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     // MARK: - Cycle de vie
 
     /// Lance une nouvelle session `claude` dans `folder`. Idempotent par `id`.
+    /// `resume` (id de conversation Claude) → reprise via `claude --resume <id>`.
     @discardableResult
-    func start(id: UUID, folder: URL) -> LocalProcessTerminalView {
+    func start(id: UUID, folder: URL, resume: String? = nil) -> LocalProcessTerminalView {
         if let existing = views[id] { return existing }
 
         let term = EmbeddedTerminalView(frame: .zero)
@@ -107,7 +108,7 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
 
         // On laisse le shell finir de s'initialiser avant d'« écrire » la commande,
         // comme le faisait iTerm2 (`write text`). Le PTY bufferise de toute façon.
-        let cmd = Self.launchCommand(folder: folder)
+        let cmd = Self.launchCommand(folder: folder, resume: resume)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak term] in
             term?.send(txt: cmd)
         }
@@ -132,11 +133,14 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
 
     // MARK: - Commande / shell
 
-    /// `cd '<dossier>' && claude` — échappement shell (apostrophe → `'\''`), suivi
-    /// d'un retour chariot (valide comme une frappe « Entrée »).
-    private static func launchCommand(folder: URL) -> String {
-        let escaped = folder.path.replacingOccurrences(of: "'", with: "'\\''")
-        return "cd '\(escaped)' && claude\r"
+    /// `cd '<dossier>' && claude [--resume '<id>']` — échappement shell (apostrophe
+    /// → `'\''`), suivi d'un retour chariot (valide comme une frappe « Entrée »).
+    /// `resume` non nil ⇒ reprise d'une session précédente par son id de conversation.
+    private static func launchCommand(folder: URL, resume: String? = nil) -> String {
+        func esc(_ s: String) -> String { s.replacingOccurrences(of: "'", with: "'\\''") }
+        var cmd = "cd '\(esc(folder.path))' && claude"
+        if let resume, !resume.isEmpty { cmd += " --resume '\(esc(resume))'" }
+        return cmd + "\r"
     }
 
     private static func userShell() -> String {

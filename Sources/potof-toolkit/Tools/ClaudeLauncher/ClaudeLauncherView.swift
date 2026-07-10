@@ -16,6 +16,9 @@ struct ClaudeLauncherView: View {
     @AppStorage("rootPath") private var rootPath: String = ""
     @StateObject private var favorites = FavoritesStore()
     @StateObject private var sessions = SessionStore()
+    /// Sessions Claude passées (lecture des `.jsonl` de `~/.claude/projects`),
+    /// limitées aux dossiers visibles. Reconstruites sur événements discrets.
+    @StateObject private var previous = PreviousSessionsStore()
 
     @State private var subfolders: [FolderItem] = []
     /// Favoris résolus (dossier existant + drapeau `CLAUDE.md`), reconstruits sur
@@ -29,6 +32,8 @@ struct ClaudeLauncherView: View {
     @State private var didApplyDefaultScope = false
     /// Visibilité de la sidebar, mémorisée entre les lancements.
     @AppStorage("claudeLauncher.sidebarVisible") private var sidebarVisible: Bool = true
+    /// Popover des sessions précédentes (ouvert depuis le bouton dédié).
+    @State private var showingPrevious = false
 
     enum FolderScope: String, CaseIterable, Identifiable {
         case all = "Dossiers"
@@ -55,6 +60,7 @@ struct ClaudeLauncherView: View {
                 didApplyDefaultScope = true
                 if !favoriteFolders.isEmpty { scope = .favorites }
             }
+            refreshPrevious()   // subfolders (1er onAppear) + favoris chargés ici
         }
         // Enregistre le store comme fournisseur de sessions pour le coordinateur de
         // notifications (mapping sid→session, focus, anti-spam). L'id de l'outil est
@@ -65,9 +71,10 @@ struct ClaudeLauncherView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             scan()
             loadFavorites()
+            refreshPrevious()
         }
         // Un (dé)favori change la liste : reconstruire (au lieu d'un stat par rendu).
-        .onChange(of: favorites.paths) { _ in loadFavorites() }
+        .onChange(of: favorites.paths) { _ in loadFavorites(); refreshPrevious() }
     }
 
     /// Bouton unique masquer/afficher la sidebar. Vit dans le centre (barre de
@@ -92,6 +99,10 @@ struct ClaudeLauncherView: View {
         VStack(spacing: 0) {
             if !sessions.sessions.isEmpty {
                 sessionsSection
+                Divider()
+            }
+            if !previous.sessions.isEmpty {
+                previousSessionsButton
                 Divider()
             }
             folderControls
@@ -124,6 +135,69 @@ struct ClaudeLauncherView: View {
             }
             .frame(maxHeight: 220)
         }
+    }
+
+    /// Bouton d'accès aux sessions Claude passées des dossiers visibles. Ouvre une
+    /// **popover** ; un clic sur une session la **reprend** (`claude --resume`) puis
+    /// ferme la popover. Volontairement discret (« moins gênant » qu'une section
+    /// permanente) et affiché seulement s'il y a au moins une session précédente.
+    private var previousSessionsButton: some View {
+        Button { showingPrevious = true } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                Text("Voir les sessions précédentes")
+                    .font(.system(size: 12, weight: .medium))
+                Spacer(minLength: 4)
+                Text("\(previous.sessions.count)")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .accessibilityHidden(true)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.primary.opacity(0.05))
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .help("Afficher les sessions Claude précédentes des dossiers visibles")
+        .accessibilityLabel("Voir les sessions précédentes (\(previous.sessions.count))")
+        .popover(isPresented: $showingPrevious, arrowEdge: .trailing) {
+            previousSessionsPopover
+        }
+    }
+
+    /// Contenu de la popover : liste des sessions précédentes, la plus récente en
+    /// haut. Clic sur une ligne → ferme la popover puis reprend la session.
+    private var previousSessionsPopover: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            sectionHeader(title: "Précédentes", systemImage: "clock.arrow.circlepath",
+                          tint: .secondary, count: previous.sessions.count)
+            Divider()
+            ScrollView {
+                VStack(spacing: 4) {
+                    ForEach(previous.sessions) { session in
+                        PreviousSessionRow(session: session) {
+                            showingPrevious = false          // ferme la popover…
+                            sessions.launch(folder: session.folderURL, resume: session.id)  // …puis reprend
+                        }
+                    }
+                }
+                .padding(8)
+            }
+        }
+        .frame(width: 340, height: min(CGFloat(previous.sessions.count) * 46 + 72, 460))
     }
 
     private var folderControls: some View {
@@ -223,7 +297,7 @@ struct ClaudeLauncherView: View {
             .help("Changer de dossier racine (⌘O)")
             .accessibilityLabel("Changer de dossier racine")
             .keyboardShortcut("o", modifiers: .command)
-            Button(action: scan) {
+            Button { scan(); refreshPrevious() } label: {
                 Image(systemName: "arrow.clockwise")
             }
             .buttonStyle(.plain)
@@ -421,6 +495,12 @@ struct ClaudeLauncherView: View {
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
+    /// Rafraîchit la section « Précédentes » pour les dossiers visibles (sous-dossiers
+    /// du root + favoris). Peu coûteux (cache `mtime`, parsing en tâche de fond).
+    private func refreshPrevious() {
+        previous.refresh(folders: subfolders + favoriteFolders)
+    }
+
     private func chooseFolder() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -436,6 +516,7 @@ struct ClaudeLauncherView: View {
             rootPath = url.path
             searchText = ""
             scan()
+            refreshPrevious()
         }
     }
 }
@@ -492,6 +573,50 @@ private struct SessionRow: View {
         .help(isActive
               ? "Session active « \(session.folderName) »"
               : "Afficher la session « \(session.folderName) » au centre")
+    }
+}
+
+// MARK: - Ligne de session précédente
+
+private struct PreviousSessionRow: View {
+    let session: PreviousSession
+    let onResume: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: hovering ? "play.circle.fill" : "clock.arrow.circlepath")
+                .font(.system(size: 13))
+                .foregroundStyle(hovering ? Color.accentColor : .secondary)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(session.title)
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                HStack(spacing: 4) {
+                    Text(session.folderName)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text("·")
+                    Text(session.lastUsed, format: .relative(presentation: .named))
+                }
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            }
+            Spacer(minLength: 4)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.primary.opacity(hovering ? 0.07 : 0))
+        )
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onResume)
+        .onHover { hovering = $0 }
+        .help("Reprendre « \(session.title) » dans « \(session.folderName) » (claude --resume)")
     }
 }
 

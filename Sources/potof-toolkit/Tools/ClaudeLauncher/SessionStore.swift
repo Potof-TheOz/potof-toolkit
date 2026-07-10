@@ -44,13 +44,14 @@ final class SessionStore: ObservableObject {
 
     // MARK: - Actions
 
-    /// Lance une nouvelle session dans `folder` et l'active.
-    func launch(folder: URL) {
+    /// Lance une nouvelle session dans `folder` et l'active. `resume` (id de
+    /// conversation Claude) ⇒ reprise d'une session précédente (`claude --resume`).
+    func launch(folder: URL, resume: String? = nil) {
         let id = UUID()
         sessions.append(
             Session(id: id, folderURL: folder, title: folder.lastPathComponent, status: .running)
         )
-        terminal.start(id: id, folder: folder)
+        terminal.start(id: id, folder: folder, resume: resume)
         activeID = id
     }
 
