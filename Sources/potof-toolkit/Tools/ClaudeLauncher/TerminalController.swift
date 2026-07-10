@@ -193,19 +193,65 @@ final class EmbeddedTerminalView: LocalProcessTerminalView {
     /// session **affichée**), ce qui évite qu'une session en arrière-plan capte la molette.
     private var scrollMonitor: Any?
 
+    /// Moniteur clavier. Même contrainte que la molette : `keyDown` est `public`
+    /// (pas `open`) hors de notre module → pas surchargeable. Sert à traduire
+    /// Shift/Option+Entrée en saut de ligne pour le prompt Claude (cf. `handleKeyDown`).
+    private var keyMonitor: Any?
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if window == nil {
             if let m = scrollMonitor { NSEvent.removeMonitor(m); scrollMonitor = nil }
-        } else if scrollMonitor == nil {
-            scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
-                self?.handleScroll(event) ?? event
+            if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
+        } else {
+            if scrollMonitor == nil {
+                scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                    self?.handleScroll(event) ?? event
+                }
+            }
+            if keyMonitor == nil {
+                // NB : on ne peut PAS écrire `self?.handleKeyDown(event) ?? event` — le
+                // `nil` que `handleKeyDown` renvoie pour **consommer** l'événement serait
+                // retransformé en `event` par le `??`, laissant le `keyDown` natif de
+                // SwiftTerm s'exécuter (et valider le prompt). On ne retombe sur `event`
+                // que si `self` a disparu.
+                keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                    guard let self else { return event }
+                    return self.handleKeyDown(event)
+                }
             }
         }
     }
 
     deinit {
         if let m = scrollMonitor { NSEvent.removeMonitor(m) }
+        if let m = keyMonitor { NSEvent.removeMonitor(m) }
+    }
+
+    // MARK: - Saut de ligne dans le prompt Claude
+
+    /// La TUI de Claude Code valide le prompt sur **Entrée simple** ; pour insérer un
+    /// saut de ligne il faut **Meta+Entrée** (`ESC` + `CR`) — exactement ce que la
+    /// config `/terminal-setup` d'iTerm2 mappait sur Shift+Entrée. Option+Entrée passe
+    /// déjà par le chemin natif `optionAsMetaKey` de SwiftTerm (→ `ESC CR`), mais
+    /// Shift+Entrée n'a aucun équivalent natif : on le traduit ici en `ESC CR`.
+    ///
+    /// Seul garde : **ce** terminal (ou une de ses sous-vues) doit avoir le focus, pour
+    /// ne pas détourner une frappe destinée ailleurs (ex. champ de recherche de la
+    /// sidebar). Pas de gate « suivi souris » : Claude ne l'active pas forcément pendant
+    /// la saisie du prompt (c'était ça qui neutralisait Shift+Entrée). Consommer
+    /// l'événement évite le double envoi (submit natif ou report kitty).
+    private func handleKeyDown(_ event: NSEvent) -> NSEvent? {
+        guard let window = window, event.window === window else { return event }
+        let focused = (window.firstResponder as? NSView).map {
+            $0 === self || $0.isDescendant(of: self)
+        } ?? false
+        guard focused else { return event }
+        let isReturn = event.keyCode == 36 || event.keyCode == 76   // Return / Enter (pavé num.)
+        let mods = event.modifierFlags
+        guard isReturn, mods.contains(.shift) || mods.contains(.option) else { return event }
+        send(txt: "\u{1b}\r")   // Meta+Entrée → saut de ligne dans le prompt Claude
+        return nil              // consommé : pas de submit natif (Shift) ni de double envoi (Option)
     }
 
     /// Traduit la molette en reports « bouton molette » SGR (64 = haut, 65 = bas) pour que
