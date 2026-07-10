@@ -78,14 +78,25 @@ TerminalHostView (NSViewRepresentable)
   actives (⌘Q ou fermeture de fenêtre). Ne pas retirer ce garde-fou.
 - **`POTOF_SESSION_ID`** est injecté dans l'environnement de chaque session : c'est la
   clé qui relie un event Claude à sa session pour les notifications (`NOTIFICATIONS.md`).
-- **Mouse reporting coupé** (`EmbeddedTerminalView` + `allowMouseReporting = false`) :
-  un survol/clic de la souris sur le terminal **ne doit jamais** être transmis à la TUI
-  de Claude — sinon passer la souris sur un bouton « Yes »/« No » (ex. quand la fenêtre
-  passe au premier plan via une notif) **valide le prompt de permission à l'insu de
-  l'utilisateur**. `allowMouseReporting = false` gère clic/drag ; `EmbeddedTerminalView`
-  filtre en plus les reports SGR de **survol** (`ESC [ < … M/m`) dans `send(source:data:)`
-  (SwiftTerm ne garde pas `mouseMoved` derrière le drapeau). La sélection de texte native
-  et le clavier restent intacts. Ne pas réactiver le report souris.
+- **Report souris : clic/survol coupés, molette forwardée** (`EmbeddedTerminalView` +
+  `allowMouseReporting = false`). Un survol/clic de la souris **ne doit jamais** être
+  transmis à la TUI de Claude — sinon passer la souris sur un bouton « Yes »/« No » (ex.
+  quand la fenêtre passe au premier plan via une notif) **valide le prompt de permission à
+  l'insu de l'utilisateur**. `allowMouseReporting = false` gère clic/drag ;
+  `EmbeddedTerminalView.send(source:data:)` filtre en plus les reports SGR **de bouton
+  < 64** (survol/motion inclus, que SwiftTerm ne garde pas derrière le drapeau). La
+  sélection de texte native et le clavier restent intacts.
+- **Scroll = molette forwardée à la TUI.** SwiftTerm-mac ne forwarde **jamais** la molette :
+  son `scrollWheel` ne fait que du scrollback **local** (buffer normal), inutile quand
+  Claude possède l'écran. `EmbeddedTerminalView` intercepte donc la molette via un
+  **moniteur d'événements local** (`NSEvent.addLocalMonitorForEvents`, car `scrollWheel` est
+  `public` non `open` hors de notre module → non surchargeable) et la traduit en reports
+  « bouton molette » (64 = haut, 65 = bas) quand le suivi souris est actif — le filtre
+  `send` laisse passer les boutons **≥ 64**. Ces reports **ne peuvent pas** sélectionner un
+  prompt Yes/No. Sans suivi souris (shell nu) ou curseur hors du terminal, on retombe sur le
+  comportement natif (scrollback local). Le moniteur est branché sur `viewDidMoveToWindow`,
+  donc actif **uniquement sur la session affichée**. Ne pas réactiver le report souris pour
+  clic/survol.
 - **App Sandbox désactivée** : requise pour qu'un sous-process lancé dans un PTY ait
   accès au disque et aux commandes (cf. remarque SwiftTerm). Ne pas l'activer.
 

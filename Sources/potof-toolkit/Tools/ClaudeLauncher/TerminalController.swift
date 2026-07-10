@@ -179,16 +179,90 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
 /// clic/drag basculent en sélection locale au lieu de reporter).
 final class EmbeddedTerminalView: LocalProcessTerminalView {
     override func send(source: TerminalView, data: ArraySlice<UInt8>) {
-        if Self.isSGRMouseReport(data) { return }
+        if Self.isFilterableMouseReport(data) { return }
         super.send(source: source, data: data)
     }
 
-    /// Vrai si `data` est un report souris SGR : `ESC [ < … (M|m)`.
-    private static func isSGRMouseReport(_ data: ArraySlice<UInt8>) -> Bool {
+    // MARK: - Molette → reports SGR
+
+    /// Moniteur d'événements molette. SwiftTerm-mac ne forwarde **jamais** la molette à la
+    /// TUI : son `scrollWheel` ne scrolle que le scrollback **local** (buffer normal
+    /// uniquement), inutile quand Claude possède l'écran. On ne peut pas non plus surcharger
+    /// `scrollWheel` (déclaré `public`, pas `open`, hors de notre module) → on intercepte via
+    /// un moniteur local. Actif uniquement tant que la vue est dans une fenêtre (donc la
+    /// session **affichée**), ce qui évite qu'une session en arrière-plan capte la molette.
+    private var scrollMonitor: Any?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            if let m = scrollMonitor { NSEvent.removeMonitor(m); scrollMonitor = nil }
+        } else if scrollMonitor == nil {
+            scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                self?.handleScroll(event) ?? event
+            }
+        }
+    }
+
+    deinit {
+        if let m = scrollMonitor { NSEvent.removeMonitor(m) }
+    }
+
+    /// Traduit la molette en reports « bouton molette » SGR (64 = haut, 65 = bas) pour que
+    /// Claude scrolle sa propre vue. Ne traite que si le curseur est **au-dessus de ce
+    /// terminal** et que la TUI a activé le suivi souris ; sinon renvoie l'événement tel quel
+    /// (scrollback local natif pour un shell nu, scroll normal ailleurs — ex. sidebar). Ces
+    /// reports (bouton ≥ 64) ne déclenchent jamais la sélection Yes/No qui a motivé
+    /// `allowMouseReporting=false` (cf. `isFilterableMouseReport`, qui les laisse passer).
+    private func handleScroll(_ event: NSEvent) -> NSEvent? {
+        guard let window = window, event.window === window else { return event }
+        let term = getTerminal()
+        guard event.deltaY != 0, term.mouseMode != .off else { return event }
+        let p = convert(event.locationInWindow, from: nil)
+        guard bounds.contains(p) else { return event }
+
+        let mods = event.modifierFlags
+        let button = event.deltaY > 0 ? 4 : 5   // 4 = molette haut, 5 = molette bas
+        let cb = term.encodeButton(button: button, release: false,
+                                   shift: mods.contains(.shift),
+                                   meta: mods.contains(.option),
+                                   control: mods.contains(.control))
+        // Position grille sous le curseur (Claude est plein cadre → importe peu, mais on la
+        // calcule pour rester conforme au protocole).
+        let cols = max(term.cols, 1), rows = max(term.rows, 1)
+        let col = min(max(Int(p.x / (bounds.width / CGFloat(cols))), 0), cols - 1)
+        let row = min(max(Int((bounds.height - p.y) / (bounds.height / CGFloat(rows))), 0), rows - 1)
+        // Un report par « cran », borné pour ne pas noyer la TUI (le trackpad émet beaucoup
+        // de petits deltas avec inertie).
+        let steps = min(max(Int(abs(event.deltaY).rounded()), 1), 4)
+        for _ in 0..<steps {
+            term.sendEvent(buttonFlags: cb, x: col, y: row)
+        }
+        return nil   // consommé : empêche le scrollback local natif de SwiftTerm de scroller
+    }
+
+    /// Vrai si `data` est un report souris SGR à **jeter** (`ESC [ < b ; … M/m` avec
+    /// `b < 64`) : clic, drag, survol. On **laisse passer** les reports molette
+    /// (`b ≥ 64`, émis par `scrollWheel`) pour préserver le scroll de la TUI.
+    private static func isFilterableMouseReport(_ data: ArraySlice<UInt8>) -> Bool {
         guard data.count >= 4 else { return false }
-        var it = data.makeIterator()
-        guard it.next() == 0x1b, it.next() == 0x5b, it.next() == 0x3c else { return false }
+        var idx = data.startIndex
+        guard data[idx] == 0x1b else { return false }          // ESC
+        idx = data.index(after: idx)
+        guard data[idx] == 0x5b else { return false }          // [
+        idx = data.index(after: idx)
+        guard data[idx] == 0x3c else { return false }          // <
+        idx = data.index(after: idx)
         let last = data[data.index(before: data.endIndex)]
-        return last == 0x4d || last == 0x6d   // 'M' (press) ou 'm' (release)
+        guard last == 0x4d || last == 0x6d else { return false }   // 'M' (press) / 'm' (release)
+        // Numéro de bouton (chiffres jusqu'au premier ';').
+        var button = 0, sawDigit = false
+        while idx < data.endIndex, data[idx] >= 0x30, data[idx] <= 0x39 {
+            button = button * 10 + Int(data[idx] - 0x30)
+            sawDigit = true
+            idx = data.index(after: idx)
+        }
+        guard sawDigit else { return false }
+        return button < 64   // 0-2 = clic (+32 = motion) → jetés ; 64/65 = molette → gardés
     }
 }
