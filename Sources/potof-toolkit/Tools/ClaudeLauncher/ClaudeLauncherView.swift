@@ -18,6 +18,10 @@ struct ClaudeLauncherView: View {
     @StateObject private var sessions = SessionStore()
 
     @State private var subfolders: [FolderItem] = []
+    /// Favoris résolus (dossier existant + drapeau `CLAUDE.md`), reconstruits sur
+    /// événements discrets (apparition, retour au premier plan, changement de favoris)
+    /// et non à chaque rendu → pas d'accès disque par frame.
+    @State private var favoriteFolders: [FolderItem] = []
     @State private var searchText: String = ""
     @State private var scope: FolderScope = .all
     /// Garde-fou : n'appliquer l'onglet par défaut (Favoris) qu'une fois, sans écraser
@@ -46,9 +50,10 @@ struct ClaudeLauncherView: View {
         // Ouvre sur l'onglet Favoris s'il existe au moins un favori (dossier encore
         // présent). Une seule fois, pour ne pas écraser un basculement manuel.
         .onAppear {
+            loadFavorites()
             if !didApplyDefaultScope {
                 didApplyDefaultScope = true
-                if !favoriteItems.isEmpty { scope = .favorites }
+                if !favoriteFolders.isEmpty { scope = .favorites }
             }
         }
         // Enregistre le store comme fournisseur de sessions pour le coordinateur de
@@ -59,7 +64,10 @@ struct ClaudeLauncherView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             scan()
+            loadFavorites()
         }
+        // Un (dé)favori change la liste : reconstruire (au lieu d'un stat par rendu).
+        .onChange(of: favorites.paths) { _ in loadFavorites() }
     }
 
     /// Bouton unique masquer/afficher la sidebar. Vit dans le centre (barre de
@@ -106,7 +114,7 @@ struct ClaudeLauncherView: View {
                         SessionRow(
                             session: session,
                             isActive: session.id == sessions.activeID,
-                            onSelect: { sessions.focus(session.id) },
+                            onSelect: { sessions.reveal(session.id) },
                             onClose: { sessions.close(session.id) }
                         )
                     }
@@ -365,20 +373,8 @@ struct ClaudeLauncherView: View {
 
     // MARK: - Données dérivées
 
-    private var favoriteItems: [FolderItem] {
-        favorites.paths
-            .compactMap { path -> FolderItem? in
-                var isDir: ObjCBool = false
-                guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir),
-                      isDir.boolValue else { return nil }
-                return FolderItem(name: (path as NSString).lastPathComponent,
-                                  url: URL(fileURLWithPath: path))
-            }
-            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-    }
-
     private var displayedFolders: [FolderItem] {
-        let base = scope == .favorites ? favoriteItems : subfolders
+        let base = scope == .favorites ? favoriteFolders : subfolders
         guard !searchText.isEmpty else { return base }
         return base.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
     }
@@ -408,7 +404,20 @@ struct ClaudeLauncherView: View {
                 let values = try? url.resourceValues(forKeys: [.isDirectoryKey])
                 return values?.isDirectory == true
             }
-            .map { FolderItem(name: $0.lastPathComponent, url: $0) }
+            .map { FolderItem(url: $0) }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    /// (Re)construit la liste des favoris résolus. Appelé sur événements discrets
+    /// (apparition, retour au premier plan, changement de favoris), jamais par rendu.
+    private func loadFavorites() {
+        favoriteFolders = favorites.paths
+            .compactMap { path -> FolderItem? in
+                var isDir: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir),
+                      isDir.boolValue else { return nil }
+                return FolderItem(url: URL(fileURLWithPath: path))
+            }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
@@ -496,13 +505,27 @@ private struct FolderRow: View {
     let onToggleFavorite: () -> Void
     @State private var hovering = false
 
+    /// Icône du dossier : marque Claude si un `CLAUDE.md` est présent à la racine,
+    /// sinon l'icône dossier standard.
+    @ViewBuilder
+    private var folderIcon: some View {
+        if item.hasClaudeMd {
+            ClaudeMark()
+                .frame(width: 15, height: 15)
+                .help("Ce dossier contient un CLAUDE.md")
+                .accessibilityHidden(true)
+        } else {
+            Image(systemName: "folder.fill")
+                .font(.system(size: 14))
+                .foregroundStyle(.tint)
+                .accessibilityHidden(true)
+        }
+    }
+
     var body: some View {
         HStack(spacing: 8) {
             ZStack(alignment: .topLeading) {
-                Image(systemName: "folder.fill")
-                    .font(.system(size: 14))
-                    .foregroundStyle(.tint)
-                    .accessibilityHidden(true)
+                folderIcon
                 if hasRunningSession {
                     Circle()
                         .fill(Color.green)
