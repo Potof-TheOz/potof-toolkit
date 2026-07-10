@@ -24,6 +24,11 @@ final class NotificationBus: ObservableObject {
         items.removeAll { $0.id == id }
     }
 
+    /// Retire toutes les notifs d'une session (appelé quand on focus son terminal).
+    func dismissAll(forSession sessionID: UUID) {
+        items.removeAll { $0.sessionID == sessionID }
+    }
+
     func clear() {
         items.removeAll()
     }

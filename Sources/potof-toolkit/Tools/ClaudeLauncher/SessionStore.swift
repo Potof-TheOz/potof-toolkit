@@ -60,7 +60,19 @@ final class SessionStore: ObservableObject {
         remove(id)
     }
 
+    /// Affiche la session `id` au centre. **Programmatique et neutre** : ne touche
+    /// pas aux notifications. `presentDiff` (openDiff) l'appelle sans intention de
+    /// l'utilisateur → le nettoyage de la cloche se fait dans `reveal(_:)`.
     func focus(_ id: UUID) { activeID = id }
+
+    /// Focus **déclenché par l'utilisateur** (clic sur une session dans la sidebar) :
+    /// affiche la session ET nettoie ses notifications (le focus vaut « j'ai vu »).
+    /// Le clic sur une *notification* passe, lui, par `handleClick` côté coordinateur
+    /// (qui nettoie aussi, y compris pour une session déjà fermée).
+    func reveal(_ id: UUID) {
+        focus(id)
+        NotificationCenterCoordinator.shared.sessionDidFocus(id)
+    }
 
     // MARK: - Aperçu de diff (intégration IDE, cf. docs/IDE_BRIDGE.md)
 

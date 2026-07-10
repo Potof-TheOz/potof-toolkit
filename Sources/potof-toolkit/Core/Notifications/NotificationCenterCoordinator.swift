@@ -88,12 +88,29 @@ final class NotificationCenterCoordinator: NSObject, UNUserNotificationCenterDel
 
     @objc private func appDidBecomeActive() { markNotificationsSeen() }
 
+    // MARK: - Focus d'une session
+
+    /// Focus utilisateur d'une session (clic dans la sidebar) → nettoie ses notifs de
+    /// la cloche ET remet la pastille Dock à zéro, comme toute autre interaction
+    /// (ouverture de la cloche, retour au premier plan) : la pastille = « non-lus
+    /// depuis la dernière fois que j'ai regardé ». L'outil passe par ici plutôt que
+    /// de muter `bus` directement. (Le clic sur une *notification* passe par
+    /// `handleClick`.)
+    func sessionDidFocus(_ id: UUID) {
+        bus.dismissAll(forSession: id)
+        markNotificationsSeen()
+    }
+
     // MARK: - Clic (bannière OU ligne de cloche)
 
     func handleClick(sessionID: UUID?) {
         NSApp.activate(ignoringOtherApps: true)
         markNotificationsSeen()
         guard let sid = sessionID else { return }
+        // Cliquer une notif vaut « j'ai vu » : on retire les notifs de cette session
+        // de la cloche, **même si la session est déjà fermée** (sinon elles resteraient
+        // coincées, seul « Tout effacer » les enlèverait).
+        bus.dismissAll(forSession: sid)
         // Owner = l'outil qui possède cette session ; sinon l'unique outil enregistré
         // (permet de basculer d'outil même pour une session déjà morte).
         let owner = registrations.first { $0.provider?.containsSession(sid) == true }
