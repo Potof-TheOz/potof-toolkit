@@ -24,6 +24,8 @@ final class IDEServer {
     /// Claude ferme un onglet de diff (par `tab_name`) / tous les onglets.
     var onCloseTab: ((String) -> Void)?
     var onCloseAllTabs: (() -> Void)?
+    /// `claude` s'est connecté (handshake). Marshalé sur `main` comme les autres seams.
+    var onConnected: (() -> Void)?
 
     private var listener: NWListener?
     private var connections: [IDEConnection] = []
@@ -64,6 +66,9 @@ final class IDEServer {
                 self.connections.append(conn)
                 conn.onClose = { [weak self, weak conn] in
                     self?.connections.removeAll { $0 === conn }
+                }
+                conn.onHandshake = { [weak self] in
+                    DispatchQueue.main.async { self?.onConnected?() }
                 }
                 conn.start(queue: self.queue)
             }

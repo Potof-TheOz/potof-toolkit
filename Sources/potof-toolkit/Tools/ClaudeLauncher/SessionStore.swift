@@ -33,6 +33,10 @@ final class SessionStore: ObservableObject {
         terminal.onCloseAllTabs = { [weak self] id in
             self?.dismissDiff(id, matchingTab: nil)
         }
+        // Init CLAUDE.md : la connexion du pont IDE signale que `claude` a booté.
+        terminal.onIDEConnected = { id in
+            InitClaudeMdCoordinator.shared.ideConnected(sessionID: id)
+        }
     }
 
     var activeSession: Session? { sessions.first { $0.id == activeID } }
@@ -53,6 +57,25 @@ final class SessionStore: ObservableObject {
         )
         terminal.start(id: id, folder: folder, resume: resume)
         activeID = id
+    }
+
+    /// Lance une session pour **initialiser un `CLAUDE.md`** (dossier sans fichier) :
+    /// démarre `claude` normalement, puis confie à l'`InitClaudeMdCoordinator` le soin
+    /// de seeder `/init` et, une fois le fichier accepté, d'injecter les conventions
+    /// maison. Réutilise `launch` tel quel (pas de `resume`).
+    ///
+    /// L'auto-init n'est armée que si le **pont IDE est disponible** pour la session :
+    /// sans lui, `claude` n'émet pas d'`openDiff`, donc pas d'aperçu Accepter/Refuser
+    /// dont dépend toute la séquence. Sinon, la session est simplement lancée (l'utilisateur
+    /// peut faire `/init` à la main) et on le journalise, plutôt que de seeder dans le vide.
+    func launchInitializingClaudeMd(folder: URL) {
+        launch(folder: folder)
+        guard let id = activeID else { return }
+        guard terminal.hasIDEBridge(id: id) else {
+            IDELog.log("init CLAUDE.md: pont IDE indisponible → auto-init désactivée (session lancée normalement)")
+            return
+        }
+        InitClaudeMdCoordinator.shared.begin(sessionID: id, folder: folder)
     }
 
     /// Ferme une session : **tue le process** puis retire l'entrée.
@@ -106,31 +129,41 @@ final class SessionStore: ObservableObject {
         pendingDiffs[id] = nil          // ferme le panneau ; `remove` ne re-votera pas
         IDELog.log("verdict utilisateur : \(verdict.rawValue)")
         pres.complete(verdict)
-        if verdict == .saved { confirmEditInTerminal(id, attempt: 0) }
+        if verdict == .saved {
+            // On répond « Yes » au prompt de permission PUIS, une fois seulement ce Yes
+            // envoyé, on prévient le coordinateur d'init : sinon l'injection des conventions
+            // (planifiée sur un délai fixe) pouvait partir avant même que le prompt de
+            // permission ne s'affiche, et taper dans le mauvais contexte.
+            confirmEditInTerminal(id, attempt: 0) { [weak self] in
+                guard self != nil else { return }
+                InitClaudeMdCoordinator.shared.diffSaved(sessionID: id, request: pres.request)
+            }
+        } else {
+            // Refus explicite → désarme une éventuelle init en cours sur cette session.
+            InitClaudeMdCoordinator.shared.diffRejected(sessionID: id, request: pres.request)
+        }
     }
 
     /// Répond « Yes » (Entrée) au prompt de permission terminal qui suit `FILE_SAVED`.
     /// On **détecte** l'apparition du prompt dans le buffer rendu (robuste au timing :
     /// il apparaît généralement en < 1 s, mais on tolère un délai) ; en dernier
     /// recours (~6 s) on envoie quand même Entrée (le prompt est alors forcément là).
-    private func confirmEditInTerminal(_ id: UUID, attempt: Int) {
+    private func confirmEditInTerminal(_ id: UUID, attempt: Int, then: (() -> Void)? = nil) {
         guard containsSession(id) else { return }
-        let screen = terminal.screenText(id: id)
-        let promptUp = screen.contains("Do you want")
-            || screen.contains("make this edit")
-            || screen.contains("1. Yes")
-        if promptUp {
+        if ClaudePromptHeuristics.permissionPromptVisible(terminal.screenText(id: id)) {
             terminal.sendKeys(id: id, "\r")   // « ❯ 1. Yes » est le défaut → Entrée = Yes
             IDELog.log("prompt de permission détecté → Entrée (Yes)")
+            then?()
             return
         }
         guard attempt < 40 else {             // ~6 s : dernier recours (best effort)
             terminal.sendKeys(id: id, "\r")
             IDELog.log("prompt non détecté après délai → Entrée (best effort)")
+            then?()
             return
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            self?.confirmEditInTerminal(id, attempt: attempt + 1)
+            self?.confirmEditInTerminal(id, attempt: attempt + 1, then: then)
         }
     }
 
@@ -141,6 +174,8 @@ final class SessionStore: ObservableObject {
         if let tab, pres.request.tabName != tab { return }
         pendingDiffs[id] = nil
         pres.complete(.rejected)
+        // Claude a annulé l'aperçu → désarme une éventuelle init en cours.
+        InitClaudeMdCoordinator.shared.diffRejected(sessionID: id, request: pres.request)
     }
 
     // MARK: - Privé
@@ -151,6 +186,8 @@ final class SessionStore: ObservableObject {
             pendingDiffs[id] = nil
             pres.complete(.rejected)
         }
+        // Désarme une éventuelle init en cours (sinon son état survit à la session).
+        InitClaudeMdCoordinator.shared.cancel(sessionID: id)
         sessions.removeAll { $0.id == id }
         if activeID == id { activeID = sessions.last?.id }
     }

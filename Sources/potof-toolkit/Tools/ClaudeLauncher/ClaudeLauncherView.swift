@@ -21,6 +21,9 @@ struct ClaudeLauncherView: View {
     @StateObject private var previous = PreviousSessionsStore()
 
     @State private var subfolders: [FolderItem] = []
+    /// Incrémenté à chaque `scan()` ; seul le scan le plus récent publie son résultat
+    /// (garde contre les scans async concurrents terminant dans le désordre).
+    @State private var scanGeneration = 0
     /// Favoris résolus (dossier existant + drapeau `CLAUDE.md`), reconstruits sur
     /// événements discrets (apparition, retour au premier plan, changement de favoris)
     /// et non à chaque rendu → pas d'accès disque par frame.
@@ -60,7 +63,7 @@ struct ClaudeLauncherView: View {
                 didApplyDefaultScope = true
                 if !favoriteFolders.isEmpty { scope = .favorites }
             }
-            refreshPrevious()   // subfolders (1er onAppear) + favoris chargés ici
+            // `refreshPrevious` est déclenché par le scan du 1er onAppear (à sa complétion).
         }
         // Enregistre le store comme fournisseur de sessions pour le coordinateur de
         // notifications (mapping sid→session, focus, anti-spam). L'id de l'outil est
@@ -69,12 +72,22 @@ struct ClaudeLauncherView: View {
             NotificationCenterCoordinator.shared.registerSessionProvider(sessions, toolID: Self.toolID)
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            scan()
+            scan()          // rafraîchit les « précédentes » à sa complétion
             loadFavorites()
-            refreshPrevious()
         }
         // Un (dé)favori change la liste : reconstruire (au lieu d'un stat par rendu).
-        .onChange(of: favorites.paths) { _ in loadFavorites(); refreshPrevious() }
+        // `loadFavorites` rafraîchit déjà les « Précédentes ».
+        .onChange(of: favorites.paths) { _ in loadFavorites() }
+        // Une init « CLAUDE.md » vient d'être acceptée : le drapeau `hasClaudeMd` est figé
+        // au scan → on rescanne pour cesser de proposer « Initialiser » sur ce dossier. Un
+        // court délai laisse `claude` écrire le fichier après le « Yes » (le rescan lit le
+        // disque) ; à défaut, le prochain retour au premier plan corrige de toute façon.
+        .onReceive(NotificationCenter.default.publisher(for: .initClaudeMdDidWriteFile)) { _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                scan()
+                loadFavorites()
+            }
+        }
     }
 
     /// Bouton unique masquer/afficher la sidebar. Vit dans le centre (barre de
@@ -268,6 +281,24 @@ struct ClaudeLauncherView: View {
                         onLaunch: { sessions.launch(folder: item.url) },
                         onToggleFavorite: { favorites.toggle(item.url.path) }
                     )
+                    .contextMenu {
+                        // Proposé seulement sur un vrai projet encore sans CLAUDE.md.
+                        if item.isProjectCandidate && !item.hasClaudeMd {
+                            Button {
+                                sessions.launchInitializingClaudeMd(folder: item.url)
+                            } label: {
+                                Label("Initialiser CLAUDE.md…", systemImage: "sparkles")
+                            }
+                            Divider()
+                        }
+                        // Toujours présent → le menu n'est jamais vide, et les
+                        // conventions maison restent éditables d'un clic droit.
+                        Button {
+                            NSWorkspace.shared.open(ConventionsProfile.ensureExists())
+                        } label: {
+                            Label("Éditer mes conventions…", systemImage: "slider.horizontal.3")
+                        }
+                    }
                 }
             }
             .padding(.horizontal, 8)
@@ -297,7 +328,7 @@ struct ClaudeLauncherView: View {
             .help("Changer de dossier racine (⌘O)")
             .accessibilityLabel("Changer de dossier racine")
             .keyboardShortcut("o", modifiers: .command)
-            Button { scan(); refreshPrevious() } label: {
+            Button { scan() } label: {
                 Image(systemName: "arrow.clockwise")
             }
             .buttonStyle(.plain)
@@ -458,21 +489,45 @@ struct ClaudeLauncherView: View {
     // MARK: - Actions
 
     private func scan() {
+        // Jeton de génération incrémenté à CHAQUE scan (y compris la branche racine vide) :
+        // seul le résultat du scan le plus récent est publié. Robuste aux scans concurrents
+        // (changement de racine OU deux scans même racine terminant dans le désordre) — un
+        // simple `rootPath == token` ne suffisait pas pour le second cas.
+        scanGeneration += 1
+        let gen = scanGeneration
         guard !rootPath.isEmpty else {
             subfolders = []
+            refreshPrevious()
             return
         }
+        // L'énumération ET la construction des `FolderItem` (chacun fait un accès disque)
+        // tournent **hors du thread principal** : multipliés par le nombre de sous-dossiers,
+        // ils gèleraient la sidebar sur une grosse racine. C'est aussi ici — et pas chez
+        // l'appelant — qu'on rafraîchit les « précédentes » (sinon calculées sur des
+        // `subfolders` d'avant le scan).
         let rootURL = URL(fileURLWithPath: rootPath)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let items = Self.scanFolders(at: rootURL)
+            DispatchQueue.main.async {
+                guard self.scanGeneration == gen else { return }   // un scan plus récent a pris la main
+                self.subfolders = items
+                self.refreshPrevious()
+            }
+        }
+    }
+
+    /// Énumère les sous-dossiers visibles et construit leurs `FolderItem`. **Statique et
+    /// sans état** : conçu pour être appelé sur une file de fond (cf. `scan`).
+    private static func scanFolders(at rootURL: URL) -> [FolderItem] {
         let fm = FileManager.default
         guard let contents = try? fm.contentsOfDirectory(
             at: rootURL,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
         ) else {
-            subfolders = []
-            return
+            return []
         }
-        subfolders = contents
+        return contents
             .filter { url in
                 guard !url.lastPathComponent.hasPrefix(".") else { return false }
                 let values = try? url.resourceValues(forKeys: [.isDirectoryKey])
@@ -484,6 +539,8 @@ struct ClaudeLauncherView: View {
 
     /// (Re)construit la liste des favoris résolus. Appelé sur événements discrets
     /// (apparition, retour au premier plan, changement de favoris), jamais par rendu.
+    /// Rafraîchit ensuite les « Précédentes » : au lancement racine vide, c'est le seul
+    /// déclencheur qui voit des favoris peuplés (le scan racine-vide tourne avant).
     private func loadFavorites() {
         favoriteFolders = favorites.paths
             .compactMap { path -> FolderItem? in
@@ -493,6 +550,7 @@ struct ClaudeLauncherView: View {
                 return FolderItem(url: URL(fileURLWithPath: path))
             }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        refreshPrevious()
     }
 
     /// Rafraîchit la section « Précédentes » pour les dossiers visibles (sous-dossiers
@@ -515,8 +573,8 @@ struct ClaudeLauncherView: View {
         if panel.runModal() == .OK, let url = panel.url {
             rootPath = url.path
             searchText = ""
-            scan()
-            refreshPrevious()
+            subfolders = []   // vide TOUT DE SUITE : évite d'afficher les dossiers de l'ancienne racine pendant le scan async
+            scan()            // rafraîchit les « précédentes » à sa complétion
         }
     }
 }

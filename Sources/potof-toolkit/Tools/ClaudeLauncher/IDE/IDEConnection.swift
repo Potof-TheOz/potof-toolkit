@@ -19,6 +19,9 @@ final class IDEConnection {
     private let handlers: IDEDiffHandlers
 
     var onClose: (() -> Void)?
+    /// Handshake WebSocket réussi = `claude` est connecté (donc booté, après un
+    /// éventuel prompt « trust this folder »). Signal robuste pour seeder `/init`.
+    var onHandshake: (() -> Void)?
 
     private var queue: DispatchQueue = .main
     private var didHandshake = false
@@ -105,6 +108,7 @@ final class IDEConnection {
         sendRaw(resp)
         didHandshake = true
         IDELog.log("handshake WebSocket OK — connexion IDE établie")
+        onHandshake?()
         if !inbound.isEmpty { parseFrames() }
     }
 

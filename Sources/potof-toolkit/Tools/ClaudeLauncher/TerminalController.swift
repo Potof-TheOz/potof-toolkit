@@ -33,9 +33,17 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     var onOpenDiff: ((UUID, IDEDiffRequest, @escaping (IDEDiffVerdict) -> Void) -> Void)?
     var onCloseTab: ((UUID, String) -> Void)?
     var onCloseAllTabs: ((UUID) -> Void)?
+    /// `claude` s'est connecté au pont IDE de la session (= booté). Sert à seeder `/init`.
+    var onIDEConnected: ((UUID) -> Void)?
 
     /// Vue terminal d'une session (nil si aucune / déjà libérée).
     func view(for id: UUID) -> LocalProcessTerminalView? { views[id] }
+
+    /// Le pont IDE (aperçu des diffs) est-il actif pour cette session ? Faux si la
+    /// réservation de port a échoué au lancement (`IDEServer.isAvailable == false`) :
+    /// `claude` n'émet alors pas d'`openDiff`, donc l'auto-init CLAUDE.md — qui dépend
+    /// de l'aperçu Accepter/Refuser — ne peut pas fonctionner.
+    func hasIDEBridge(id: UUID) -> Bool { ideServers[id] != nil }
 
     /// Écrit des octets bruts dans le PTY d'une session (ex. répondre `Entrée` à un
     /// prompt de permission). No-op si la session n'existe pas.
@@ -94,6 +102,7 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
             ide.onOpenDiff = { [weak self] req, done in self?.onOpenDiff?(id, req, done) }
             ide.onCloseTab = { [weak self] tab in self?.onCloseTab?(id, tab) }
             ide.onCloseAllTabs = { [weak self] in self?.onCloseAllTabs?(id) }
+            ide.onConnected = { [weak self] in self?.onIDEConnected?(id) }
             ide.start()
             env.append(contentsOf: ide.environment)
             ideServers[id] = ide
