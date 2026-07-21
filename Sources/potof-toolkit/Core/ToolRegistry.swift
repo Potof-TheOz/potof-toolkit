@@ -12,6 +12,13 @@ enum ToolRegistry {
             subtitle: "Lancer Claude Code dans un terminal embarqué",
             icon: "terminal.fill",
             view: { ClaudeLauncherView() }
+        ),
+        Tool(
+            id: GitStuffsView.toolID,
+            title: "Git Stuffs",
+            subtitle: "Explorer les repos git et rebaser interactivement",
+            icon: "arrow.triangle.branch",
+            view: { GitStuffsView() }
         )
     ]
 }
