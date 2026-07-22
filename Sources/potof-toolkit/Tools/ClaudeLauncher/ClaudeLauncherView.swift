@@ -6,6 +6,8 @@ import AppKit
 /// Disposition en deux volets (`HSplitView`) :
 /// - **Sidebar gauche** : sessions Claude en cours (haut) + un sélecteur
 ///   `Dossiers / Favoris` listant les dossiers d'où lancer une nouvelle session.
+///   Les deux blocs sont séparés par un `VSplitView` : leur répartition en hauteur
+///   se règle à la souris.
 /// - **Centre** : le **terminal embarqué** de la session active (`claude` tourne
 ///   dans un PTY possédé par l'app). Fermer une session tue son process.
 struct ClaudeLauncherView: View {
@@ -110,10 +112,30 @@ struct ClaudeLauncherView: View {
 
     private var sidebar: some View {
         VStack(spacing: 0) {
-            if !sessions.sessions.isEmpty {
-                sessionsSection
-                Divider()
+            if sessions.sessions.isEmpty {
+                folderPane
+            } else {
+                // Split vertical redimensionnable : la poignée entre les deux volets
+                // permet de donner plus de place aux sessions ou aux dossiers, au besoin.
+                VSplitView {
+                    sessionsSection
+                        .frame(minHeight: 88, idealHeight: 200, maxHeight: .infinity)
+                    folderPane
+                        .frame(minHeight: 200, maxHeight: .infinity)
+                }
             }
+            Divider()
+            sidebarFooter
+        }
+        .frame(maxHeight: .infinity)
+        .background(.background)
+    }
+
+    /// Volet bas de la sidebar : accès aux sessions précédentes + contrôles + liste
+    /// des dossiers. Extrait pour servir tel quel (aucune session active) ou comme
+    /// second volet du `VSplitView` (sessions actives présentes).
+    private var folderPane: some View {
+        VStack(spacing: 0) {
             if !previous.sessions.isEmpty {
                 previousSessionsButton
                 Divider()
@@ -121,11 +143,7 @@ struct ClaudeLauncherView: View {
             folderControls
             Divider()
             folderList
-            Divider()
-            sidebarFooter
         }
-        .frame(maxHeight: .infinity)
-        .background(.background)
     }
 
     private var sessionsSection: some View {
@@ -146,7 +164,9 @@ struct ClaudeLauncherView: View {
                 .padding(.horizontal, 8)
                 .padding(.bottom, 8)
             }
-            .frame(maxHeight: 220)
+            // Remplit le volet haut du VSplitView (la hauteur est fixée par la poignée,
+            // plus par un plafond en dur).
+            .frame(maxHeight: .infinity)
         }
     }
 
