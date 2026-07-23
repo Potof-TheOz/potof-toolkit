@@ -1,11 +1,14 @@
 # Potof Toolkit
 
 App macOS native (SwiftUI + AppKit) servant de **toolkit d'outils de dev locaux**.
-100 % local : aucun réseau, aucun compte, aucune télémétrie. Premier (et seul) outil
-à ce jour : **Claude Launcher** — liste les sous-dossiers d'un dossier racine et lance
-`claude` dans un **terminal embarqué** (SwiftTerm) affiché **au centre de l'app**. Les
-sessions sont **possédées par l'app** (process enfant dans un PTY) : les fermer **tue**
-le process. Voir `docs/SESSIONS.md`.
+100 % local : aucun réseau, aucun compte, aucune télémétrie. Trois outils à ce jour :
+**Claude Launcher** — liste les sous-dossiers d'un dossier racine et lance `claude`
+dans un **terminal embarqué** (SwiftTerm) affiché **au centre de l'app** ; les
+sessions sont **possédées par l'app** (process enfant dans un PTY) : les fermer
+**tue** le process (voir `docs/SESSIONS.md`). **Git Stuffs** — explore les repos git
+du poste et rebase interactivement. **Script Runner** — découvre les `package.json`
+et lance/arrête leurs scripts npm sur le même modèle de terminal possédé
+(voir `docs/SCRIPT_RUNNER.md`).
 
 > Le dépôt s'appelle encore `claude-launcher/` (dossier historique) mais le produit,
 > l'exécutable et l'app sont **`potof-toolkit`**.
@@ -45,13 +48,15 @@ Core/
     NotificationChannel.swift Tail du JSONL (DispatchSource vnode) ; décode ChannelEvent
     NotificationCenterCoordinator.swift  ⭐ Propriétaire : bus + Dock + bannières UN + clics
     NotificationSessionProviding.swift   Protocole de découplage (Core ↮ outil) + FocusRequest
+  Terminal/
+    TerminalHostView.swift    NSViewRepresentable partagé (a quitté ClaudeLauncher/) : place la
+                              vue terminal possédée par le contrôleur appelant + focus au chgt d'id
 Tools/
   ClaudeLauncher/             Premier outil
     ClaudeLauncherView.swift  UI : HSplitView(sidebar sessions+dossiers/favoris | terminal central)
     Session.swift             Modèle session possédée { id, folderURL, title, status }
-    SessionStore.swift        Source de vérité UI : launch / close / focus
+    SessionStore.swift        ⭐ Singleton : launch / close / focus (survit au switch d'outil)
     TerminalController.swift  Possède les LocalProcessTerminalView (PTY), spawn/kill, délégué SwiftTerm
-    TerminalHostView.swift    NSViewRepresentable : affiche la session active (vues gardées vivantes)
     FavoritesStore.swift      Favoris (chemins absolus, UserDefaults)
     FolderItem.swift          Modèle dossier (name + url)
     IDE/                      Pont IDE : aperçu des diffs Claude → docs/IDE_BRIDGE.md
@@ -60,10 +65,22 @@ Tools/
       IDEConnection.swift     Handshake WebSocket + framing RFC 6455 + JSON-RPC/MCP (openDiff)
       DiffModel.swift         Diff ligne-à-ligne (rognage préfixe/suffixe + LCS + garde-fou)
       DiffOverlayView.swift   Panneau SwiftUI : diff unifié + Accepter/Refuser
+  GitStuffs/                  Deuxième outil : explorer les repos git + rebase interactif
+  ScriptRunner/               Troisième outil : scripts npm → docs/SCRIPT_RUNNER.md
+    PackageProject.swift      Modèles ScriptPackage (id = chemin) + PackageProject { root, subpackages }
+    PackageStore.swift        Scan $HOME en fond + groupage monorepo + cache chemins (scriptRunner.packageDirs)
+    PackageManifest.swift     Relecture à chaud de package.json { name?, scripts triés par nom }
+    PackageManager.swift      npm/pnpm/yarn/bun : détection par lockfile racine + runCommand échappé
+    ScriptRun.swift           Modèle run { id, packageDir, scriptName, status } + decodeWaitStatus(raw)
+    ScriptTerminalController.swift  Possède les LocalProcessTerminalView (1/run), spawn + primitives d'arrêt
+    ScriptRunStore.swift      ⭐ Singleton : launch/stop/close/focus + machine à états de l'arrêt
+    ScriptRunnerView.swift    UI : HSplitView(sidebar exécutions+projets | run ou détail au centre)
+    PackageDetailView.swift   Détail d'un package : scripts + badge manager + ▶ (ou « voir le run »)
 Resources/AppIcon.png         Icône 1024×1024 (→ Bundle.module en dev, → .icns en bundle)
 ```
 `Scripts/build-app.sh` : packaging en `.app` (voir LIFECYCLE). Détails du modèle de
-session (spawn, PATH, cycle de vie) → **`docs/SESSIONS.md`**.
+session (spawn, PATH, cycle de vie) → **`docs/SESSIONS.md`** ; modèle d'exécution et
+d'arrêt des scripts npm → **`docs/SCRIPT_RUNNER.md`**.
 
 ## Ajouter un outil (le geste clé)
 1. Créer `Tools/<MonOutil>/<MonOutil>View.swift` — n'importe quelle `View` SwiftUI.
@@ -94,12 +111,31 @@ sont automatiques. L'outil occupe tout le cadre sous le header et gère sa propr
   de session — sinon perte du process + scrollback). `TerminalHostView` ne fait que placer
   la vue. Toutes les mutations d'état passent par le **thread principal** (callbacks du
   delegate SwiftTerm remarshalés). Détails → `docs/SESSIONS.md`.
+- **Changer d'outil ne perd jamais un terminal** : `RootView` pose `.id(tool.id)` sur la
+  vue de l'outil → au switch, la vue ET ses `@StateObject` sont **détruits**. Tout état
+  process-backed vit donc dans des **singletons app-level** (`SessionStore.shared`,
+  `ScriptRunStore.shared` et leurs contrôleurs terminal), observés via `@ObservedObject`.
+  Ne PAS revenir à des `@StateObject` pour ces stores (sinon terminaux orphelins :
+  process vivants mais invisibles au retour sur l'outil).
 - **Login shell interactif pour le PATH** : on lance **`$SHELL -l -i`** (login + interactif
   → source `.zprofile`/`.zshrc`… → PATH complet), puis on écrit `cd '<dossier>' && claude⏎`.
   Ne PAS lancer `claude` en direct (le PATH par défaut de SwiftTerm exclut `PATH`).
   Échappement shell de l'apostrophe (`'` → `'\''`) conservé.
-- **Quitter tue les sessions** (l'app possède les process) → `applicationShouldTerminate`
-  confirme s'il reste des sessions actives. Garde-fou à conserver.
+- **Script Runner : contrat `; exit` + statut waitpid brut** : la commande écrite est
+  `cd '<dir>' && <mgr> run '<script>'; exit` — `; exit` (PAS `&&`) fait mourir le shell
+  même si le script échoue, et `exit` sans argument propage `$?` → la fin du script tue
+  le shell et `processTerminated` livre alors le statut waitpid **BRUT** (exit 1 arrive
+  comme `256`), à décoder exclusivement via `ScriptRun.decodeWaitStatus`. Détails →
+  `docs/SCRIPT_RUNNER.md`.
+- **Kill propre des scripts** : ne JAMAIS utiliser `terminate()` de SwiftTerm pour arrêter
+  un run (il annule le monitor d'exit → plus aucun callback, badge figé) ; l'arrêt est la
+  séquence graduée Ctrl-C → `exit\r` conditionné par `tcgetpgrp(childfd) == shellPid`
+  (shell revenu au prompt) → SIGKILL du groupe de premier plan + du shell (~3 s).
+  `terminate()` ne sert qu'à **libérer** une vue. Détails → `docs/SCRIPT_RUNNER.md`.
+- **Quitter tue les sessions et les runs de scripts** (l'app possède les process) →
+  `applicationShouldTerminate` confirme s'il reste des process actifs (alerte combinée
+  sessions Claude + scripts) et `applicationWillTerminate` hardKill les groupes des
+  scripts. Garde-fou à conserver.
 - **`POTOF_SESSION_ID`** injecté dans l'env de chaque session = clé de mapping des
   notifications. Le hook `~/.claude/hooks/claude-notify.js` append un JSONL dans
   `~/Library/Application Support/PotofToolkit/notifications.jsonl` quand cette variable est

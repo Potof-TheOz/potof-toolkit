@@ -43,29 +43,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         NotificationCenterCoordinator.shared.stop()
+        // SIGKILL explicite des groupes de process des runs de scripts : la
+        // fermeture du fd maître du PTY ne SIGHUPe pas un dev server qui
+        // l'ignore — sans ça, ports orphelins après quit.
+        ScriptTerminalController.shared.terminateAll()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
     }
 
-    /// Comme l'app **possède** les process des sessions Claude (contrairement à
-    /// l'ancienne intégration iTerm2 où les onglets survivaient), quitter les tue.
-    /// On confirme s'il reste des sessions actives, pour éviter de perdre un travail
-    /// en cours par ⌘Q ou fermeture de fenêtre réflexe. Sur annulation, on ré-affiche
-    /// la fenêtre (cas où elle venait d'être fermée).
+    /// Comme l'app **possède** les process des sessions Claude ET des runs de
+    /// scripts (contrairement à l'ancienne intégration iTerm2 où les onglets
+    /// survivaient), quitter les tue. On confirme s'il reste des process actifs,
+    /// pour éviter de perdre un travail en cours par ⌘Q ou fermeture de fenêtre
+    /// réflexe. Sur annulation, on ré-affiche la fenêtre (cas où elle venait
+    /// d'être fermée).
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        let count = TerminalController.shared.runningProcessCount
-        guard count > 0 else { return .terminateNow }
+        let claudeCount = TerminalController.shared.runningProcessCount
+        let scriptCount = ScriptTerminalController.shared.runningProcessCount
+        guard claudeCount + scriptCount > 0 else { return .terminateNow }
 
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = count == 1
-            ? "Une session Claude est active"
-            : "\(count) sessions Claude sont actives"
-        alert.informativeText = count == 1
-            ? "Quitter fermera cette session et arrêtera le process Claude."
-            : "Quitter fermera ces sessions et arrêtera les process Claude."
+        switch (claudeCount, scriptCount) {
+        case (_, 0):
+            // Sessions Claude seulement (libellés historiques conservés).
+            alert.messageText = claudeCount == 1
+                ? "Une session Claude est active"
+                : "\(claudeCount) sessions Claude sont actives"
+            alert.informativeText = claudeCount == 1
+                ? "Quitter fermera cette session et arrêtera le process Claude."
+                : "Quitter fermera ces sessions et arrêtera les process Claude."
+        case (0, _):
+            // Scripts seulement.
+            alert.messageText = scriptCount == 1
+                ? "Un script est en cours d'exécution"
+                : "\(scriptCount) scripts sont en cours d'exécution"
+            alert.informativeText = scriptCount == 1
+                ? "Quitter arrêtera ce script (processus tué)."
+                : "Quitter arrêtera ces scripts (processus tués)."
+        default:
+            // Les deux à la fois.
+            let sessions = claudeCount == 1
+                ? "1 session Claude"
+                : "\(claudeCount) sessions Claude"
+            let scripts = scriptCount == 1
+                ? "1 script"
+                : "\(scriptCount) scripts"
+            alert.messageText = "Des processus sont actifs : \(sessions) et \(scripts)"
+            alert.informativeText = "Quitter fermera "
+                + (claudeCount == 1 ? "cette session Claude" : "ces sessions Claude")
+                + " et arrêtera "
+                + (scriptCount == 1 ? "ce script" : "ces scripts")
+                + " (processus tués)."
+        }
         alert.addButton(withTitle: "Quitter")
         alert.addButton(withTitle: "Annuler")
 

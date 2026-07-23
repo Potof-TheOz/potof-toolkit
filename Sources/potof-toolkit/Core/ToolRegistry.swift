@@ -19,6 +19,13 @@ enum ToolRegistry {
             subtitle: "Explorer les repos git et rebaser interactivement",
             icon: "arrow.triangle.branch",
             view: { GitStuffsView() }
+        ),
+        Tool(
+            id: ScriptRunnerView.toolID,
+            title: "Script Runner",
+            subtitle: "Lancer les scripts npm de vos projets",
+            icon: "play.rectangle.fill",
+            view: { ScriptRunnerView() }
         )
     ]
 }
