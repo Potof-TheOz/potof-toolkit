@@ -2,14 +2,20 @@ import SwiftUI
 import AppKit
 import SwiftTerm
 
-/// Affiche le terminal de la session active. Les `LocalProcessTerminalView` sont
-/// possédées par `TerminalController` (jamais recréées) : cette vue ne fait que
-/// placer la bonne vue dans un conteneur et lui donner le focus clavier.
+/// Affiche un terminal embarqué (SwiftTerm) au centre d'un outil. Vue **partagée**
+/// par le Claude Launcher et le Script Runner : les `LocalProcessTerminalView` sont
+/// possédées par le contrôleur de l'outil appelant (jamais recréées — sinon perte du
+/// process + scrollback) ; cette vue ne fait que **placer** la vue résolue par
+/// l'appelant dans un conteneur et lui donner le focus clavier.
 struct TerminalHostView: NSViewRepresentable {
-    let controller: TerminalController
-    let sessionID: UUID?
+    /// Vue terminal résolue par l'appelant (gardée vivante ailleurs, dans le
+    /// contrôleur propriétaire). `nil` ⇒ rien à afficher.
+    let terminal: LocalProcessTerminalView?
+    /// Identité de ce qui est affiché (session, run…) : le focus clavier n'est
+    /// donné qu'au **changement** de cette identité.
+    let focusID: UUID?
 
-    /// Mémorise la dernière session à qui on a donné le focus, pour ne pas le
+    /// Mémorise la dernière identité à qui on a donné le focus, pour ne pas le
     /// reprendre à chaque recomposition SwiftUI.
     final class Coordinator {
         var focusedID: UUID?
@@ -24,15 +30,13 @@ struct TerminalHostView: NSViewRepresentable {
     }
 
     func updateNSView(_ container: NSView, context: Context) {
-        let desired = sessionID.flatMap { controller.view(for: $0) }
-
         // Retirer toute vue terminal qui n'est pas celle attendue (on ne la
-        // détruit pas : elle reste vivante dans le controller).
-        for sub in container.subviews where sub !== desired {
+        // détruit pas : elle reste vivante dans son contrôleur).
+        for sub in container.subviews where sub !== terminal {
             sub.removeFromSuperview()
         }
 
-        guard let term = desired else {
+        guard let term = terminal else {
             context.coordinator.focusedID = nil
             return
         }
@@ -49,12 +53,12 @@ struct TerminalHostView: NSViewRepresentable {
             ])
         }
 
-        // Ne donner le focus clavier qu'au **changement** de session affichée.
+        // Ne donner le focus clavier qu'au **changement** d'identité affichée.
         // Sinon chaque recomposition (ex. frappe dans le champ de recherche de la
         // sidebar) reprendrait le focus au terminal, rendant la recherche
         // inutilisable.
-        if context.coordinator.focusedID != sessionID {
-            context.coordinator.focusedID = sessionID
+        if context.coordinator.focusedID != focusID {
+            context.coordinator.focusedID = focusID
             DispatchQueue.main.async {
                 term.window?.makeFirstResponder(term)
             }

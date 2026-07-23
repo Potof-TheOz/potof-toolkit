@@ -8,6 +8,13 @@ import Combine
 /// de concurrence) : par construction, toutes les mutations passent par le thread
 /// principal — actions UI + callbacks du controller déjà remarshalés sur `main`.
 final class SessionStore: ObservableObject {
+    /// Singleton app-level : `RootView` détruit la vue de l'outil (et ses
+    /// `@StateObject`) au switch d'outil, alors que les sessions sont des process
+    /// vivants dans `TerminalController.shared`. Sans singleton, revenir sur
+    /// l'outil repartirait d'une liste vide (terminaux orphelins invisibles).
+    /// Invariant : changer d'outil ne perd jamais un terminal.
+    static let shared = SessionStore()
+
     @Published private(set) var sessions: [Session] = []
     @Published var activeID: UUID?
     /// Aperçus de diff en attente de décision, par session (intégration IDE).
@@ -16,7 +23,7 @@ final class SessionStore: ObservableObject {
 
     let terminal = TerminalController.shared
 
-    init() {
+    private init() {
         terminal.onTitleChange = { [weak self] id, title in
             self?.updateTitle(id, title)
         }

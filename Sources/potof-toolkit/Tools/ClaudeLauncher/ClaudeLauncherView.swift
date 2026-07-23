@@ -17,7 +17,9 @@ struct ClaudeLauncherView: View {
 
     @AppStorage("rootPath") private var rootPath: String = ""
     @StateObject private var favorites = FavoritesStore()
-    @StateObject private var sessions = SessionStore()
+    /// `@ObservedObject` sur le singleton (PAS `@StateObject`) : `RootView` détruit
+    /// la vue au switch d'outil ; les sessions (process vivants) doivent survivre.
+    @ObservedObject private var sessions = SessionStore.shared
     /// Sessions Claude passées (lecture des `.jsonl` de `~/.claude/projects`),
     /// limitées aux dossiers visibles. Reconstruites sur événements discrets.
     @StateObject private var previous = PreviousSessionsStore()
@@ -385,7 +387,7 @@ struct ClaudeLauncherView: View {
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
-                    TerminalHostView(controller: sessions.terminal, sessionID: session.id)
+                    TerminalHostView(terminal: sessions.terminal.view(for: session.id), focusID: session.id)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }

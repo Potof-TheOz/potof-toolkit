@@ -23,7 +23,7 @@ TerminalController (NSObject, délégué SwiftTerm)
 LocalProcessTerminalView (SwiftTerm)  ── PTY ──▶  $SHELL -l  ──▶  claude
    ▲
    │  affichée (jamais recréée) par
-TerminalHostView (NSViewRepresentable)
+TerminalHostView (NSViewRepresentable, Core/Terminal/ — partagée avec Script Runner)
 ```
 
 ## Cycle de vie d'une session
@@ -47,12 +47,14 @@ TerminalHostView (NSViewRepresentable)
    précédente** —, la commande devient `cd '<dossier>' && claude --resume '<id>'⏎`
    (cf. section « Sessions précédentes »).
 
-### Afficher — `TerminalHostView`
-- N'affiche **jamais** deux fois la même vue et **ne recrée pas** les vues : elle
-  demande au `TerminalController` la vue de la session active et la place dans un
-  conteneur (contraintes plein cadre). Changer de session = échanger la sous-vue,
-  **sans perdre scrollback ni process**.
-- Donne le focus clavier au terminal affiché (`makeFirstResponder`).
+### Afficher — `TerminalHostView` (partagée, `Core/Terminal/`)
+- N'affiche **jamais** deux fois la même vue et **ne recrée pas** les vues : l'appelant
+  lui passe la vue de la session active (résolue auprès de son contrôleur) et elle la
+  place dans un conteneur (contraintes plein cadre). Changer de session = échanger la
+  sous-vue, **sans perdre scrollback ni process**.
+- Donne le focus clavier au terminal affiché (`makeFirstResponder`), une seule fois
+  par changement de `focusID`.
+- Vue **partagée** avec le Script Runner (elle a quitté `Tools/ClaudeLauncher/`).
 
 ### Fermer — `SessionStore.close(id:)`
 - `TerminalController.terminate(id:)` **coupe d'abord le delegate** (pour ne pas
@@ -147,7 +149,7 @@ bien plus coûteux.
 | `Tools/ClaudeLauncher/PreviousSession.swift` | Modèle d'une session passée `{ id, folderURL, title, lastUsed, gitBranch }` |
 | `Tools/ClaudeLauncher/PreviousSessionsStore.swift` | Lit/parse `~/.claude/projects` (fond + cache `mtime`), matche par `cwd` |
 | `Tools/ClaudeLauncher/TerminalController.swift` | Possède les vues/PTY, spawn/kill, délégué SwiftTerm |
-| `Tools/ClaudeLauncher/TerminalHostView.swift` | `NSViewRepresentable` : affiche la session active |
+| `Core/Terminal/TerminalHostView.swift` | `NSViewRepresentable` partagé : affiche la vue terminal fournie |
 | `Tools/ClaudeLauncher/ClaudeLauncherView.swift` | UI : sidebar (sessions + dossiers/favoris) + terminal central |
 
 ## Limites connues
