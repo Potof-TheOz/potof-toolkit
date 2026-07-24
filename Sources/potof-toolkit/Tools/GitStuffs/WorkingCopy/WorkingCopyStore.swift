@@ -234,8 +234,11 @@ final class WorkingCopyStore: ObservableObject {
         let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
         let process = Process()
         process.executableURL = URL(fileURLWithPath: shell)
-        // -l : shell de login → source les profils → PATH complet (claude, node…).
-        process.arguments = ["-l", "-c", "claude -p '/staged-file-commit-message'"]
+        // -l -i : login + interactif → source .zprofile ET .zshrc. `claude` vit souvent dans
+        // un PATH ajouté par .zshrc (interactif) : lancée depuis le Finder, l'app n'hérite que
+        // d'un PATH minimal, donc `-l` seul ne suffit pas (« command not found: claude »).
+        // Même parade que les sessions du Launcher (cf. CLAUDE.md).
+        process.arguments = ["-l", "-i", "-c", "claude -p '/staged-file-commit-message'"]
         process.currentDirectoryURL = repo
         process.standardInput = FileHandle.nullDevice     // headless : pas d'attente d'entrée
         var env = ProcessInfo.processInfo.environment
