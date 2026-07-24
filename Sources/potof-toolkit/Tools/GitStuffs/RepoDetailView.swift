@@ -1,21 +1,20 @@
 import SwiftUI
 import AppKit
 
-/// Espace de travail d'un repo (modèle GitHub Desktop). Recréé par repo (`.id(repo.id)`).
+/// Espace de travail d'un worktree (modèle GitHub Desktop). Recréé par worktree (`.id(worktree.id)`).
 ///
-/// - **Top bar** : sélecteur de repo (`RepoPicker`) + branche + badge de synchro (↑/↓/⚠️) +
+/// - **Top bar** : sélecteur de worktree (`ProjectPicker`) + branche + badge de synchro (↑/↓/⚠️) +
 ///   actions Fetch · Pull · Push · Recharger.
 /// - **Colonne gauche** : toggle **Modifications | Historique**.
 ///   - *Modifications* → fichiers en diff (`ChangesListView`) + boîte de commit.
 ///   - *Historique* → liste des commits (clic = diff à droite, clic droit = rebase).
 /// - **Colonne droite** : diff du fichier working tree sélectionné, ou du commit sélectionné.
 struct RepoDetailView: View {
-    let repo: GitRepo
-    /// Repos connus + pilotage du scan, pour le sélecteur.
-    let repos: [GitRepo]
-    let isScanning: Bool
-    let onRescan: () -> Void
-    let onSelectRepo: (GitRepo) -> Void
+    let worktree: Worktree
+    /// Source des projets/worktrees pour le sélecteur (nommé `projects` pour ne pas entrer
+    /// en collision avec le `@StateObject private var store: WorkingCopyStore`).
+    let projects: ProjectStore
+    let onSelect: (Worktree) -> Void
 
     @StateObject private var detail: RepoDetail
     /// Couche « working copy » (statut, staging, commit, push/pull, auto-fetch).
@@ -33,15 +32,12 @@ struct RepoDetailView: View {
     /// Résolveur de conflits (pull --rebase en conflit), ou nil. Remplace tout le centre.
     @State private var conflictResolver: ConflictResolver?
 
-    init(repo: GitRepo, repos: [GitRepo], isScanning: Bool,
-         onRescan: @escaping () -> Void, onSelectRepo: @escaping (GitRepo) -> Void) {
-        self.repo = repo
-        self.repos = repos
-        self.isScanning = isScanning
-        self.onRescan = onRescan
-        self.onSelectRepo = onSelectRepo
-        _detail = StateObject(wrappedValue: RepoDetail(repo: repo.url))
-        _store = StateObject(wrappedValue: WorkingCopyStore(repo: repo.url))
+    init(worktree: Worktree, projects: ProjectStore, onSelect: @escaping (Worktree) -> Void) {
+        self.worktree = worktree
+        self.projects = projects
+        self.onSelect = onSelect
+        _detail = StateObject(wrappedValue: RepoDetail(repo: worktree.url))
+        _store  = StateObject(wrappedValue: WorkingCopyStore(repo: worktree.url))
     }
 
     var body: some View {
@@ -81,9 +77,9 @@ struct RepoDetailView: View {
 
     private var topBar: some View {
         HStack(spacing: 12) {
-            RepoPicker(repos: repos, currentID: repo.id, isScanning: isScanning,
-                       onRescan: onRescan, onSelect: onSelectRepo)
-            branchLabel
+            ProjectPicker(store: projects, current: worktree, onSelect: onSelect)
+            WorktreePicker(store: projects, current: worktree,
+                           branch: detail.branch, isDetached: detail.isDetached, onSelect: onSelect)
             syncBadge
             Spacer(minLength: 12)
             syncActions
@@ -91,18 +87,6 @@ struct RepoDetailView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
         .background(.bar)
-    }
-
-    private var branchLabel: some View {
-        HStack(spacing: 5) {
-            Image(systemName: "arrow.triangle.branch").font(.system(size: 10))
-                .accessibilityHidden(true)
-            Text(detail.branch.isEmpty ? "…" : detail.branch)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(detail.isDetached ? Color.orange : .secondary)
-                .lineLimit(1).truncationMode(.middle)
-        }
-        .help(detail.isDetached ? "HEAD détaché" : "Branche courante")
     }
 
     @ViewBuilder
@@ -239,7 +223,7 @@ struct RepoDetailView: View {
     }
 
     private func diffTarget(for commit: GitCommit) -> CommitDiffTarget {
-        CommitDiffTarget(repo: repo.url, hash: commit.hash, shortHash: commit.shortHash, subject: commit.subject)
+        CommitDiffTarget(repo: worktree.url, hash: commit.hash, shortHash: commit.shortHash, subject: commit.subject)
     }
 
     // MARK: - Liste des commits (colonne gauche, onglet Historique)
@@ -314,7 +298,7 @@ struct RepoDetailView: View {
         } else {
             Button {
                 rebase = RebaseController(
-                    repo: repo.url,
+                    repo: worktree.url,
                     commits: detail.commits,
                     upstream: detail.upstream,
                     initialCount: index + 1,
@@ -360,7 +344,7 @@ struct RepoDetailView: View {
             Spacer(minLength: 8)
             if !store.conflictedFiles.isEmpty {
                 Button("Résoudre les conflits") {
-                    let resolver = ConflictResolver(repo: repo.url)
+                    let resolver = ConflictResolver(repo: worktree.url)
                     resolver.onFinished = {
                         conflictResolver = nil
                         detail.load()
@@ -371,7 +355,7 @@ struct RepoDetailView: View {
                 .help("Résoudre les conflits dans l'app (bloc par bloc ou édition libre)")
             }
             Button("Reprendre le contrôle") {
-                let controller = RebaseController(repo: repo.url, commits: detail.commits, upstream: detail.upstream)
+                let controller = RebaseController(repo: worktree.url, commits: detail.commits, upstream: detail.upstream)
                 controller.attachToInProgress()
                 rebase = controller
             }
