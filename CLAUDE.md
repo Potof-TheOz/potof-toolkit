@@ -35,6 +35,14 @@ Détails deploy / debug / données / permissions → **`docs/LIFECYCLE.md`**.
   qu'un sous-process lancé dans un PTY ait accès au disque/commandes. Ne PAS l'activer.
 - Package **exécutable** buildable/lançable en terminal (sans Xcode).
 - Structure volontairement simple, pas de MVVM lourd.
+- **PAS de build/déploiement « sauvage » dans `~/Applications`** (ni `rm -rf` /
+  remplacement du bundle installé, ni quitter/relancer l'instance en cours) **sans
+  demande explicite de l'utilisateur** — ça tuerait toute session Claude embarquée.
+  **Si on n'est pas sur `main`, on ne déploie jamais dans `~/Applications`.** Pour
+  tester : **packager dans le scratchpad** (bundle `.app` assemblé hors `~/Applications`),
+  **sans toucher l'instance en cours** et **sans enregistrer le bundle dans Launch
+  Services** (`lsregister`) — pour ne pas détourner l'`open -a "Potof Toolkit"` habituel.
+  Lancer l'instance de test par chemin explicite : `open -n "<scratchpad>/Potof Toolkit.app"`.
 
 ## Architecture (`Sources/potof-toolkit/`)
 ```
