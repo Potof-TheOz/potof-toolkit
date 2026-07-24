@@ -18,6 +18,9 @@ struct CommitDiffView: View {
     /// = pas de bouton fermer (panneau toujours présent, ex. à droite du rebase).
     var onClose: (() -> Void)?
 
+    /// Disposition unifié / côte à côte, préférence globale partagée (voir `DiffLayoutMode`).
+    @AppStorage("gitStuffs.diffLayoutMode") private var layoutMode: DiffLayoutMode = .unified
+
     @State private var files: [FileChange] = []
     /// Fichier dont le diff est affiché en bas (arbre en haut). Défaut : le 1er.
     @State private var selectedFileID: FileChange.ID?
@@ -90,6 +93,7 @@ struct CommitDiffView: View {
                     .foregroundStyle(.red)
                     .font(.system(size: 11, weight: .semibold)).monospacedDigit()
             }
+            DiffLayoutToggle(mode: $layoutMode)
             if let onClose {
                 Button(action: onClose) {
                     Image(systemName: "xmark")
@@ -191,16 +195,33 @@ struct CommitDiffView: View {
                     .background(Color(nsColor: .textBackgroundColor))
             } else {
                 ScrollView(.vertical) {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(file.items) { item in
-                            switch item.content {
-                            case .line(let line): DiffLineRow(line: line, compactGutter: true)
-                            case .gap(let n):     gapRow(n)
+                    // Côte à côte : VStack EAGER (cf. WorkingDiffView) — un LazyVStack laisse
+                    // les lignes appariées hors écran non peintes (hauteurs variables). Unifié :
+                    // LazyVStack (fluide). `.id(layoutMode)` = bascule immédiate et propre.
+                    Group {
+                        if layoutMode == .sideBySide {
+                            VStack(alignment: .leading, spacing: 0) {
+                                ForEach(sideBySideItems(file.items)) { item in
+                                    switch item {
+                                    case .row(let row): commitSideBySideRow(row)
+                                    case .gap(_, let n): gapRow(n)
+                                    }
+                                }
+                            }
+                        } else {
+                            LazyVStack(alignment: .leading, spacing: 0) {
+                                ForEach(file.items) { item in
+                                    switch item.content {
+                                    case .line(let line): DiffLineRow(line: line, compactGutter: true)
+                                    case .gap(let n):     gapRow(n)
+                                    }
+                                }
                             }
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.vertical, 4)
+                    .id(layoutMode)
                 }
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -237,6 +258,52 @@ struct CommitDiffView: View {
         }
         .padding(.vertical, 2)
         .background(Color.primary.opacity(0.04))
+    }
+
+    // MARK: - Côte à côte
+
+    /// Élément d'affichage côte à côte : une ligne appariée, ou un repli de contexte.
+    /// Gaps et lignes partagent un même espace d'`id` → ids uniques pour `ForEach`.
+    private enum SxSDisplayItem: Identifiable {
+        case row(SideBySideDiffRow)
+        case gap(id: Int, count: Int)
+        var id: Int { switch self { case .row(let r): return r.id; case .gap(let id, _): return id } }
+    }
+
+    /// Transforme les `DiffDisplayItem` (déjà repliés) en éléments côte à côte : on
+    /// accumule les lignes consécutives puis on les apparie via `SideBySideDiff.pair`,
+    /// et chaque `.gap` réémet un repli pleine largeur. Correct car un `.gap` ne remplace
+    /// que du **contexte** (`collapse` garde ≥ `contextLines` autour de chaque modif) →
+    /// les piles d'appariement sont toujours vides au bord d'un gap.
+    private func sideBySideItems(_ items: [DiffDisplayItem]) -> [SxSDisplayItem] {
+        var out: [SxSDisplayItem] = []
+        var buffer: [DiffLine] = []
+        var id = 0
+        func flushRun() {
+            guard !buffer.isEmpty else { return }
+            for r in SideBySideDiff.pair(buffer) {
+                out.append(.row(SideBySideDiffRow(id: id, left: r.left, right: r.right)))
+                id += 1
+            }
+            buffer.removeAll(keepingCapacity: true)
+        }
+        for item in items {
+            switch item.content {
+            case .line(let l): buffer.append(l)
+            case .gap(let n):  flushRun(); out.append(.gap(id: id, count: n)); id += 1
+            }
+        }
+        flushRun()
+        return out
+    }
+
+    /// Une ligne appariée : ancien à gauche, nouveau à droite (lecture seule, pas de case).
+    private func commitSideBySideRow(_ row: SideBySideDiffRow) -> some View {
+        HStack(alignment: .top, spacing: 0) {
+            DiffHalfRow(line: row.left, side: .old)
+            Divider()
+            DiffHalfRow(line: row.right, side: .new)
+        }
     }
 
     /// Réduit les lignes au contexte de `contextLines` autour de chaque modif ; les
