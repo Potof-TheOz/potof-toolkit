@@ -74,10 +74,16 @@ Tools/
       DiffModel.swift         Diff ligne-à-ligne (rognage préfixe/suffixe + LCS + garde-fou)
       DiffOverlayView.swift   Panneau SwiftUI : diff unifié + Accepter/Refuser
   GitStuffs/                  Deuxième outil : explorer les repos git, rebase interactif + copie de travail
-    GitStuffsView.swift       UI racine : RepoPicker (menu déroulant filtrable + re-scan) + auto-sélection
-    RepoDetailView.swift      ⭐ Espace de travail (modèle GitHub Desktop) : top bar sync (↑/↓/⚠️ + Fetch/Pull/
-                              Push) + onglets Modifications | Historique + intégration. Seul fichier existant
-                              modifié pour la copie de travail.
+    GitStuffsView.swift       UI racine : sélection d'un worktree (favoris de projets) + fallback + onboarding
+    Projects/                 ⭐ Favoris de PROJETS worktree-aware (unité = --git-common-dir, pas un dossier de repo)
+      GitProjectModels.swift  Worktree/GitProject + parsers PURS (git worktree list ; .git worktree vs sous-module)
+      GitProjectService.swift Shell-outs git fins : common-dir absolu normalisé, worktree list, resolveProject
+      ProjectStore.swift      ⭐ Store : scan (accepte les .git FICHIERS, saute les sous-modules) + favoris + dernier
+                              worktree ouvert + worktrees énumérés PARESSEUSEMENT ; NON process-backed (@StateObject)
+      ProjectPicker.swift     Sélecteur de PROJET : 2 sections (Favoris + Tous repliée) / recherche plate / ★ / Ajouter
+      WorktreePicker.swift    Sélecteur de WORKTREE (branche) du projet courant : dropdown si multi, libellé sinon
+    RepoDetailView.swift      ⭐ Espace de travail (modèle GitHub Desktop) : top bar (ProjectPicker + WorktreePicker +
+                              sync ↑/↓/⚠️ + Fetch/Pull/Push) + onglets Modifications | Historique. Alimenté par worktree.url.
     CommitDiffView.swift      Diff LECTURE SEULE d'un commit (arbre de fichiers + git show)
     WorkingCopy/              Couche « copie de travail » : staging hunk/ligne, commit, sync, conflits
       GitStatusModels.swift   FileStatus, RepoSyncState, protocole WorkingCopyServicing (contrat des actions)
