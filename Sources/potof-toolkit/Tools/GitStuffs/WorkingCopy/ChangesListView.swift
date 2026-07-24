@@ -7,7 +7,11 @@ struct ChangesListView: View {
     @ObservedObject var store: WorkingCopyStore
     /// Fichier dont le diff est affiché à droite (surlignage), ou `nil`.
     let selectedFileID: FileStatus.ID?
-    let onSelectFile: (FileStatus) -> Void
+    /// Mode de la sélection courante (indexé / non indexé). Un fichier « MM » apparaît dans
+    /// les deux sections → on ne surligne que celle qui correspond à ce mode.
+    let selectedMode: WorkingDiffView.Mode
+    /// Clic sur un fichier : porte le mode de la section (INDEXÉ → .staged, NON INDEXÉ → .unstaged).
+    let onSelectFile: (FileStatus, WorkingDiffView.Mode) -> Void
 
     /// Corps de message déplié ? (replié par défaut : peu utilisé.)
     @State private var showsBody = false
@@ -63,12 +67,12 @@ struct ChangesListView: View {
         } else {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    section("Conflits", files: store.conflictedFiles, folder: nil)
-                    section("Indexé", files: store.stagedFiles, folder: .unstage,
+                    section("Conflits", files: store.conflictedFiles, folder: nil, mode: .unstaged)
+                    section("Indexé", files: store.stagedFiles, folder: .unstage, mode: .staged,
                             allAction: store.stagedFiles.isEmpty ? nil : ("Tout déstager", { store.unstageAll() }))
                     // « Non indexé » fusionne modifiés-non-stagés + non-suivis ; les pastilles
                     // (M orange, ? vert, D rouge…) différencient les statuts.
-                    section("Non indexé", files: store.unstagedFiles + store.untrackedFiles, folder: .stage,
+                    section("Non indexé", files: store.unstagedFiles + store.untrackedFiles, folder: .stage, mode: .unstaged,
                             allAction: nonStagedEmpty ? nil : ("Tout stager", { store.stageAll() }))
                 }
                 .padding(.vertical, 6)
@@ -82,6 +86,7 @@ struct ChangesListView: View {
     @ViewBuilder
     private func section(_ title: String, files: [FileStatus],
                          folder: FolderAction?,
+                         mode: WorkingDiffView.Mode,
                          allAction: (label: String, action: () -> Void)? = nil) -> some View {
         if !files.isEmpty {
             HStack(spacing: 6) {
@@ -99,9 +104,11 @@ struct ChangesListView: View {
             FileTreeView(
                 items: files.map { FileTreeItem(path: $0.path, value: $0) },
                 collapsed: $collapsedFolders,
-                selectedPath: selectedFileID,
+                // Ne surligner que si la sélection courante vise CETTE section (sinon un
+                // fichier « MM » s'allumerait dans les deux).
+                selectedPath: selectedMode == mode ? selectedFileID : nil,
                 namespace: title,
-                onSelect: { onSelectFile($0) },
+                onSelect: { onSelectFile($0, mode) },
                 leading: { badge($0) },
                 trailing: { fileActions($0) },
                 folderTrailing: { path, _ in folderButton(folder, path: path) }

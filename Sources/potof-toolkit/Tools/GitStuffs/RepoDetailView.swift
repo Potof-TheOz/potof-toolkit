@@ -29,6 +29,10 @@ struct RepoDetailView: View {
     @State private var diffTarget: CommitDiffTarget?
     /// Fichier du working tree dont on affiche le diff interactif (onglet Modifications).
     @State private var selectedWorkingFileID: FileStatus.ID?
+    /// Section d'où vient la sélection : un fichier « MM » (indexé ET non indexé) apparaît
+    /// dans les deux sections → ce mode dit lequel afficher (et surligner) : INDEXÉ →
+    /// `.staged`, NON INDEXÉ → `.unstaged`.
+    @State private var selectedWorkingMode: WorkingDiffView.Mode = .unstaged
     /// Résolveur de conflits (pull --rebase en conflit), ou nil. Remplace tout le centre.
     @State private var conflictResolver: ConflictResolver?
 
@@ -167,7 +171,11 @@ struct RepoDetailView: View {
                 ChangesListView(
                     store: store,
                     selectedFileID: selectedWorkingFileID,
-                    onSelectFile: { selectedWorkingFileID = $0.id }
+                    selectedMode: selectedWorkingMode,
+                    onSelectFile: { file, mode in
+                        selectedWorkingFileID = file.id
+                        selectedWorkingMode = mode
+                    }
                 )
             } else {
                 historyList
@@ -190,11 +198,14 @@ struct RepoDetailView: View {
     @ViewBuilder
     private var changesRightPane: some View {
         if let file = liveSelectedFile {
-            WorkingDiffView(file: file, store: store, onClose: { selectedWorkingFileID = nil })
+            WorkingDiffView(file: file, store: store, initialMode: selectedWorkingMode,
+                            onClose: { selectedWorkingFileID = nil })
                 // Recréer la vue (donc réinitialiser `mode`) quand la composition staged/
                 // unstaged du fichier change : sinon `mode` reste figé (ex. après avoir tout
                 // stagé un fichier non indexé, on reste bloqué sur un diff non indexé vide).
-                .id("\(file.id)#\(file.isStaged)\(file.hasUnstagedChanges)\(file.isUntracked)")
+                // Le mode de sélection est dans l'identité → cliquer INDEXÉ vs NON INDEXÉ
+                // recrée la vue sur le bon diff.
+                .id("\(file.id)#\(file.isStaged)\(file.hasUnstagedChanges)\(file.isUntracked)#\(selectedWorkingMode.rawValue)")
         } else {
             placeholder(icon: store.isClean ? "checkmark.seal" : "sidebar.left",
                         text: store.isClean
