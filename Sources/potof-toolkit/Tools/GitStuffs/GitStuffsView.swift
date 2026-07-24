@@ -3,29 +3,33 @@ import AppKit
 
 /// Outil « Git Stuffs ».
 ///
-/// Disposition en deux volets (`HSplitView`, jamais `NavigationSplitView`) :
-/// - **Sidebar gauche** : liste filtrable des repos git découverts sur le poste.
-/// - **Centre** : sur le repo sélectionné, la branche courante + le graphe de
-///   commits, et l'accès au rebase interactif.
-///
-/// v1 : la seule action git offerte est le **rebase interactif** (réel, encadré).
+/// Modèle **GitHub Desktop** : pas de barre latérale permanente de repos. Le repo courant
+/// se choisit via un **menu déroulant** en haut (`RepoPicker`) ; le centre affiche pour ce
+/// repo un espace de travail à deux onglets **Modifications / Historique** (`RepoDetailView`).
 struct GitStuffsView: View {
     /// Id de l'outil (référencé par `ToolRegistry`).
     static let toolID: Tool.ID = "git-stuffs"
 
     @StateObject private var repos = RepoStore()
     @State private var selection: GitRepo.ID?
-    @State private var searchText = ""
-    /// Le scan de `$HOME` n'est automatique qu'au tout 1er lancement ; ensuite on lit
-    /// le cache (le bouton Rafraîchir relance un scan à la demande).
+    /// Le scan de `$HOME` n'est automatique qu'au tout 1er lancement ; ensuite on lit le
+    /// cache (le bouton Rafraîchir du picker relance un scan à la demande).
     @AppStorage("gitStuffs.didScanOnce") private var didScanOnce = false
 
     var body: some View {
-        HSplitView {
-            sidebar
-                .frame(minWidth: 260, idealWidth: 300, maxWidth: 420)
-            center
-                .frame(minWidth: 480, maxWidth: .infinity, maxHeight: .infinity)
+        Group {
+            if let repo = selectedRepo {
+                RepoDetailView(
+                    repo: repo,
+                    repos: repos.repos,
+                    isScanning: repos.isScanning,
+                    onRescan: { repos.scan() },
+                    onSelectRepo: { selection = $0.id }
+                )
+                .id(repo.id)     // état frais par repo (recharge branche + commits + statut)
+            } else {
+                emptyState
+            }
         }
         .frame(minWidth: 820, minHeight: 500)
         .onAppear {
@@ -33,185 +37,149 @@ struct GitStuffsView: View {
                 didScanOnce = true
                 repos.scan()
             }
+            selectFirstIfNeeded()
         }
+        .onChange(of: repos.repos) { _ in selectFirstIfNeeded() }
     }
 
-    // MARK: - Sidebar
+    // MARK: - Sélection
 
-    private var sidebar: some View {
-        VStack(spacing: 0) {
-            searchField
-                .padding(12)
-            Divider()
-            repoList
-            Divider()
-            sidebarFooter
-        }
-        .frame(maxHeight: .infinity)
-        .background(.background)
-    }
-
-    private var searchField: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
-                .font(.system(size: 12))
-                .accessibilityHidden(true)
-            TextField("Filtrer par nom ou chemin", text: $searchText)
-                .textFieldStyle(.plain)
-                .font(.system(size: 12))
-            if !searchText.isEmpty {
-                Button { searchText = "" } label: {
-                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Effacer le filtre")
-                .accessibilityLabel("Effacer le filtre")
-            }
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .background(
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(Color.primary.opacity(0.06))
-        )
-    }
-
-    @ViewBuilder
-    private var repoList: some View {
-        if repos.repos.isEmpty {
-            emptyRepos
-        } else if displayedRepos.isEmpty {
-            emptyMessage(icon: "magnifyingglass", text: "Aucun repo pour « \(searchText) ».")
-        } else {
-            ScrollView {
-                VStack(spacing: 2) {
-                    ForEach(displayedRepos) { repo in
-                        RepoRow(repo: repo, isSelected: repo.id == selection) {
-                            selection = repo.id
-                        }
-                    }
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 8)
-            }
-            .frame(maxHeight: .infinity)
+    /// Sélectionne le premier repo si rien n'est choisi (ou si la sélection a disparu).
+    private func selectFirstIfNeeded() {
+        if selection == nil || !repos.repos.contains(where: { $0.id == selection }) {
+            selection = repos.repos.first?.id
         }
     }
-
-    @ViewBuilder
-    private var emptyRepos: some View {
-        if repos.isScanning {
-            emptyMessage(icon: "hourglass", text: "Recherche des repos…")
-        } else {
-            VStack(spacing: 10) {
-                Image(systemName: "shippingbox")
-                    .font(.system(size: 30)).foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
-                Text("Aucun repo git trouvé")
-                    .font(.system(size: 12, weight: .medium))
-                Button { repos.scan() } label: { Text("Lancer un scan…") }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding()
-        }
-    }
-
-    private func emptyMessage(icon: String, text: String) -> some View {
-        VStack(spacing: 8) {
-            Image(systemName: icon).font(.system(size: 24)).foregroundStyle(.secondary)
-                .accessibilityHidden(true)
-            Text(text)
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding()
-    }
-
-    private var sidebarFooter: some View {
-        HStack(spacing: 8) {
-            if repos.isScanning {
-                ProgressView()
-                    .controlSize(.small)
-                Text("Scan… \(repos.foundSoFar) repo\(repos.foundSoFar > 1 ? "s" : "")")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-            } else {
-                Image(systemName: "shippingbox.fill")
-                    .foregroundStyle(.tint)
-                    .font(.system(size: 12))
-                    .accessibilityHidden(true)
-                Text("\(repos.repos.count) repo\(repos.repos.count > 1 ? "s" : "")")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-            }
-            Spacer(minLength: 4)
-            Button { repos.scan() } label: {
-                Image(systemName: "arrow.clockwise")
-            }
-            .buttonStyle(.plain)
-            .disabled(repos.isScanning)
-            .help("Re-scanner le disque à la recherche de repos (⌘R)")
-            .accessibilityLabel("Rafraîchir la liste des repos")
-            .keyboardShortcut("r", modifiers: .command)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-    }
-
-    // MARK: - Centre
-
-    @ViewBuilder
-    private var center: some View {
-        if let repo = selectedRepo {
-            RepoDetailView(repo: repo)
-                .id(repo.id)     // état frais par repo (recharge branche + commits)
-        } else {
-            centerEmptyState
-        }
-    }
-
-    private var centerEmptyState: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "point.3.connected.trianglepath.dotted")
-                .font(.system(size: 54))
-                .foregroundStyle(.secondary)
-                .accessibilityHidden(true)
-            Text("Aucun repo sélectionné")
-                .font(.title3.weight(.semibold))
-            Text("Choisissez un repo dans la barre latérale pour voir sa branche et ses commits.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 380)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding()
-        .background(.background)
-    }
-
-    // MARK: - Données dérivées
 
     private var selectedRepo: GitRepo? {
         repos.repos.first { $0.id == selection }
     }
 
-    private var displayedRepos: [GitRepo] {
-        guard !searchText.isEmpty else { return repos.repos }
-        return repos.repos.filter {
-            $0.name.localizedCaseInsensitiveContains(searchText)
-                || $0.path.localizedCaseInsensitiveContains(searchText)
+    // MARK: - État vide (aucun repo)
+
+    @ViewBuilder
+    private var emptyState: some View {
+        if repos.isScanning {
+            VStack(spacing: 12) {
+                ProgressView()
+                Text("Recherche des repos… \(repos.foundSoFar)")
+                    .font(.system(size: 12)).foregroundStyle(.secondary).monospacedDigit()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(.background)
+        } else {
+            VStack(spacing: 14) {
+                Image(systemName: "shippingbox")
+                    .font(.system(size: 40)).foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                Text("Aucun repo git trouvé")
+                    .font(.title3.weight(.semibold))
+                Text("Lance un scan de ton dossier personnel pour découvrir les repos.")
+                    .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    .frame(maxWidth: 360)
+                Button { repos.scan() } label: { Text("Lancer un scan…") }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding()
+            .background(.background)
         }
     }
 }
 
-// MARK: - Ligne de repo
+// MARK: - Sélecteur de repo (menu déroulant filtrable)
 
-private struct RepoRow: View {
+/// Bouton « repo courant ▾ » ouvrant un popover : champ de recherche + liste filtrable des
+/// repos + pied (compte + re-scan). Remplace l'ancienne barre latérale permanente.
+struct RepoPicker: View {
+    let repos: [GitRepo]
+    let currentID: GitRepo.ID?
+    let isScanning: Bool
+    let onRescan: () -> Void
+    let onSelect: (GitRepo) -> Void
+
+    @State private var isOpen = false
+    @State private var search = ""
+
+    private var current: GitRepo? { repos.first { $0.id == currentID } }
+    private var filtered: [GitRepo] {
+        guard !search.isEmpty else { return repos }
+        return repos.filter {
+            $0.name.localizedCaseInsensitiveContains(search)
+                || $0.path.localizedCaseInsensitiveContains(search)
+        }
+    }
+
+    var body: some View {
+        Button { isOpen.toggle() } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "shippingbox.fill").foregroundStyle(.tint)
+                    .accessibilityHidden(true)
+                Text(current?.name ?? "Choisir un repo")
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1).truncationMode(.middle)
+                Image(systemName: "chevron.down").font(.system(size: 9)).foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+            }
+        }
+        .buttonStyle(.plain)
+        .help("Changer de repo")
+        .accessibilityLabel("Sélecteur de repo")
+        .popover(isPresented: $isOpen, arrowEdge: .bottom) {
+            popoverContent.frame(width: 320, height: 400)
+        }
+    }
+
+    private var popoverContent: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary).font(.system(size: 12))
+                    .accessibilityHidden(true)
+                TextField("Filtrer par nom ou chemin", text: $search)
+                    .textFieldStyle(.plain).font(.system(size: 12))
+            }
+            .padding(8)
+            Divider()
+            if filtered.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass").font(.system(size: 20)).foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
+                    Text(repos.isEmpty ? "Aucun repo" : "Aucun repo pour « \(search) »")
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 2) {
+                        ForEach(filtered) { repo in
+                            RepoRow(repo: repo, isSelected: repo.id == currentID) {
+                                onSelect(repo)
+                                isOpen = false
+                            }
+                        }
+                    }
+                    .padding(8)
+                }
+            }
+            Divider()
+            HStack(spacing: 8) {
+                Text("\(repos.count) repo\(repos.count > 1 ? "s" : "")")
+                    .font(.system(size: 11)).foregroundStyle(.secondary).monospacedDigit()
+                Spacer()
+                Button { onRescan() } label: {
+                    if isScanning { ProgressView().controlSize(.small) }
+                    else { Image(systemName: "arrow.clockwise") }
+                }
+                .buttonStyle(.plain).disabled(isScanning)
+                .help("Re-scanner le disque").accessibilityLabel("Rafraîchir la liste des repos")
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+        }
+    }
+}
+
+// MARK: - Ligne de repo (liste du picker)
+
+struct RepoRow: View {
     let repo: GitRepo
     let isSelected: Bool
     let onSelect: () -> Void
@@ -226,18 +194,14 @@ private struct RepoRow: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(repo.name)
                     .font(.system(size: 12, weight: .medium))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                    .lineLimit(1).truncationMode(.middle)
                 Text(repo.displayPath)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle)
             }
             Spacer(minLength: 4)
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 8).padding(.vertical, 6)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(Color.accentColor.opacity(isSelected ? 0.16 : (hovering ? 0.07 : 0)))

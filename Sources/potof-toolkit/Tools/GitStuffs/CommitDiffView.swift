@@ -24,6 +24,8 @@ struct CommitDiffView: View {
     @State private var isLoading = true
     @State private var error: String?
     @State private var truncated = false
+    /// Dossiers repliés de l'arbre de fichiers (détenu ici, cf. `FileTreeView`).
+    @State private var collapsedFolders: Set<String> = []
 
     /// Bornes d'affichage (fluidité sur gros commits).
     private static let maxFiles = 40
@@ -45,6 +47,8 @@ struct CommitDiffView: View {
         var id: String { display }
         let status: Status
         let display: String       // « path » ou « old → new » (renommage)
+        /// Chemin réel pour placer le fichier dans l'arbre (nouveau chemin ; ancien si suppression).
+        let path: String
         let diff: FileDiff
         /// Lignes repliées au contexte de `contextLines` (rendu limité en hauteur).
         let items: [DiffDisplayItem]
@@ -134,13 +138,20 @@ struct CommitDiffView: View {
         min(max(CGFloat(files.count) * 26 + 14, 52), 220)
     }
 
-    /// Liste des fichiers touchés (statut + chemin + compteurs). Sélectionne le diff.
+    /// Arbre des fichiers touchés (statut + compteurs). Réutilise le composant générique
+    /// `FileTreeView` (mêmes chrome/pliage que la liste des modifications).
     private var fileTree: some View {
         ScrollView {
-            LazyVStack(spacing: 1) {
-                ForEach(files) { file in
-                    fileTreeRow(file)
-                }
+            LazyVStack(alignment: .leading, spacing: 0) {
+                FileTreeView(
+                    items: files.map { FileTreeItem(path: $0.path, value: $0) },
+                    collapsed: $collapsedFolders,
+                    selectedPath: selectedPath,
+                    onSelect: { selectedFileID = $0.id },
+                    leading: { statusChip($0.status) },
+                    trailing: { fileCounts($0) },
+                    folderTrailing: { _, _ in EmptyView() }
+                )
                 if truncated {
                     Text("… d'autres fichiers non affichés (diff volumineux).")
                         .font(.system(size: 10))
@@ -153,29 +164,17 @@ struct CommitDiffView: View {
         }
     }
 
-    private func fileTreeRow(_ file: FileChange) -> some View {
-        let selected = file.id == selectedFileID
-        return HStack(spacing: 8) {
-            statusChip(file.status)
-            Text(file.display)
-                .font(.system(size: 11, design: .monospaced))
-                .lineLimit(1)
-                .truncationMode(.middle)
-            Spacer(minLength: 8)
+    /// Chemin du fichier sélectionné (pour le surlignage de l'arbre).
+    private var selectedPath: String? {
+        files.first { $0.id == selectedFileID }?.path
+    }
+
+    private func fileCounts(_ file: FileChange) -> some View {
+        HStack(spacing: 8) {
             Text("+\(file.diff.addedCount)").foregroundStyle(.green)
             Text("−\(file.diff.removedCount)").foregroundStyle(.red)
         }
-        .font(.system(size: 11, weight: .semibold))
-        .monospacedDigit()
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(Color.accentColor.opacity(selected ? 0.16 : 0))
-        )
-        .contentShape(Rectangle())
-        .onTapGesture { selectedFileID = file.id }
-        .help(file.display)
+        .font(.system(size: 11, weight: .semibold)).monospacedDigit()
     }
 
     /// Diff du fichier sélectionné (lignes repliées au contexte).
@@ -378,7 +377,8 @@ struct CommitDiffView: View {
                 totalLines += items.reduce(0) { acc, item in
                     if case .line = item.content { return acc + 1 } else { return acc }
                 }
-                changes.append(FileChange(status: status, display: display, diff: fd, items: items))
+                let treePath = !newPath.isEmpty ? newPath : oldPath
+                changes.append(FileChange(status: status, display: display, path: treePath, diff: fd, items: items))
             }
 
             let result = changes

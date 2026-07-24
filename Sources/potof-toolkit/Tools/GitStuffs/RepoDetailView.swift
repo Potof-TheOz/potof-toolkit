@@ -1,202 +1,287 @@
 import SwiftUI
+import AppKit
 
-/// Centre de l'outil pour un repo sélectionné : barre (branche + rebase), puis
-/// graphe de commits de la branche courante. Recréé par repo (`.id(repo.id)`).
+/// Espace de travail d'un repo (modèle GitHub Desktop). Recréé par repo (`.id(repo.id)`).
+///
+/// - **Top bar** : sélecteur de repo (`RepoPicker`) + branche + badge de synchro (↑/↓/⚠️) +
+///   actions Fetch · Pull · Push · Recharger.
+/// - **Colonne gauche** : toggle **Modifications | Historique**.
+///   - *Modifications* → fichiers en diff (`ChangesListView`) + boîte de commit.
+///   - *Historique* → liste des commits (clic = diff à droite, clic droit = rebase).
+/// - **Colonne droite** : diff du fichier working tree sélectionné, ou du commit sélectionné.
 struct RepoDetailView: View {
     let repo: GitRepo
-    @StateObject private var detail: RepoDetail
-    /// Contrôleur du rebase courant. Présenté via `.sheet(item:)` : non nil ⇒ feuille
-    /// ouverte, nil ⇒ fermée (garantit un contenu rendu, pas de feuille vide).
-    @State private var rebase: RebaseController?
-    /// Commit dont on affiche le diff (feuille lecture seule), ou nil.
-    @State private var diffTarget: CommitDiffTarget?
+    /// Repos connus + pilotage du scan, pour le sélecteur.
+    let repos: [GitRepo]
+    let isScanning: Bool
+    let onRescan: () -> Void
+    let onSelectRepo: (GitRepo) -> Void
 
-    init(repo: GitRepo) {
+    @StateObject private var detail: RepoDetail
+    /// Couche « working copy » (statut, staging, commit, push/pull, auto-fetch).
+    @StateObject private var store: WorkingCopyStore
+
+    enum Tab: Hashable { case changes, history }
+    @State private var tab: Tab = .changes
+
+    /// Contrôleur du rebase courant, ou nil.
+    @State private var rebase: RebaseController?
+    /// Commit dont on affiche le diff (onglet Historique), ou nil.
+    @State private var diffTarget: CommitDiffTarget?
+    /// Fichier du working tree dont on affiche le diff interactif (onglet Modifications).
+    @State private var selectedWorkingFileID: FileStatus.ID?
+    /// Résolveur de conflits (pull --rebase en conflit), ou nil. Remplace tout le centre.
+    @State private var conflictResolver: ConflictResolver?
+
+    init(repo: GitRepo, repos: [GitRepo], isScanning: Bool,
+         onRescan: @escaping () -> Void, onSelectRepo: @escaping (GitRepo) -> Void) {
         self.repo = repo
+        self.repos = repos
+        self.isScanning = isScanning
+        self.onRescan = onRescan
+        self.onSelectRepo = onSelectRepo
         _detail = StateObject(wrappedValue: RepoDetail(repo: repo.url))
+        _store = StateObject(wrappedValue: WorkingCopyStore(repo: repo.url))
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            headerBar
+            topBar
             Divider()
             if let controller = rebase {
-                // Rebase présenté EN PLACE (pas en feuille) : remplit la zone centrale
-                // et se redimensionne avec la fenêtre. `onClose` revient au graphe.
                 RebasePanelView(controller: controller, onClose: {
                     rebase = nil
-                    detail.load()      // l'historique a pu changer : on recharge le graphe
+                    detail.load()
+                    store.refresh()
                 })
+            } else if let resolver = conflictResolver {
+                ConflictResolutionView(resolver: resolver)
             } else {
                 if detail.rebaseInProgress {
                     inProgressBanner
                     Divider()
                 }
-                content
+                workspaceSplit
             }
         }
         .background(.background)
-        .onAppear(perform: detail.load)
+        .onAppear {
+            store.onHistoryChanged = { [weak detail] in detail?.load() }
+            detail.load()
+            store.refresh()
+            store.startAutoFetch()
+        }
+        .onDisappear { store.stopAutoFetch() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            store.refresh()
+        }
     }
 
-    /// Construit la cible de diff pour un commit du repo courant.
+    // MARK: - Top bar
+
+    private var topBar: some View {
+        HStack(spacing: 12) {
+            RepoPicker(repos: repos, currentID: repo.id, isScanning: isScanning,
+                       onRescan: onRescan, onSelect: onSelectRepo)
+            branchLabel
+            syncBadge
+            Spacer(minLength: 12)
+            syncActions
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(.bar)
+    }
+
+    private var branchLabel: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "arrow.triangle.branch").font(.system(size: 10))
+                .accessibilityHidden(true)
+            Text(detail.branch.isEmpty ? "…" : detail.branch)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(detail.isDetached ? Color.orange : .secondary)
+                .lineLimit(1).truncationMode(.middle)
+        }
+        .help(detail.isDetached ? "HEAD détaché" : "Branche courante")
+    }
+
+    @ViewBuilder
+    private var syncBadge: some View {
+        HStack(spacing: 8) {
+            if store.isFetching { ProgressView().controlSize(.small) }
+            if store.sync.hasUpstream {
+                if store.sync.isBehind {
+                    Label("\(store.sync.behind)", systemImage: "arrow.down")
+                        .foregroundStyle(.orange)
+                        .help("\(store.sync.behind) commit(s) distant(s) non récupéré(s)")
+                }
+                if store.sync.isAhead {
+                    Label("\(store.sync.ahead)", systemImage: "arrow.up")
+                        .foregroundStyle(.tint)
+                        .help("\(store.sync.ahead) commit(s) local(aux) non poussé(s)")
+                }
+                if !store.sync.isBehind && !store.sync.isAhead && !store.sync.fetchFailed {
+                    Image(systemName: "checkmark.circle").foregroundStyle(.secondary)
+                        .help("À jour avec l'amont")
+                }
+                if store.sync.fetchFailed {
+                    Image(systemName: "exclamationmark.triangle").foregroundStyle(.secondary)
+                        .help("Le fetch a échoué (authentification ou réseau ?).")
+                }
+            } else {
+                Image(systemName: "cloud.slash").foregroundStyle(.secondary)
+                    .help("Aucune branche amont. Push la publiera (origin).")
+            }
+        }
+        .font(.system(size: 11, weight: .medium)).monospacedDigit()
+        .labelStyle(.titleAndIcon)
+    }
+
+    private var syncActions: some View {
+        HStack(spacing: 12) {
+            barButton("arrow.down.circle", help: "Fetch (récupérer l'état distant)",
+                      label: "Fetch", disabled: store.isFetching || store.isBusy) { store.fetch() }
+            barButton("arrow.down.to.line", help: "Pull (rebase)",
+                      label: "Pull (rebase)", disabled: store.isBusy || !store.sync.hasUpstream) { store.pullRebase() }
+            barButton("arrow.up.to.line", help: "Push",
+                      label: "Push", disabled: store.isBusy) { store.push() }
+            barButton("arrow.clockwise", help: "Recharger branche, commits et statut",
+                      label: "Recharger", disabled: false) { detail.load(); store.refresh() }
+        }
+    }
+
+    private func barButton(_ systemName: String, help: String, label: String,
+                           disabled: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) { Image(systemName: systemName).font(.system(size: 13)) }
+            .buttonStyle(.plain).foregroundStyle(.secondary).disabled(disabled)
+            .help(help).accessibilityLabel(label)
+    }
+
+    // MARK: - Split principal (colonne gauche à onglets + diff)
+
+    private var workspaceSplit: some View {
+        HSplitView {
+            leftColumn
+                .frame(minWidth: 300, idealWidth: 340, maxWidth: 520)
+            rightPane
+                .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private var leftColumn: some View {
+        VStack(spacing: 0) {
+            Picker("", selection: $tab) {
+                Text("Modifications").tag(Tab.changes)
+                Text("Historique").tag(Tab.history)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            Divider()
+            if tab == .changes {
+                ChangesListView(
+                    store: store,
+                    selectedFileID: selectedWorkingFileID,
+                    onSelectFile: { selectedWorkingFileID = $0.id }
+                )
+            } else {
+                historyList
+            }
+        }
+        .background(.background)
+    }
+
+    @ViewBuilder
+    private var rightPane: some View {
+        if tab == .changes {
+            changesRightPane
+        } else {
+            historyRightPane
+        }
+    }
+
+    // MARK: - Volet droit : Modifications
+
+    @ViewBuilder
+    private var changesRightPane: some View {
+        if let file = liveSelectedFile {
+            WorkingDiffView(file: file, store: store, onClose: { selectedWorkingFileID = nil })
+                // Recréer la vue (donc réinitialiser `mode`) quand la composition staged/
+                // unstaged du fichier change : sinon `mode` reste figé (ex. après avoir tout
+                // stagé un fichier non indexé, on reste bloqué sur un diff non indexé vide).
+                .id("\(file.id)#\(file.isStaged)\(file.hasUnstagedChanges)\(file.isUntracked)")
+        } else {
+            placeholder(icon: store.isClean ? "checkmark.seal" : "sidebar.left",
+                        text: store.isClean
+                            ? "Arbre de travail propre."
+                            : "Sélectionne un fichier modifié à gauche pour voir et stager son diff.")
+        }
+    }
+
+    /// Fichier sélectionné relu depuis l'état courant (nil s'il a disparu, ex. après commit).
+    private var liveSelectedFile: FileStatus? {
+        guard let id = selectedWorkingFileID else { return nil }
+        return store.files.first { $0.id == id }
+    }
+
+    // MARK: - Volet droit : Historique
+
+    @ViewBuilder
+    private var historyRightPane: some View {
+        if let target = diffTarget {
+            CommitDiffView(target: target, onClose: { diffTarget = nil })
+                .id(target.id)
+        } else {
+            placeholder(icon: "clock.arrow.circlepath",
+                        text: "Sélectionne un commit à gauche pour voir ses modifications.")
+        }
+    }
+
     private func diffTarget(for commit: GitCommit) -> CommitDiffTarget {
         CommitDiffTarget(repo: repo.url, hash: commit.hash, shortHash: commit.shortHash, subject: commit.subject)
     }
 
-    // MARK: - Barre supérieure
-
-    private var headerBar: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "shippingbox.fill")
-                .foregroundStyle(.tint)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(repo.name)
-                    .font(.system(size: 13, weight: .semibold))
-                HStack(spacing: 6) {
-                    Image(systemName: detail.isDetached ? "arrow.triangle.branch" : "arrow.triangle.branch")
-                        .font(.system(size: 10))
-                        .accessibilityHidden(true)
-                    Text(detail.branch.isEmpty ? "…" : detail.branch)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(detail.isDetached ? Color.orange : .secondary)
-                }
-            }
-            if let up = detail.upstream {
-                Label(up, systemImage: "cloud")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .help("Branche amont : \(up)")
-            }
-            Spacer(minLength: 12)
-            Button { detail.load() } label: {
-                Image(systemName: "arrow.clockwise")
-            }
-            .buttonStyle(.plain)
-            .help("Recharger la branche et les commits")
-            .accessibilityLabel("Recharger")
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(.bar)
-    }
-
-    private var inProgressBanner: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
-                .accessibilityHidden(true)
-            Text("Un rebase est déjà en cours dans ce repo.")
-                .font(.system(size: 12, weight: .medium))
-            Spacer(minLength: 8)
-            Button("Reprendre le contrôle") {
-                let controller = RebaseController(repo: repo.url, commits: detail.commits, upstream: detail.upstream)
-                controller.attachToInProgress()
-                rebase = controller
-            }
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
-        .background(Color.orange.opacity(0.12))
-    }
-
-    // MARK: - Contenu
+    // MARK: - Liste des commits (colonne gauche, onglet Historique)
 
     @ViewBuilder
-    private var content: some View {
+    private var historyList: some View {
         if detail.isLoading && detail.commits.isEmpty {
-            VStack(spacing: 10) {
-                ProgressView()
-                Text("Lecture de l'historique…")
-                    .font(.system(size: 12)).foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            placeholder(icon: nil, text: "Lecture de l'historique…", spinner: true)
         } else if let error = detail.loadError {
-            VStack(spacing: 8) {
-                Image(systemName: "exclamationmark.triangle")
-                    .font(.system(size: 24)).foregroundStyle(.orange)
-                    .accessibilityHidden(true)
-                Text(error)
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .textSelection(.enabled)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding()
+            placeholder(icon: "exclamationmark.triangle", text: error, tint: .orange)
         } else if detail.commits.isEmpty {
-            VStack(spacing: 8) {
-                Image(systemName: "tray")
-                    .font(.system(size: 24)).foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
-                Text("Aucun commit sur cette branche.")
-                    .font(.system(size: 12)).foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            placeholder(icon: "tray", text: "Aucun commit sur cette branche.")
         } else {
-            graphArea
-        }
-    }
-
-    /// Graphe à gauche, panneau de diff à droite (ouvert au clic, fermable).
-    private var graphArea: some View {
-        HSplitView {
-            // Diff fermé → le graphe remplit tout ; diff ouvert → graphe borné pour
-            // laisser la majorité de la largeur au diff (lecture du code).
-            commitGraph
-                .frame(minWidth: 340, maxWidth: diffTarget == nil ? .infinity : 560)
-            if let target = diffTarget {
-                CommitDiffView(target: target, onClose: { diffTarget = nil })
-                    // Identité par commit : cliquer un autre commit recrée la vue
-                    // (état neuf + rechargement), sinon l'ancien diff resterait affiché.
-                    .id(target.id)
-                    .frame(minWidth: 460, maxWidth: .infinity)
-            }
-        }
-    }
-
-    private var commitGraph: some View {
-        let currentColor = branchColor(detail.branch)
-        return VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Image(systemName: "cursorarrow.rays")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
-                Text("Clic : voir le diff · clic droit : rebase interactif.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                // Légende des couleurs du graphe (branche courante / base).
-                legendItem(color: currentColor, label: detail.branch)
-                if let base = detail.baseBranchName {
-                    legendItem(color: .secondary, label: base)
+            VStack(spacing: 0) {
+                HStack(spacing: 6) {
+                    Image(systemName: "cursorarrow.rays").font(.system(size: 10)).foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
+                    Text("Clic : diff · clic droit : rebase")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                    Spacer()
                 }
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 6)
-            Divider()
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(Array(detail.commits.enumerated()), id: \.element.id) { index, commit in
-                        if index == forkBoundaryIndex {
-                            forkDivider
+                .padding(.horizontal, 12).padding(.vertical, 5)
+                Divider()
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(Array(detail.commits.enumerated()), id: \.element.id) { index, commit in
+                            if index == forkBoundaryIndex { forkDivider }
+                            let isOwn = detail.branchOwnHashes.contains(commit.hash)
+                            CommitRow(
+                                commit: commit,
+                                isFirst: index == 0,
+                                isLast: index == detail.commits.count - 1,
+                                isPushed: detail.pushedHashes.contains(commit.hash),
+                                dotColor: isOwn ? branchColor(detail.branch) : .secondary,
+                                isSelected: diffTarget?.hash == commit.hash,
+                                onSelect: { diffTarget = diffTarget(for: commit) }
+                            )
+                            .contextMenu { commitMenu(index: index) }
                         }
-                        let isOwn = detail.branchOwnHashes.contains(commit.hash)
-                        CommitRow(
-                            commit: commit,
-                            isFirst: index == 0,
-                            isLast: index == detail.commits.count - 1,
-                            isPushed: detail.pushedHashes.contains(commit.hash),
-                            dotColor: isOwn ? currentColor : .secondary,
-                            isSelected: diffTarget?.hash == commit.hash,
-                            onSelect: { diffTarget = diffTarget(for: commit) }
-                        )
-                        .contextMenu { commitMenu(index: index) }
                     }
+                    .padding(.vertical, 6)
                 }
-                .padding(.vertical, 6)
             }
         }
     }
@@ -205,37 +290,17 @@ struct RepoDetailView: View {
     private var forkDivider: some View {
         HStack(spacing: 8) {
             Rectangle().fill(Color.secondary.opacity(0.3)).frame(height: 1)
-            Text("Création de « \(detail.branch) »" + (detail.baseBranchName.map { " · base : \($0)" } ?? ""))
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(.secondary)
-                .fixedSize()
+            Text("Création de « \(detail.branch) »" + (detail.baseBranchName.map { " · \($0)" } ?? ""))
+                .font(.system(size: 9, weight: .medium)).foregroundStyle(.secondary).fixedSize()
             Rectangle().fill(Color.secondary.opacity(0.3)).frame(height: 1)
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 16).padding(.vertical, 6)
     }
 
-    private func legendItem(color: Color, label: String) -> some View {
-        HStack(spacing: 4) {
-            Circle().fill(color).frame(width: 8, height: 8)
-            Text(label)
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-        }
-        .help("Couleur du graphe pour « \(label) »")
-    }
-
-    /// Menu contextuel d'un commit : rebase interactif depuis ce commit (inclut ce
-    /// commit et tous les plus récents). Le menu **ouvre toujours** le panneau (sauf
-    /// rebase déjà en cours) ; les garde-fous (arbre propre, fusions, etc.) sont
-    /// affichés et appliqués DANS le panneau, pas ici — ainsi le rebase se déclenche
-    /// et l'utilisateur voit ce qui bloque.
+    /// Menu contextuel d'un commit : diff (lecture seule) + rebase interactif encadré.
     @ViewBuilder
     private func commitMenu(index: Int) -> some View {
         let commit = detail.commits[index]
-        // Toujours disponible (lecture seule), quel que soit l'état du rebase.
         Button {
             diffTarget = diffTarget(for: commit)
         } label: {
@@ -261,8 +326,7 @@ struct RepoDetailView: View {
         }
     }
 
-    /// Nombre de commits en tête (depuis HEAD) propres à la branche, avant d'atteindre le
-    /// point de création. Borne la plage rebasable (jamais un commit partagé avec la base).
+    /// Nombre de commits en tête propres à la branche (borne la plage rebasable).
     private var branchOwnLeadingCount: Int {
         var count = 0
         for commit in detail.commits {
@@ -271,37 +335,81 @@ struct RepoDetailView: View {
         return count
     }
 
-    /// Index du 1er commit de la branche de base (frontière de création), ou `nil` si
-    /// non pertinent (pas de base détectée, ou tous les commits sont propres à la branche).
+    /// Index du 1er commit de la base (frontière de création), ou nil si non pertinent.
     private var forkBoundaryIndex: Int? {
         guard detail.baseBranchName != nil else { return nil }
         let k = branchOwnLeadingCount
         return (k > 0 && k < detail.commits.count) ? k : nil
     }
 
-    /// Couleur stable dérivée d'un nom de branche (déterministe, indépendante du hash
-    /// aléatoire de String) → chaque branche a sa teinte dans le graphe.
+    /// Couleur stable dérivée du nom de branche (déterministe).
     private func branchColor(_ name: String) -> Color {
         let palette: [Color] = [.blue, .purple, .pink, .orange, .teal, .green, .indigo, .mint, .cyan]
         let sum = name.unicodeScalars.reduce(0) { $0 &+ Int($1.value) }
         return palette.isEmpty ? .accentColor : palette[sum % palette.count]
     }
+
+    // MARK: - Bannière rebase en cours
+
+    private var inProgressBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                .accessibilityHidden(true)
+            Text("Un rebase est déjà en cours dans ce repo.")
+                .font(.system(size: 12, weight: .medium))
+            Spacer(minLength: 8)
+            if !store.conflictedFiles.isEmpty {
+                Button("Résoudre les conflits") {
+                    let resolver = ConflictResolver(repo: repo.url)
+                    resolver.onFinished = {
+                        conflictResolver = nil
+                        detail.load()
+                        store.refresh()
+                    }
+                    conflictResolver = resolver
+                }
+                .help("Résoudre les conflits dans l'app (bloc par bloc ou édition libre)")
+            }
+            Button("Reprendre le contrôle") {
+                let controller = RebaseController(repo: repo.url, commits: detail.commits, upstream: detail.upstream)
+                controller.attachToInProgress()
+                rebase = controller
+            }
+            .help("Voir la sortie git brute et continuer / abandonner à la main")
+        }
+        .padding(.horizontal, 16).padding(.vertical, 8)
+        .background(Color.orange.opacity(0.12))
+    }
+
+    // MARK: - Placeholder générique
+
+    private func placeholder(icon: String?, text: String, tint: Color = .secondary, spinner: Bool = false) -> some View {
+        VStack(spacing: 10) {
+            if spinner { ProgressView() }
+            if let icon {
+                Image(systemName: icon).font(.system(size: 30)).foregroundStyle(tint)
+                    .accessibilityHidden(true)
+            }
+            Text(text)
+                .font(.system(size: 12)).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center).textSelection(.enabled)
+                .frame(maxWidth: 360)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding()
+        .background(.background)
+    }
 }
 
-// MARK: - Ligne de commit (graphe linéaire)
+// MARK: - Ligne de commit (liste d'historique)
 
 private struct CommitRow: View {
     let commit: GitCommit
     let isFirst: Bool
     let isLast: Bool
-    /// Commit déjà présent sur l'amont (affiché à titre indicatif : le rebaser
-    /// impliquera un force-push).
     let isPushed: Bool
-    /// Couleur de la pastille/trait = couleur de la branche (ou gris pour la base).
     let dotColor: Color
-    /// Ligne sélectionnée (diff affiché dans le panneau de droite).
     let isSelected: Bool
-    /// Clic sur la ligne → ouvre le diff dans le panneau de droite.
     let onSelect: () -> Void
     @State private var hovering = false
 
@@ -311,8 +419,7 @@ private struct CommitRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(commit.subject)
-                        .font(.system(size: 12))
-                        .lineLimit(2)
+                        .font(.system(size: 12)).lineLimit(2)
                     if commit.isMerge {
                         Text("merge")
                             .font(.system(size: 9, weight: .semibold))
@@ -323,70 +430,39 @@ private struct CommitRow: View {
                 }
                 HStack(spacing: 8) {
                     Text(commit.shortHash)
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.tint)
+                        .font(.system(size: 10, design: .monospaced)).foregroundStyle(.tint)
                     Text(commit.author)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                    Text("·")
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+                    Text("·").foregroundStyle(.secondary)
                     Text(commit.relativeDate)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
                     if isPushed {
-                        Image(systemName: "cloud.fill")
-                            .font(.system(size: 9))
-                            .foregroundStyle(.secondary)
-                            .help("Déjà poussé sur l'amont")
-                            .accessibilityLabel("Déjà poussé")
+                        Image(systemName: "cloud.fill").font(.system(size: 9)).foregroundStyle(.secondary)
+                            .help("Déjà poussé sur l'amont").accessibilityLabel("Déjà poussé")
                     }
                 }
             }
             Spacer(minLength: 4)
-            // Rappel de l'action clic droit au survol.
-            if hovering {
-                Image(systemName: "arrow.triangle.2.circlepath")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tint)
-                    .help("Clic droit : rebase interactif depuis ce commit")
-                    .accessibilityHidden(true)
-            }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
-        .background(
-            Color.accentColor.opacity(isSelected ? 0.16 : (hovering ? 0.08 : 0))
-        )
+        .padding(.horizontal, 14).padding(.vertical, 8)
+        .background(Color.accentColor.opacity(isSelected ? 0.16 : (hovering ? 0.08 : 0)))
         .overlay(alignment: .leading) {
-            // Liseré d'accent à gauche : plein si sélectionné, discret au survol.
-            Rectangle()
-                .fill(Color.accentColor)
-                .frame(width: 2.5)
+            Rectangle().fill(Color.accentColor).frame(width: 2.5)
                 .opacity(isSelected ? 1 : (hovering ? 0.6 : 0))
         }
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)
         .onHover { hovering = $0 }
-        .help("Cliquer pour voir le diff de ce commit")
+        .help("Cliquer pour voir le diff · clic droit pour rebaser")
     }
 
-    /// Colonne « graphe » : trait vertical continu + pastille du commit, teintés à la
-    /// couleur de la branche (gris pour les commits de la base).
     private var graphGutter: some View {
         ZStack {
-            // Le trait ne dépasse ni en haut du 1er commit ni en bas du dernier.
             VStack(spacing: 0) {
-                Rectangle()
-                    .fill(isFirst ? Color.clear : dotColor.opacity(0.45))
-                    .frame(width: 2)
-                Rectangle()
-                    .fill(isLast ? Color.clear : dotColor.opacity(0.45))
-                    .frame(width: 2)
+                Rectangle().fill(isFirst ? Color.clear : dotColor.opacity(0.45)).frame(width: 2)
+                Rectangle().fill(isLast ? Color.clear : dotColor.opacity(0.45)).frame(width: 2)
             }
-            Circle()
-                .fill(dotColor)
-                .frame(width: 9, height: 9)
+            Circle().fill(dotColor).frame(width: 9, height: 9)
                 .overlay(Circle().strokeBorder(Color(nsColor: .windowBackgroundColor), lineWidth: 2))
         }
         .frame(width: 12)
