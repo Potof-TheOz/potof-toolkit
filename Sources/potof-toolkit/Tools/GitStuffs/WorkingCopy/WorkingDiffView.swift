@@ -13,6 +13,9 @@ struct WorkingDiffView: View {
 
     enum Mode: String { case unstaged, staged }
 
+    /// Disposition unifié / côte à côte, préférence globale partagée (voir `DiffLayoutMode`).
+    @AppStorage("gitStuffs.diffLayoutMode") private var layoutMode: DiffLayoutMode = .unified
+
     @State private var mode: Mode
     @State private var diff: UnifiedFileDiff?
     @State private var selected: Set<Int> = []
@@ -20,14 +23,21 @@ struct WorkingDiffView: View {
     @State private var error: String?
     @State private var confirmDiscard = false
 
-    init(file: FileStatus, store: WorkingCopyStore, onClose: (() -> Void)? = nil) {
+    init(file: FileStatus, store: WorkingCopyStore, initialMode: Mode? = nil, onClose: (() -> Void)? = nil) {
         self.file = file
         self.store = store
         self.onClose = onClose
         // Mode par défaut : les changements non indexés d'abord (ce qu'on est en train de
-        // travailler) ; sinon l'indexé.
-        let defaultUnstaged = file.hasUnstagedChanges || file.isUntracked
-        _mode = State(initialValue: defaultUnstaged ? .unstaged : .staged)
+        // travailler) ; sinon l'indexé. `initialMode` (fourni selon la section cliquée :
+        // INDEXÉ → .staged, NON INDEXÉ → .unstaged) prime, mais on retombe sur le défaut
+        // s'il n'est pas applicable (ex. .staged demandé sur un fichier sans changement indexé).
+        let fallback: Mode = (file.hasUnstagedChanges || file.isUntracked) ? .unstaged : .staged
+        switch initialMode ?? fallback {
+        case .staged:
+            _mode = State(initialValue: file.isStaged ? .staged : fallback)
+        case .unstaged:
+            _mode = State(initialValue: (file.hasUnstagedChanges || file.isUntracked) ? .unstaged : fallback)
+        }
     }
 
     var body: some View {
@@ -72,6 +82,7 @@ struct WorkingDiffView: View {
                 .lineLimit(1).truncationMode(.middle)
                 .help(file.display)
             Spacer(minLength: 12)
+            DiffLayoutToggle(mode: $layoutMode)
             if store.isBusy {
                 ProgressView().controlSize(.small)
             }
@@ -158,16 +169,36 @@ struct WorkingDiffView: View {
 
     private func diffScroll(_ diff: UnifiedFileDiff, readOnly: Bool = false) -> some View {
         ScrollView(.vertical) {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(diff.hunks) { hunk in
-                    hunkHeaderRow(hunk, readOnly: readOnly)
-                    ForEach(hunk.lines) { line in
-                        lineRow(line, readOnly: readOnly)
+            // Côte à côte : VStack EAGER (pas Lazy). Les lignes ont des hauteurs variables
+            // (texte à la ligne, colonnes appariées) ; un LazyVStack réserve alors l'espace
+            // mais laisse les lignes hors du premier écran NON peintes → gros trous vides.
+            // L'eager mesure/peint chaque ligne. Le mode unifié garde LazyVStack (lignes
+            // simples, gros diffs fluides). `.id(layoutMode)` force une reconstruction propre
+            // à la bascule (sinon le recyclage des lignes masque le changement de mode).
+            Group {
+                if layoutMode == .sideBySide {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(diff.hunks) { hunk in
+                            hunkHeaderRow(hunk, readOnly: readOnly)
+                            ForEach(SideBySideDiff.pair(hunk.lines.map(\.asDiffLine))) { row in
+                                sideBySideRow(row, readOnly: readOnly)
+                            }
+                        }
+                    }
+                } else {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(diff.hunks) { hunk in
+                            hunkHeaderRow(hunk, readOnly: readOnly)
+                            ForEach(hunk.lines) { line in
+                                lineRow(line, readOnly: readOnly)
+                            }
+                        }
                     }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.vertical, 4)
+            .id(layoutMode)
         }
         .textSelection(.enabled)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -231,6 +262,50 @@ struct WorkingDiffView: View {
             }
             DiffLineRow(line: line.asDiffLine, compactGutter: true)
         }
+        .background(isChange && isSelected ? Color.accentColor.opacity(0.10) : Color.clear)
+    }
+
+    // MARK: - Côte à côte
+
+    /// Une ligne du rendu côte à côte : ancien à gauche, nouveau à droite. Alignement
+    /// `.top` → les deux colonnes démarrent au même y et le `Divider` s'étire à la hauteur
+    /// de la moitié la plus haute (rendu eager, cf. `diffScroll` ; pas de synchro de scroll).
+    private func sideBySideRow(_ row: SideBySideDiffRow, readOnly: Bool) -> some View {
+        HStack(alignment: .top, spacing: 0) {
+            halfCell(row.left, .old, readOnly: readOnly)
+            Divider()
+            halfCell(row.right, .new, readOnly: readOnly)
+        }
+    }
+
+    /// Une moitié : colonne case (22pt, comme en unifié) + `DiffHalfRow`. La case
+    /// n'apparaît que sur une ligne de changement (retrait à gauche, ajout à droite) ;
+    /// le contexte et les remplissages (`nil`) gardent la colonne vide pour l'alignement.
+    private func halfCell(_ line: DiffLine?, _ side: DiffHalfRow.Side, readOnly: Bool) -> some View {
+        let isChange = line != nil && line!.kind != .context
+        let isSelected = line.map { selected.contains($0.id) } ?? false
+        return HStack(spacing: 0) {
+            if !readOnly && canStageByLine {
+                Group {
+                    if isChange, let line {
+                        Button {
+                            toggleLine(id: line.id)
+                        } label: {
+                            Image(systemName: isSelected ? "checkmark.square.fill" : "square")
+                                .font(.system(size: 11))
+                                .foregroundStyle(isSelected ? Color.accentColor : .secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(isSelected ? "Désélectionner la ligne" : "Sélectionner la ligne")
+                    } else {
+                        Color.clear
+                    }
+                }
+                .frame(width: 22)
+            }
+            DiffHalfRow(line: line, side: side)
+        }
+        .frame(maxWidth: .infinity)
         .background(isChange && isSelected ? Color.accentColor.opacity(0.10) : Color.clear)
     }
 
@@ -299,8 +374,10 @@ struct WorkingDiffView: View {
 
     // MARK: - Sélection
 
-    private func toggleLine(_ line: PatchLine) {
-        if selected.contains(line.id) { selected.remove(line.id) } else { selected.insert(line.id) }
+    private func toggleLine(_ line: PatchLine) { toggleLine(id: line.id) }
+
+    private func toggleLine(id: Int) {
+        if selected.contains(id) { selected.remove(id) } else { selected.insert(id) }
     }
 
     private func hunkChangeIDs(_ hunk: Hunk) -> [Int] {
