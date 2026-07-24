@@ -1,12 +1,16 @@
 # Potof Toolkit
 
 App macOS native (SwiftUI + AppKit) servant de **toolkit d'outils de dev locaux**.
-100 % local : aucun réseau, aucun compte, aucune télémétrie. Trois outils à ce jour :
+**Local par défaut** : aucun compte, aucune télémétrie, pas de réseau — à une exception
+**opt-in** près, la génération de message de commit de Git Stuffs, qui invoque `claude`
+(outil externe → réseau). Trois outils à ce jour :
 **Claude Launcher** — liste les sous-dossiers d'un dossier racine et lance `claude`
 dans un **terminal embarqué** (SwiftTerm) affiché **au centre de l'app** ; les
 sessions sont **possédées par l'app** (process enfant dans un PTY) : les fermer
 **tue** le process (voir `docs/SESSIONS.md`). **Git Stuffs** — explore les repos git
-du poste et rebase interactivement. **Script Runner** — découvre les `package.json`
+du poste, **rebase interactivement** et **édite la copie de travail** (staging par
+hunk/ligne, commit, push/pull avec badge ahead/behind, résolution de conflits dans
+l'app). **Script Runner** — découvre les `package.json`
 et lance/arrête leurs scripts npm sur le même modèle de terminal possédé
 (voir `docs/SCRIPT_RUNNER.md`).
 
@@ -51,6 +55,10 @@ Core/
   Terminal/
     TerminalHostView.swift    NSViewRepresentable partagé (a quitté ClaudeLauncher/) : place la
                               vue terminal possédée par le contrôleur appelant + focus au chgt d'id
+  FileTree/                   Arbre de fichiers GÉNÉRIQUE (aucune dépendance git), réutilisable
+    FileTreeModel.swift       FileTreeItem/Node + FileTreeBuilder (build + compaction dossiers + flatten)
+    FileTreeView.swift        Vue générique : slots onSelect/leading/trailing ; pliage détenu par
+                              l'appelant (@Binding) ; identité des lignes + clé de pliage NAMESPACÉES
 Tools/
   ClaudeLauncher/             Premier outil
     ClaudeLauncherView.swift  UI : HSplitView(sidebar sessions+dossiers/favoris | terminal central)
@@ -65,7 +73,24 @@ Tools/
       IDEConnection.swift     Handshake WebSocket + framing RFC 6455 + JSON-RPC/MCP (openDiff)
       DiffModel.swift         Diff ligne-à-ligne (rognage préfixe/suffixe + LCS + garde-fou)
       DiffOverlayView.swift   Panneau SwiftUI : diff unifié + Accepter/Refuser
-  GitStuffs/                  Deuxième outil : explorer les repos git + rebase interactif
+  GitStuffs/                  Deuxième outil : explorer les repos git, rebase interactif + copie de travail
+    GitStuffsView.swift       UI racine : RepoPicker (menu déroulant filtrable + re-scan) + auto-sélection
+    RepoDetailView.swift      ⭐ Espace de travail (modèle GitHub Desktop) : top bar sync (↑/↓/⚠️ + Fetch/Pull/
+                              Push) + onglets Modifications | Historique + intégration. Seul fichier existant
+                              modifié pour la copie de travail.
+    CommitDiffView.swift      Diff LECTURE SEULE d'un commit (arbre de fichiers + git show)
+    WorkingCopy/              Couche « copie de travail » : staging hunk/ligne, commit, sync, conflits
+      GitStatusModels.swift   FileStatus, RepoSyncState, protocole WorkingCopyServicing (contrat des actions)
+      GitStatusParser.swift   Porcelain v2 -z → [FileStatus] + ahead/behind (fonctions PURES, testables)
+      UnifiedDiff.swift       Parseur diff unifié + buildPatch(selecting:) : staging par ligne BYTE-EXACT
+      GitWorkingActions.swift Impl. WorkingCopyServicing : add/restore/commit/push/pull/fetch/apply
+      WorkingCopyStore.swift  ⭐ ObservableObject : statut + RepoSyncState + timer fetch (~3 min) + refresh
+      ChangesListView.swift   Colonne gauche : sections Conflits/Indexé/Non indexé + boîte de commit (✨ Générer)
+      WorkingDiffView.swift   Diff INTERACTIF : cases hunk/ligne, stager/jeter la sélection, bascule staged
+      Conflict/               Résolution de conflits DANS l'app (rebase OU merge en pause)
+        ConflictModels.swift        Parse marqueurs <<<<<<< ======= >>>>>>> → régions { ours, theirs }
+        ConflictResolver.swift      Applique les choix, réécrit le fichier, git add, continue/abort
+        ConflictResolutionView.swift UI de résolution bloc-par-bloc (nôtre/leur/les deux) + édition libre
   ScriptRunner/               Troisième outil : scripts npm → docs/SCRIPT_RUNNER.md
     PackageProject.swift      Modèles ScriptPackage (id = chemin) + PackageProject { root, subpackages }
     PackageStore.swift        Scan $HOME en fond + groupage monorepo + cache chemins (scriptRunner.packageDirs)
