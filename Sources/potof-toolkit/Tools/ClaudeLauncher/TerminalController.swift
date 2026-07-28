@@ -53,9 +53,49 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
 
     /// Texte **rendu** de l'écran actif du terminal (buffer alterné de la TUI Claude).
     /// Sert à détecter un prompt de permission avant d'y répondre. Vide si absent.
+    ///
+    /// ⚠️ **Normalisation indispensable, pas cosmétique.** La TUI de Claude positionne
+    /// le curseur colonne par colonne (`CSI n G`) au lieu d'écrire des espaces : les
+    /// cellules ainsi sautées ressortent de `getBufferAsData` en **U+0000**, pas en
+    /// espace. Sans ce nettoyage, le texte est truffé de NUL et le moindre
+    /// `contains("1. Yes")` échoue **toujours** — ce qui rendait muettes, en silence,
+    /// toutes les heuristiques de `ClaudePromptHeuristics` (détection d'un prompt
+    /// égaré côté `SessionStore`, attente de disponibilité côté init CLAUDE.md).
+    /// Diagnostiqué par l'auto-test `--ide-selftest --e2e` : 110 sondages consécutifs
+    /// renvoyaient `false` alors que le prompt était bel et bien à l'écran.
+    ///
+    /// On remplace donc tout caractère de contrôle par une espace et on écrase les
+    /// suites d'espaces, en préservant les sauts de ligne (la structure en lignes
+    /// reste la seule chose sur laquelle les heuristiques s'appuient).
     func screenText(id: UUID) -> String {
         guard let term = views[id] else { return "" }
-        return String(data: term.getTerminal().getBufferAsData(kind: .active), encoding: .utf8) ?? ""
+        let raw = String(data: term.getTerminal().getBufferAsData(kind: .active), encoding: .utf8) ?? ""
+        return Self.normalizeScreen(raw)
+    }
+
+    /// Voir `screenText(id:)`. Isolée pour être testable et réutilisable.
+    static func normalizeScreen(_ raw: String) -> String {
+        var out = ""
+        out.reserveCapacity(raw.count)
+        var previousWasBlank = false
+        for scalar in raw.unicodeScalars {
+            if scalar == "\n" {
+                out.append("\n")
+                previousWasBlank = false
+                continue
+            }
+            // NUL (cellule sautée), autres contrôles, DEL et espace : tous « du vide ».
+            let blank = scalar.value < 0x20 || scalar.value == 0x7F || scalar == " "
+            if blank {
+                if previousWasBlank { continue }
+                previousWasBlank = true
+                out.append(" ")
+            } else {
+                previousWasBlank = false
+                out.unicodeScalars.append(scalar)
+            }
+        }
+        return out
     }
 
     /// Nombre de sessions dont le process (shell + éventuel `claude`) tourne encore.
@@ -92,11 +132,18 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
         var env = Terminal.getEnvironmentVariables(termName: "xterm-256color", trueColor: true)
         env.append("POTOF_SESSION_ID=\(id.uuidString)")   // ancrage notif (Phase 4)
 
-        // Intégration IDE : un serveur MCP par session. On l'ouvre AVANT le spawn
-        // pour injecter `CLAUDE_CODE_SSE_PORT`/`ENABLE_IDE_INTEGRATION` dans l'env →
-        // `claude` route alors ses éditions vers l'app via `openDiff` (aperçu +
-        // accepter/refuser) au lieu d'écrire directement. L'env prime sur le scan
-        // des locks, donc gagne sur un WebStorm ouvert. Voir docs/IDE_BRIDGE.md.
+        // Intégration IDE : un serveur MCP par session. On l'ouvre AVANT le spawn pour
+        // injecter `CLAUDE_CODE_SSE_PORT` dans l'env → `claude` route alors ses éditions
+        // vers l'app via `openDiff` (revue Accepter/Refuser) au lieu d'écrire directement.
+        //
+        // Pourquoi garder un serveur **par session** alors qu'`IDEHost` sert déjà tout
+        // `$HOME` : le port injecté court-circuite le scan des locks (`lock.port ===
+        // CLAUDE_CODE_SSE_PORT`), donc l'`openDiff` d'une session possédée arrive sur
+        // SON socket — routage exact, aucune ambiguïté quand plusieurs IDE sont déclarés.
+        // C'est aussi ce qui permet à `InitClaudeMdCoordinator` de savoir de quelle
+        // session vient un aperçu. (`ENABLE_IDE_INTEGRATION`, injectée jusqu'ici, a été
+        // retirée : la chaîne n'existe plus dans le binaire `claude 2.1.220` — variable
+        // morte.) Voir docs/IDE_BRIDGE.md.
         let ide = IDEServer(sessionID: id, workspace: folder)
         if ide.isAvailable {
             ide.onOpenDiff = { [weak self] req, done in self?.onOpenDiff?(id, req, done) }
