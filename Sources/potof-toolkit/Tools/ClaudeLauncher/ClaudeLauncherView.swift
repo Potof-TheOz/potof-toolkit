@@ -84,8 +84,9 @@ struct ClaudeLauncherView: View {
         .onChange(of: favorites.paths) { _ in loadFavorites() }
         // Une init « CLAUDE.md » vient d'être acceptée : le drapeau `hasClaudeMd` est figé
         // au scan → on rescanne pour cesser de proposer « Initialiser » sur ce dossier. Un
-        // court délai laisse `claude` écrire le fichier après le « Yes » (le rescan lit le
-        // disque) ; à défaut, le prochain retour au premier plan corrige de toute façon.
+        // court délai laisse `claude` appliquer l'outil après le verdict (c'est LUI qui
+        // écrit, le rescan lit le disque) ; à défaut, le prochain retour au premier plan
+        // corrige de toute façon.
         .onReceive(NotificationCenter.default.publisher(for: .initClaudeMdDidWriteFile)) { _ in
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 scan()
@@ -371,25 +372,15 @@ struct ClaudeLauncherView: View {
             VStack(spacing: 0) {
                 sessionBar(session)
                 Divider()
-                // Aperçu d'un diff proposé par Claude (openDiff) pour CETTE session.
-                // On affiche le panneau **à la place** du terminal (pas en overlay) :
-                // le terminal est un NSView (SwiftTerm) qui capterait les clics d'un
-                // overlay SwiftUI posé au-dessus (fall-through du hit-test) → les
-                // boutons paraîtraient morts. Le NSView reste vivant dans le
-                // contrôleur (process + scrollback préservés) et revient au verdict.
-                // Accepter → Claude écrit ; Refuser → fichier inchangé. Cf. IDE_BRIDGE.
-                if let pres = sessions.pendingDiffs[session.id] {
-                    DiffOverlayView(
-                        request: pres.request,
-                        diff: pres.diff,
-                        onAccept: { sessions.resolveDiff(session.id, .saved) },
-                        onReject: { sessions.resolveDiff(session.id, .rejected) }
-                    )
+                // Le terminal est **toujours** visible : les diffs proposés par Claude
+                // (`openDiff`) ne s'affichent plus ici. Ils partent dans la file unique
+                // de `DiffReviewCenter` et se valident dans la fenêtre flottante de
+                // revue (`Core/DiffReview/`), commune aux sessions possédées et aux
+                // agents externes. On garde ainsi une seule surface de validation dans
+                // l'app, et on peut suivre ce que fait `claude` pendant qu'on relit son
+                // diff — ce que l'ancien panneau plein cadre interdisait.
+                TerminalHostView(terminal: sessions.terminal.view(for: session.id), focusID: session.id)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    TerminalHostView(terminal: sessions.terminal.view(for: session.id), focusID: session.id)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
             }
         } else {
             centerEmptyState

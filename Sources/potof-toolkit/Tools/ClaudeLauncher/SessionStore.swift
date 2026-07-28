@@ -17,9 +17,6 @@ final class SessionStore: ObservableObject {
 
     @Published private(set) var sessions: [Session] = []
     @Published var activeID: UUID?
-    /// Aperçus de diff en attente de décision, par session (intégration IDE).
-    /// L'UI en affiche un overlay au-dessus du terminal de la session active.
-    @Published private(set) var pendingDiffs: [UUID: DiffPresentation] = [:]
 
     let terminal = TerminalController.shared
 
@@ -30,7 +27,9 @@ final class SessionStore: ObservableObject {
         terminal.onProcessExit = { [weak self] id, code in
             self?.handleExit(id, code)
         }
-        // Intégration IDE : Claude propose un diff / ferme un onglet de diff.
+        // Intégration IDE : Claude propose un diff / ferme un onglet de diff. Les
+        // demandes ne sont plus gardées ici : elles partent dans `DiffReviewCenter`,
+        // la file d'attente **unique** de l'app (cf. `Core/DiffReview/`).
         terminal.onOpenDiff = { [weak self] id, req, done in
             self?.presentDiff(id, req, done)
         }
@@ -107,92 +106,127 @@ final class SessionStore: ObservableObject {
 
     // MARK: - Aperçu de diff (intégration IDE, cf. docs/IDE_BRIDGE.md)
 
-    /// Claude propose une modification (`openDiff`, bloquant côté CLI) : on calcule
-    /// le diff vs le disque, on le met en attente et on bascule sur la session
-    /// concernée pour le rendre visible. L'app **n'écrit rien** : c'est le verdict
-    /// (`resolveDiff`) qui, si accepté, laisse Claude écrire.
+    /// Claude propose une modification (`openDiff`, bloquant côté CLI) : la demande
+    /// part dans `DiffReviewCenter`, la **file d'attente unique** de l'app, affichée
+    /// par la fenêtre flottante de revue. Une session possédée et un agent externe
+    /// (Superset) empruntent donc exactement la même surface de validation ; le
+    /// terminal, lui, reste visible en permanence.
+    ///
+    /// L'app **n'écrit rien** : c'est le verdict qui, si accepté, laisse `claude`
+    /// écrire le contenu qu'on lui renvoie (§2.3 du contrat).
     private func presentDiff(_ id: UUID, _ request: IDEDiffRequest,
                              _ complete: @escaping (IDEDiffVerdict) -> Void) {
         // Session déjà fermée entre-temps → refuse, sinon Claude resterait bloqué.
         guard containsSession(id) else { complete(.rejected); return }
-        // Un aperçu déjà en attente (ne devrait pas arriver : les openDiff sont
-        // sérialisés) → on le refuse avant de le remplacer, pas de complétion perdue.
-        if let stale = pendingDiffs[id] { stale.complete(.rejected) }
-        let diff = DiffComputer.compute(oldPath: request.oldPath, newContent: request.newContents)
-        pendingDiffs[id] = DiffPresentation(sessionID: id, request: request, diff: diff, complete: complete)
-        IDELog.log("présente diff (+\(diff.addedCount)/−\(diff.removedCount)) : \(request.tabName)")
-        focus(id)
+        // On **enveloppe** la complétion du protocole : quel que soit le chemin de
+        // résolution (clic de l'utilisateur, `close_tab`, purge à la fermeture de la
+        // session), la réponse part d'abord vers le CLI, puis les conséquences locales
+        // sont traitées ici — un seul endroit, aucune branche oubliée.
+        DiffReviewCenter.shared.enqueue(request: request, origin: diffOrigin(for: id)) {
+            [weak self] verdict in
+            complete(verdict)
+            self?.didResolveDiff(id, request: request, verdict: verdict)
+        }
     }
 
-    /// Décision de l'utilisateur (clic Accepter/Refuser dans le panneau).
+    /// Suites locales d'un verdict, une fois la réponse `openDiff` partie.
     ///
-    /// Subtilité clé (cf. docs/IDE_BRIDGE.md) : `openDiff` n'est qu'un **aperçu**.
-    /// En mode permission par défaut, Claude affiche APRÈS un prompt terminal
-    /// « Do you want to make this edit? 1. Yes / 3. No ». C'est LUI la vraie porte.
-    /// Donc : Refuser → `DIFF_REJECTED` (Claude abandonne, aucun prompt) ; Accepter →
-    /// `FILE_SAVED` puis on répond « Yes » à ce prompt (`confirmEditInTerminal`).
-    func resolveDiff(_ id: UUID, _ verdict: IDEDiffVerdict) {
-        guard let pres = pendingDiffs[id] else { return }
-        pendingDiffs[id] = nil          // ferme le panneau ; `remove` ne re-votera pas
-        IDELog.log("verdict utilisateur : \(verdict.rawValue)")
-        pres.complete(verdict)
-        if verdict == .saved {
-            // On répond « Yes » au prompt de permission PUIS, une fois seulement ce Yes
-            // envoyé, on prévient le coordinateur d'init : sinon l'injection des conventions
-            // (planifiée sur un délai fixe) pouvait partir avant même que le prompt de
-            // permission ne s'affiche, et taper dans le mauvais contexte.
-            confirmEditInTerminal(id, attempt: 0) { [weak self] in
-                guard self != nil else { return }
-                InitClaudeMdCoordinator.shared.diffSaved(sessionID: id, request: pres.request)
-            }
-        } else {
-            // Refus explicite → désarme une éventuelle init en cours sur cette session.
-            InitClaudeMdCoordinator.shared.diffRejected(sessionID: id, request: pres.request)
+    /// ⚠️ **Plus aucun « Entrée » n'est envoyé au terminal en routine.** Fait vérifié
+    /// sur `claude 2.1.220` (§2.3 du contrat, `tSd`) : quand la réponse `FILE_SAVED`
+    /// est bien formée (deux blocs), le panneau de diff **EST** le prompt de
+    /// permission — il rend un `allow`/`deny`, et **rien ne s'affiche dans le
+    /// terminal**. L'ancien repli « au bout de ~6 s, tape Entrée quoi qu'il arrive »
+    /// validerait aujourd'hui n'importe quel prompt présent à ce moment-là (« trust
+    /// this folder », un `Bash` proposé entre-temps…) : il est supprimé.
+    ///
+    /// Reste une surveillance **conditionnelle** (cf. `watchStrayPermissionPrompt`),
+    /// qui ne tape que sur détection et signale alors une dérive du contrat.
+    private func didResolveDiff(_ id: UUID, request: IDEDiffRequest, verdict: IDEDiffVerdict) {
+        switch verdict {
+        case .saved:
+            // Le « Yes » terminal ayant disparu, l'enchaînement de l'init CLAUDE.md
+            // part **immédiatement après le verdict** : c'est désormais le verdict
+            // lui-même qui débloque `claude` (il applique l'outil dans la foulée).
+            InitClaudeMdCoordinator.shared.diffSaved(sessionID: id, request: request)
+            watchStrayPermissionPrompt(id, request: request, attempt: 0)
+        case .rejected:
+            // Refus explicite, `close_tab`, ou session fermée → désarme une éventuelle
+            // init en cours sur cette session (sinon elle injecterait les conventions
+            // au prochain CLAUDE.md accepté, longtemps après et sans qu'on le demande).
+            InitClaudeMdCoordinator.shared.diffRejected(sessionID: id, request: request)
         }
     }
 
-    /// Répond « Yes » (Entrée) au prompt de permission terminal qui suit `FILE_SAVED`.
-    /// On **détecte** l'apparition du prompt dans le buffer rendu (robuste au timing :
-    /// il apparaît généralement en < 1 s, mais on tolère un délai) ; en dernier
-    /// recours (~6 s) on envoie quand même Entrée (le prompt est alors forcément là).
-    private func confirmEditInTerminal(_ id: UUID, attempt: Int, then: (() -> Void)? = nil) {
+    /// Filet de sécurité **conditionnel** après une acceptation : on regarde ~2 s si un
+    /// prompt de permission apparaît malgré tout dans le terminal.
+    ///
+    /// En nominal il n'en apparaît **aucun** — c'est tout l'intérêt du contrat. Qu'il
+    /// s'en affiche un veut dire que le CLI n'a pas pris notre revendication de
+    /// permission (réponse mal formée, protocole modifié…) : dans ce cas seulement on
+    /// répond `Entrée` (« ❯ 1. Yes » est l'option par défaut) pour ne pas laisser la
+    /// session bloquée, **et** on lève le drapeau de dérive (bandeau + `ide.log`).
+    ///
+    /// Garde-fou anti-faux-positif : l'heuristique lit le buffer *rendu*, où un prompt
+    /// déjà répondu peut encore traîner. On exige donc une véritable **apparition** —
+    /// si l'écran montrait déjà un prompt au moment du verdict, on désarme la
+    /// surveillance plutôt que de risquer une frappe à l'aveugle.
+    private func watchStrayPermissionPrompt(_ id: UUID, request: IDEDiffRequest, attempt: Int) {
         guard containsSession(id) else { return }
-        if ClaudePromptHeuristics.permissionPromptVisible(terminal.screenText(id: id)) {
+        let promptVisible = ClaudePromptHeuristics.permissionPromptVisible(terminal.screenText(id: id))
+        if attempt == 0 {
+            guard !promptVisible else {
+                IDELog.log("prompt déjà à l'écran au moment du verdict → surveillance désarmée "
+                           + "(reliquat d'affichage indiscernable d'une dérive ; on ne tape jamais à l'aveugle)")
+                return
+            }
+        } else if promptVisible {
             terminal.sendKeys(id: id, "\r")   // « ❯ 1. Yes » est le défaut → Entrée = Yes
-            IDELog.log("prompt de permission détecté → Entrée (Yes)")
-            then?()
+            IDELog.log("DÉRIVE : prompt de permission apparu après FILE_SAVED → Entrée envoyée")
+            IDEContractGuard.shared.flagDrift(
+                "Un prompt de permission est apparu dans le terminal après une acceptation "
+                + "(\(request.tabName)). Sur claude \(IDEProtocolContract.lastValidatedClaudeVersion) "
+                + "le panneau de revue EST la permission : ce prompt signifie que la réponse "
+                + "FILE_SAVED n'a pas été prise en compte. Répondu « Entrée » pour ne pas bloquer "
+                + "la session — le contrat openDiff a probablement changé.")
             return
         }
-        guard attempt < 40 else {             // ~6 s : dernier recours (best effort)
-            terminal.sendKeys(id: id, "\r")
-            IDELog.log("prompt non détecté après délai → Entrée (best effort)")
-            then?()
-            return
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            self?.confirmEditInTerminal(id, attempt: attempt + 1, then: then)
+        // ~2 s de veille (13 × 0,15 s) : au-delà, l'absence de prompt = comportement
+        // nominal, on s'arrête en silence.
+        guard attempt < Self.strayPromptPollCount else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.strayPromptPollInterval) { [weak self] in
+            self?.watchStrayPermissionPrompt(id, request: request, attempt: attempt + 1)
         }
     }
 
-    /// Claude a fermé l'onglet (annulation, ex. Ctrl-C) alors que l'aperçu était
-    /// encore ouvert → on le retire en refusant. `matchingTab == nil` ⇒ tout fermer.
+    private static let strayPromptPollInterval: TimeInterval = 0.15
+    private static let strayPromptPollCount = 13
+
+    /// Claude a fermé l'onglet (annulation, ex. Ctrl-C) alors que la demande était
+    /// encore dans la file → le centre la retire **en refusant** (l'appel bloquant
+    /// doit recevoir une réponse). `matchingTab == nil` ⇒ tout fermer pour la session.
     private func dismissDiff(_ id: UUID, matchingTab tab: String?) {
-        guard let pres = pendingDiffs[id] else { return }
-        if let tab, pres.request.tabName != tab { return }
-        pendingDiffs[id] = nil
-        pres.complete(.rejected)
-        // Claude a annulé l'aperçu → désarme une éventuelle init en cours.
-        InitClaudeMdCoordinator.shared.diffRejected(sessionID: id, request: pres.request)
+        DiffReviewCenter.shared.dismiss(matchingTab: tab, origin: diffOrigin(for: id))
+    }
+
+    /// Origine d'une demande émise par cette session. `kind` porte l'identité
+    /// **stable** (c'est sur elle que le centre apparie ses purges) ; `label` n'est
+    /// que de l'affichage : titre courant de la session (OSC title de `claude`) ou,
+    /// à défaut, nom du dossier.
+    private func diffOrigin(for id: UUID) -> DiffReviewOrigin {
+        let session = sessions.first { $0.id == id }
+        let label = session.map { $0.title.isEmpty ? $0.folderName : $0.title } ?? "Session Claude"
+        return DiffReviewOrigin(kind: .session(id), label: label)
     }
 
     // MARK: - Privé
 
     private func remove(_ id: UUID) {
-        // Session fermée avec un diff en attente → on refuse (libère le CLI).
-        if let pres = pendingDiffs[id] {
-            pendingDiffs[id] = nil
-            pres.complete(.rejected)
-        }
+        // Session fermée : plus personne pour lire nos réponses, et plus aucune UI
+        // rattachée à cette origine. On purge la file **avant** de retirer la session,
+        // pour que toute demande encore en vol reçoive son `DIFF_REJECTED` — sinon le
+        // CLI resterait bloqué indéfiniment sur son appel `openDiff`.
+        // (Chaque purge repasse par `didResolveDiff`, qui désarme l'init au passage.)
+        DiffReviewCenter.shared.dropAll(origin: diffOrigin(for: id))
         // Désarme une éventuelle init en cours (sinon son état survit à la session).
         InitClaudeMdCoordinator.shared.cancel(sessionID: id)
         sessions.removeAll { $0.id == id }
@@ -217,18 +251,9 @@ final class SessionStore: ObservableObject {
     }
 }
 
-// MARK: - Aperçu de diff en attente
-
-/// Un `openDiff` en attente de décision, pour une session. Porte la complétion à
-/// rappeler avec le verdict (renvoyé au CLI Claude via le pont IDE). Le `diff` est
-/// pré-calculé à la réception ; la vue ne fait que l'afficher.
-struct DiffPresentation: Identifiable {
-    let id = UUID()
-    let sessionID: UUID
-    let request: IDEDiffRequest
-    let diff: FileDiff
-    let complete: (IDEDiffVerdict) -> Void
-}
+// `DiffPresentation` (l'aperçu en attente gardé ici, avec sa complétion) a disparu :
+// la file d'attente est désormais **unique** et vit dans `DiffReviewCenter`
+// (`PendingDiffReview`), partagée avec les agents externes servis par `IDEHost`.
 
 // MARK: - Fournisseur de sessions pour les notifications
 

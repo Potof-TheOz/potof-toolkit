@@ -18,6 +18,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Pont IDE : log vierge + nettoyage des locks orphelins (crash précédent).
         IDELog.startSession()
         IDEServer.sweepStaleLocks()
+        // Hôte IDE global (agents externes : Superset, terminaux du poste). Démarré
+        // ici et pas plus tard : `claude` ne tente l'auto-connexion que pendant ses
+        // 30 premières secondes, donc notre lock doit exister avant l'agent. Le
+        // balayage des locks orphelins ci-dessus le précède volontairement (un lock
+        // Potof fantôme ferait deux IDE « valides » → plus d'auto-connexion du tout).
+        IDEHost.shared.start()
 
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1040, height: 680),
@@ -43,6 +49,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         NotificationCenterCoordinator.shared.stop()
+        // Hôte IDE : coupe les connexions et surtout **supprime le lock**. Un lock qui
+        // survivrait à l'app enverrait les prochains `claude` vers un port mort (le CLI
+        // ne purge que les locks dont le pid n'existe plus — un pid recyclé passerait).
+        // Synchrone : après ce retour, le run loop principal ne tourne plus.
+        IDEHost.shared.stop()
         // SIGKILL explicite des groupes de process des runs de scripts : la
         // fermeture du fd maître du PTY ne SIGHUPe pas un dev server qui
         // l'ignore — sans ça, ports orphelins après quit.
@@ -168,6 +179,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             action: #selector(NSText.selectAll(_:)),
             keyEquivalent: "a"
         )
+
+        // Menu Hôte IDE : périmètre servi (le lock `~/.claude/ide/<port>.lock` couvre
+        // tout $HOME par défaut, ce qui entre en conflit avec un autre IDE qui
+        // publierait un lock — d'où un réglage, cf. IDEHostSettings) + panneau de
+        // diagnostic des clients connectés. Construit hors de ce delegate, qui reste
+        // mince ; le singleton retient la fenêtre.
+        mainMenu.addItem(IDEHostMenu.shared.makeMenuItem())
 
         NSApp.mainMenu = mainMenu
     }
