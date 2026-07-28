@@ -1,30 +1,17 @@
 import AppKit
 
-// Mode diagnostic (hors GUI) : lance le serveur d'intégration IDE **de production**
-// en isolation, pour le valider contre un vrai `claude` (connexion + openDiff →
-// refus, sans écrire de fichier). Usage :
-//   potof-toolkit --ide-selftest <dossier>
-// Le port (éphémère) est imprimé sur stdout ; le lock est écrit dans ~/.claude/ide.
-// Voir docs/IDE_BRIDGE.md. N'affecte jamais le lancement normal (drapeau absent).
+// Mode diagnostic (hors GUI) : rejoue le contrat protocolaire `claude` ↔ IDE contre le
+// binaire `claude` réellement installé. Il vit **avant** `NSApplication` et ne revient
+// jamais : ni l'UI, ni l'hôte IDE global de l'app (`IDEHost.shared`, démarré par
+// `AppDelegate`) ne sont montés — le banc de test a son propre port et son propre lock.
+//
+//   potof-toolkit --ide-selftest <dossier> [accept]   serveur de production, branchement manuel
+//   potof-toolkit --ide-selftest --e2e [--keep]       test automatique de bout en bout
+//
+// Détails et compte rendu par point de contrat → `Core/IDEHost/IDESelfTest.swift`
+// et `docs/IDE_BRIDGE.md`. N'affecte jamais le lancement normal (drapeau absent).
 if let idx = CommandLine.arguments.firstIndex(of: "--ide-selftest") {
-    let folder = CommandLine.arguments.count > idx + 1
-        ? URL(fileURLWithPath: CommandLine.arguments[idx + 1])
-        : URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-    let server = IDEServer(sessionID: UUID(), workspace: folder)
-    guard let port = server.port else {
-        FileHandle.standardError.write(Data("ide-selftest: réservation de port échouée\n".utf8))
-        exit(1)
-    }
-    // Par défaut onOpenDiff reste nil → refus systématique. Avec l'argument
-    // `accept`, on simule un clic « Accepter » (valide le chemin FILE_SAVED :
-    // c'est alors Claude qui écrit le fichier).
-    if CommandLine.arguments.contains("accept") {
-        server.onOpenDiff = { _, done in done(.saved) }
-    }
-    server.start()
-    print("PORT=\(port)")
-    fflush(stdout)
-    dispatchMain()
+    IDESelfTest.run(arguments: CommandLine.arguments, flagIndex: idx)   // -> Never
 }
 
 // Point d'entrée : NSApplication piloté manuellement (voir AppDelegate).

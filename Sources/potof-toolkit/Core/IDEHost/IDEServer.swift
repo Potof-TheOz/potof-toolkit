@@ -9,6 +9,11 @@ import Network
 /// Cycle de vie calqué sur le process : `TerminalController` crée le serveur au
 /// lancement (avant de spawn le shell, pour injecter le port dans l'env) et l'arrête
 /// à la fermeture (supprime le lock). Voir `docs/IDE_BRIDGE.md`.
+///
+/// À distinguer d'`IDEHost` (hôte **global**, un seul port pour tout `$HOME`), qui
+/// sert les agents que l'app ne lance pas. Ici le port injecté court-circuite le scan
+/// des locks (`lock.port === CLAUDE_CODE_SSE_PORT`) : le routage vers la bonne session
+/// est exact, sans ambiguïté possible entre plusieurs IDE déclarés.
 final class IDEServer {
 
     let sessionID: UUID
@@ -43,10 +48,18 @@ final class IDEServer {
     var isAvailable: Bool { port != nil }
 
     /// Variables à injecter dans l'environnement du shell pour que `claude` se
-    /// connecte à CE serveur (et pas à un lock WebStorm : l'env prime sur le scan).
+    /// connecte à CE serveur (l'env prime sur le scan des locks : `lock.port ===
+    /// CLAUDE_CODE_SSE_PORT` court-circuite la validation par préfixe de chemin, donc
+    /// une session possédée atteint toujours son propre serveur, jamais l'hôte global
+    /// ni un lock d'un autre IDE).
+    ///
+    /// Une seule variable, volontairement : `ENABLE_IDE_INTEGRATION=true` était injectée
+    /// jusqu'ici, mais la chaîne **n'existe plus dans le binaire `claude 2.1.220`**
+    /// (vérifié) — c'est une variable morte, la laisser entretiendrait la croyance
+    /// qu'elle conditionne quelque chose.
     var environment: [String] {
         guard let port else { return [] }
-        return ["CLAUDE_CODE_SSE_PORT=\(port)", "ENABLE_IDE_INTEGRATION=true"]
+        return ["CLAUDE_CODE_SSE_PORT=\(port)"]
     }
 
     func start() {
@@ -131,7 +144,9 @@ final class IDEServer {
 
     // MARK: - Statique
 
-    static let ideName = "Potof Toolkit"
+    /// Nom publié dans le lock : source unique dans `IDEProtocolContract` (partagé
+    /// avec l'hôte global, qui doit balayer les mêmes locks).
+    static let ideName = IDEProtocolContract.ideName
 
     static var lockDir: URL {
         FileManager.default.homeDirectoryForCurrentUser

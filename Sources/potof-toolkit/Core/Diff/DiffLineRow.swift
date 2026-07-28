@@ -5,8 +5,9 @@ import SwiftUI
 /// l'ajout / la suppression.
 ///
 /// Consomme le `DiffLine` produit par `DiffComputer` (voir `Core/Diff/DiffModel`).
-/// Mutualisé entre l'aperçu des diffs Claude (`DiffOverlayView`, pont IDE) et
-/// l'aperçu des commits de Git Stuffs (`CommitDiffView`).
+/// Mutualisé entre la revue des diffs proposés par les agents Claude
+/// (`Core/DiffReview/DiffReviewView`) et l'aperçu des commits de Git Stuffs
+/// (`CommitDiffView`).
 struct DiffLineRow: View {
     let line: DiffLine
     /// `true` (défaut) : le texte revient à la ligne (aperçu à largeur fixe, pont IDE).

@@ -34,6 +34,13 @@ final class NotificationCenterCoordinator: NSObject, UNUserNotificationCenterDel
     private var unreadCount = 0
     private var started = false
 
+    /// Miroir de `DiffReviewCenter.shared.pendingCount`, tenu à jour par abonnement.
+    /// On mémorise au lieu de relire le centre au moment d'écrire la pastille :
+    /// `@Published` émet en `willSet`, une relecture dans le callback donnerait la
+    /// valeur d'AVANT la mutation.
+    private var pendingDiffCount = 0
+    private var diffReviewSubscription: AnyCancellable?
+
     private lazy var channel = NotificationChannel { [weak self] event in
         self?.ingest(event)
     }
@@ -59,11 +66,28 @@ final class NotificationCenterCoordinator: NSObject, UNUserNotificationCenterDel
             self, selector: #selector(appDidBecomeActive),
             name: NSApplication.didBecomeActiveNotification, object: nil)
 
+        // Fenêtre flottante de revue des diffs : elle doit être armée dès le
+        // lancement — une demande peut arriver d'un agent externe avant toute
+        // interaction de l'utilisateur avec l'app. Amorcée ici parce que c'est le
+        // point d'entrée app-level déjà câblé dans `AppDelegate` ; `start()` est
+        // idempotent, un appel supplémentaire ailleurs est sans effet.
+        DiffReviewWindowController.shared.start()
+
+        // Part « diffs en attente » de la pastille du Dock (voir `refreshDockBadge`).
+        // Le coordinateur possède `NSApp.dockTile.badgeLabel` : c'est donc lui qui
+        // suit la file, pas la fenêtre de revue.
+        diffReviewSubscription = DiffReviewCenter.shared.$pending.sink { [weak self] pending in
+            guard let self else { return }
+            self.pendingDiffCount = pending.count
+            self.refreshDockBadge()
+        }
+
         channel.start()
     }
 
     func stop() {
         channel.stop()
+        diffReviewSubscription = nil
         NotificationCenter.default.removeObserver(self)
         started = false
     }
@@ -81,9 +105,28 @@ final class NotificationCenterCoordinator: NSObject, UNUserNotificationCenterDel
 
     // MARK: - Pastille Dock
 
+    /// La pastille est **composée** de deux comptes aux durées de vie opposées :
+    ///
+    /// - `unreadCount` — notifications Claude non lues. Éphémère : « non-lues depuis
+    ///   la dernière fois que j'ai regardé », donc remis à zéro dès que l'utilisateur
+    ///   revient dans l'app (`markNotificationsSeen`).
+    /// - `pendingDiffCount` — modifications en attente de validation. **Non
+    ///   effaçable par une simple activation** : derrière chaque demande, un agent
+    ///   est *bloqué* sur un `openDiff` tant que personne n'a tranché. Revenir dans
+    ///   l'app ne décide de rien ; seul un verdict (ou la disparition du client)
+    ///   fait retomber ce compte, via l'abonnement à `DiffReviewCenter`.
+    ///
+    /// D'où la recomposition systématique ici, au lieu d'écrire la pastille en dur
+    /// aux points d'appel : c'est le seul endroit qui connaît les deux parts.
+    private func refreshDockBadge() {
+        let total = unreadCount + pendingDiffCount
+        NSApp.dockTile.badgeLabel = total > 0 ? String(total) : nil
+    }
+
     func markNotificationsSeen() {
         unreadCount = 0
-        NSApp.dockTile.badgeLabel = nil
+        // ⚠️ Pas `badgeLabel = nil` : ça effacerait aussi les diffs en attente.
+        refreshDockBadge()
     }
 
     @objc private func appDidBecomeActive() { markNotificationsSeen() }
@@ -136,9 +179,9 @@ final class NotificationCenterCoordinator: NSObject, UNUserNotificationCenterDel
         bus.ingest(AppNotification(id: UUID(), sessionID: sid, kind: kind,
                                    title: title, body: body, date: date))
 
-        // b. Pastille Dock.
+        // b. Pastille Dock (recomposée : non-lues + diffs en attente).
         unreadCount += 1
-        NSApp.dockTile.badgeLabel = String(unreadCount)
+        refreshDockBadge()
 
         // c. Rebond du Dock (ignoré par macOS quand l'app est déjà active).
         //    Attente/permission = rebond insistant ; tâche terminée = rebond simple.
@@ -242,6 +285,18 @@ final class NotificationCenterCoordinator: NSObject, UNUserNotificationCenterDel
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let info = response.notification.request.content.userInfo
+        // Bannière posée par la fenêtre de revue des diffs : ce coordinateur est le
+        // délégué UNIQUE d'`UNUserNotificationCenter` pour toute l'app, il reçoit
+        // donc aussi ces clics-là. Aucune session Claude derrière → la cible est le
+        // panneau flottant, et on ne touche pas à la pastille (les diffs en attente
+        // ne s'effacent pas d'un clic, seulement d'un verdict).
+        if info[DiffReviewWindowController.bannerUserInfoKey] != nil {
+            DispatchQueue.main.async {
+                DiffReviewWindowController.shared.bringToFront()
+                completionHandler()
+            }
+            return
+        }
         let sid = (info["sessionID"] as? String).flatMap { UUID(uuidString: $0) }
         DispatchQueue.main.async { [weak self] in
             self?.handleClick(sessionID: sid)

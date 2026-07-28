@@ -18,11 +18,16 @@ extension Notification.Name {
 ///     après un éventuel prompt « trust this folder ») → **seul** signal qui déclenche
 ///     `/init`. On ne seed **jamais** à l'aveugle : taper `/init` dans un shell qui
 ///     pourrait être nu produit « zsh: no such file: /init ».
-///  3. Claude propose le `CLAUDE.md` via `openDiff` → l'utilisateur accepte
-///     (`SessionStore.resolveDiff(.saved)` → `diffSaved(...)`) ou refuse (→ `diffRejected`).
-///  4. Une fois le fichier accepté (et « Yes » répondu au prompt de permission), on
-///     attend que Claude soit de nouveau prêt, puis on injecte les **conventions maison**
-///     (`ConventionsProfile.augmentationPrompt()`), si tant est qu'il y en ait.
+///  3. Claude propose le `CLAUDE.md` via `openDiff` → la demande part dans la file
+///     unique (`DiffReviewCenter`) et se valide dans la fenêtre de revue ; le verdict
+///     revient par `SessionStore` (→ `diffSaved(...)` ou `diffRejected(...)`).
+///  4. Une fois le fichier accepté, on attend que Claude soit de nouveau prêt, puis on
+///     injecte les **conventions maison** (`ConventionsProfile.augmentationPrompt()`),
+///     si tant est qu'il y en ait. ⚠️ Depuis `claude 2.1.220`, le verdict `FILE_SAVED`
+///     **est** la permission : il n'y a plus de « Yes » à taper dans le terminal, donc
+///     l'enchaînement part directement après le verdict (et non après une frappe).
+///     C'est `saveSettle` + la scrutation `readyForInput` qui laissent `claude`
+///     appliquer l'outil et finir son tour avant qu'on lui parle.
 ///  5. Le second `openDiff` (accepté) clôt l'orchestration.
 ///
 /// L'app **n'écrit jamais** : tout passe par l'aperçu Accepter/Refuser du pont IDE
@@ -50,7 +55,12 @@ final class InitClaudeMdCoordinator {
     private let pollInterval: TimeInterval = 0.25
     private let readyCap = 80               // ~20 s de scrutation « prêt » avant abandon
     private let connectSettle: TimeInterval = 0.8   // laisse le prompt se dessiner après connexion
-    private let saveSettle: TimeInterval = 1.0      // laisse Claude enchaîner l'écriture avant de guetter l'idle
+    /// Délai après le verdict avant de guetter l'état « prêt ». Seul rempart si la TUI
+    /// n'a pas encore basculé sur « esc to interrupt » : le verdict débloque l'appel
+    /// `openDiff`, `claude` applique l'outil puis finit son tour — écrire pendant cette
+    /// fenêtre taperait le prompt de conventions dans le vide. (Depuis 2.1.220 il n'y a
+    /// plus de prompt de permission pour tenir `readyForInput` à faux entre-temps.)
+    private let saveSettle: TimeInterval = 1.0
     private let connectTimeout: TimeInterval = 15   // abandon si le pont IDE ne se connecte jamais
     private let enterDelay: TimeInterval = 0.4       // délai entre le texte et la touche Entrée
 
@@ -95,7 +105,8 @@ final class InitClaudeMdCoordinator {
         sendWhenReady(id, text: "/init", phase: .awaitingInit)
     }
 
-    /// Un `openDiff` vient d'être **accepté** (« Yes » répondu au prompt de permission).
+    /// Un `openDiff` vient d'être **accepté** (verdict `FILE_SAVED` renvoyé au CLI, qui
+    /// applique alors l'outil et écrit le fichier — l'app n'écrit jamais).
     /// Si c'est la session d'init et l'aperçu du `CLAUDE.md` visé : après `/init` →
     /// injection des conventions (si présentes) ; après l'augmentation → fin. Tout autre
     /// fichier / session non-init est ignoré.

@@ -9,8 +9,8 @@ struct CommitDiffTarget: Identifiable {
     let subject: String
 }
 
-/// Aperçu **lecture seule** des modifications d'un commit, mutualisant le rendu du
-/// pont IDE : `DiffComputer` (LCS ligne-à-ligne) + `DiffLineRow` (Core/Diff). Un
+/// Aperçu **lecture seule** des modifications d'un commit, bâti sur le moteur de diff
+/// partagé `Core/Diff` : `DiffComputer` (LCS ligne-à-ligne) + `DiffLineRow`. Un
 /// bouton ferme le panneau (`onClose`). N'écrit jamais rien (via `git show`).
 struct CommitDiffView: View {
     let target: CommitDiffTarget

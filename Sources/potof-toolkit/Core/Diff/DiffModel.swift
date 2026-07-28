@@ -1,5 +1,13 @@
 import Foundation
 
+// Moteur de diff **partagé** de l'app (`Core/Diff/`). Il a longtemps vécu dans
+// `Tools/ClaudeLauncher/IDE/`, mais ce n'est pas une affaire de pont IDE : ses
+// consommateurs sont l'aperçu des commits de Git Stuffs (`CommitDiffView`), la
+// revue des diffs proposés par les agents (`Core/DiffReview/`) et les rendus
+// mutualisés voisins (`DiffLineRow`, `SideBySideDiff`). Aucune dépendance à git
+// ni au protocole IDE ici : entrée = deux textes (ou un chemin + un texte),
+// sortie = un `FileDiff` prêt à afficher.
+
 /// Une ligne du diff unifié calculé, prête à l'affichage.
 ///
 /// On produit un modèle *déjà rendu* (numéros de ligne inclus) plutôt que de

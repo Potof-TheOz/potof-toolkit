@@ -197,8 +197,8 @@ final class ScriptRunStore: ObservableObject {
         }
     }
 
-    /// Un tick du poll d'arrêt (toutes les 0,5 s, main queue — pattern
-    /// `SessionStore.confirmEditInTerminal`). Se **désarme** dès que le run a été
+    /// Un tick du poll d'arrêt (toutes les 0,5 s, main queue — même pattern que
+    /// `SessionStore.watchStrayPermissionPrompt`). Se **désarme** dès que le run a été
     /// fermé/terminé entre-temps (guards ci-dessous) : aucun timer fantôme.
     private func pollStop(_ id: UUID, attempt: Int) {
         // Machine désarmée (handleExit / close) ou run disparu / plus en arrêt.

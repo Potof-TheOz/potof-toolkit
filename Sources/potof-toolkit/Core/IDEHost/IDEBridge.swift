@@ -5,25 +5,35 @@ import os
 ///
 /// Claude Code sait piloter un IDE **en tant que serveur MCP** : l'IDE ouvre un
 /// WebSocket sur `127.0.0.1`, publie un fichier `~/.claude/ide/<port>.lock`, et le
-/// CLI `claude` s'y connecte (JSON-RPC 2.0) dès qu'on lui injecte
-/// `CLAUDE_CODE_SSE_PORT` + `ENABLE_IDE_INTEGRATION` dans l'environnement du terminal.
+/// CLI `claude` s'y connecte (JSON-RPC 2.0) — soit parce qu'on lui a injecté
+/// `CLAUDE_CODE_SSE_PORT` (sessions possédées par l'app), soit par **découverte du
+/// lock** (agents externes : Superset, n'importe quel terminal du poste ; le
+/// matching se fait par préfixe de chemin sur `workspaceFolders`).
 /// Quand Claude veut modifier un fichier, il appelle l'outil **`openDiff`** (bloquant)
 /// au lieu d'écrire : l'IDE affiche le diff, l'utilisateur accepte/refuse, et l'IDE
-/// renvoie `FILE_SAVED` / `DIFF_REJECTED`.
+/// renvoie `FILE_SAVED` (+ contenu final) / `DIFF_REJECTED`.
 ///
-/// ⚠️ **Contrat vérifié empiriquement** (spike, `claude 2.1.205`) — voir
+/// ⚠️ **Contrat vérifié empiriquement contre `claude 2.1.220`** — les formes de
+/// réponse exactes et les constantes vivent dans `IDEProtocolContract`, voir aussi
 /// `docs/IDE_BRIDGE.md`. Points saillants :
 /// - sous-protocole WebSocket exigé : `mcp` (à écho dans la réponse 101) ;
 /// - header d'auth : `X-Claude-Code-Ide-Authorization: <authToken du lock>` ;
 /// - **`FILE_SAVED` = « l'utilisateur accepte »** → c'est **Claude** qui écrit le
-///   fichier ensuite. `DIFF_REJECTED` laisse le fichier intact. **Cette app ne
-///   touche donc JAMAIS au disque** : elle ne fait que présenter le diff et voter.
+///   fichier ensuite, avec le contenu qu'on lui renvoie. `DIFF_REJECTED` laisse le
+///   fichier intact. **Cette app ne touche donc JAMAIS au disque** : elle ne fait
+///   que présenter le diff et voter.
 ///
 /// Protocole non-officiel (reverse-engineered) : susceptible de bouger d'une version
 /// de `claude` à l'autre. Isolé ici et re-validable avec `--ide-selftest`.
 
 /// Demande d'aperçu de diff reçue via l'outil MCP `openDiff`.
-struct IDEDiffRequest {
+struct IDEDiffRequest: Identifiable {
+    /// Identité **locale** de la demande (générée à la réception, pas fournie par
+    /// le CLI). Clé de résolution : une même connexion peut avoir **N `openDiff`
+    /// en vol** en parallèle (les sous-agents `Task` d'un même `claude` en émettent
+    /// concurremment) — sans cette clé, impossible d'apparier un verdict à l'appel
+    /// JSON-RPC qui l'attend.
+    let id: UUID
     /// Chemin du fichier existant (lu sur disque pour l'« avant »).
     let oldPath: String
     /// Chemin cible (identique à `oldPath` pour une édition en place).
@@ -35,10 +45,30 @@ struct IDEDiffRequest {
     let tabName: String
 }
 
-/// Verdict de l'utilisateur, renvoyé tel quel comme texte de résultat MCP.
-enum IDEDiffVerdict: String {
-    case saved = "FILE_SAVED"
-    case rejected = "DIFF_REJECTED"
+/// Verdict de l'utilisateur sur une demande `openDiff`.
+///
+/// ⚠️ N'est **plus** un `String` brut : depuis `claude 2.1.220` (vérifié), le contenu
+/// renvoyé avec `FILE_SAVED` **devient l'input réel** de l'outil `Edit`/`Write` — donc
+/// accepter, c'est renvoyer un contenu, et on peut accepter **en l'ayant modifié**.
+/// La traduction en tableau `content` MCP est centralisée dans `IDEProtocolContract`.
+enum IDEDiffVerdict {
+    /// Accepté : `content` est ce que `claude` écrira (contenu proposé, ou édité par
+    /// l'utilisateur). ⚠️ Si `content` est identique à l'ancien fichier, le CLI en
+    /// déduit un diff vide et traite ça comme un **refus** (cf. `IDEProtocolContract`).
+    case saved(content: String)
+    /// Refusé : le fichier reste intact, `claude` l'annonce à l'agent.
+    case rejected
+}
+
+extension IDEDiffVerdict {
+    /// Étiquette courte pour `ide.log`. **Ne journalise pas le contenu** (un fichier
+    /// entier n'a rien à faire dans le log), seulement sa taille.
+    var logLabel: String {
+        switch self {
+        case .saved(let content): return "FILE_SAVED (\(content.utf8.count) o)"
+        case .rejected:           return "DIFF_REJECTED"
+        }
+    }
 }
 
 /// Callbacks fournis par la couche session à chaque connexion IDE. Regroupés pour
