@@ -1,9 +1,10 @@
 # Potof Toolkit
 
 App macOS native (SwiftUI + AppKit) servant de **toolkit d'outils de dev locaux**.
-**Local par défaut** : aucun compte, aucune télémétrie, pas de réseau — à une exception
-**opt-in** près, la génération de message de commit de Git Stuffs, qui invoque `claude`
-(outil externe → réseau). Trois outils à ce jour :
+**Local par défaut** : aucun compte, aucune télémétrie, aucune sortie réseau — à une
+exception **opt-in** près, la génération de message de commit de Git Stuffs, qui invoque
+`claude` (outil externe → réseau). Seule écoute : un socket **`127.0.0.1` uniquement**
+(pont IDE, cf. plus bas), protégé par un token. Trois outils à ce jour :
 **Claude Launcher** — liste les sous-dossiers d'un dossier racine et lance `claude`
 dans un **terminal embarqué** (SwiftTerm) affiché **au centre de l'app** ; les
 sessions sont **possédées par l'app** (process enfant dans un PTY) : les fermer
@@ -13,6 +14,10 @@ hunk/ligne, commit, push/pull avec badge ahead/behind, résolution de conflits d
 l'app). **Script Runner** — découvre les `package.json`
 et lance/arrête leurs scripts npm sur le même modèle de terminal possédé
 (voir `docs/SCRIPT_RUNNER.md`).
+Transversal aux outils : le **pont IDE** — l'app se fait passer pour un IDE Claude Code
+et **valide dans une fenêtre flottante** les modifications proposées par les agents
+`claude` du poste (Superset, terminaux, sessions embarquées) au lieu du prompt de
+permission du terminal (voir `docs/IDE_BRIDGE.md`).
 
 > Le dépôt s'appelle encore `claude-launcher/` (dossier historique) mais le produit,
 > l'exécutable et l'app sont **`potof-toolkit`**.
@@ -48,7 +53,8 @@ Détails deploy / debug / données / permissions → **`docs/LIFECYCLE.md`**.
 ```
 main.swift                    Entrée : NSApplication piloté à la main (pas de @main)
 App/
-  AppDelegate.swift           Fenêtre "Potof Toolkit", menu minimal, icône du Dock
+  AppDelegate.swift           Fenêtre "Potof Toolkit", menus (dont « Hôte IDE »), icône du Dock,
+                              démarrage/arrêt de l'hôte IDE + du canal de notifications
   RootView.swift              Coquille : header = sélecteur d'outil (menu) + slot notif
 Core/
   Tool.swift                  Abstraction d'un outil (id, title, subtitle, icon, view)
@@ -63,6 +69,29 @@ Core/
   Terminal/
     TerminalHostView.swift    NSViewRepresentable partagé (a quitté ClaudeLauncher/) : place la
                               vue terminal possédée par le contrôleur appelant + focus au chgt d'id
+  IDEHost/                    Pont IDE : l'app se fait passer pour un IDE Claude Code et sert des
+                              agents EXTERNES (Superset, terminaux) → docs/IDE_BRIDGE.md
+    IDEProtocolContract.swift ⭐ LE contrat en un seul endroit : formes de réponse openDiff, noms
+                              d'outils, en-tête d'auth, dernière version de claude validée
+    IDEBridge.swift           Types (IDEDiffRequest/Verdict, IDEDiffHandlers) + logger IDELog
+    IDEHost.swift             ⭐ Hôte GLOBAL (singleton) : 1 port, 1 lock ($HOME), N connexions
+    IDEServer.swift           Serveur d'UNE session possédée (port injecté) + sweepStaleLocks
+    IDEConnection.swift       Handshake WebSocket + framing RFC 6455 + JSON-RPC/MCP, N openDiff en vol
+    IDEClientIdentity.swift   pid (ide_connected) → cwd (lsof) → worktree → « Superset · branche »
+    IDEContractGuard.swift    ⭐ Vérif post-acceptation + empreinte de version + bandeau de dérive
+    IDEHostSettings.swift     Périmètre servi (ideHost.scope) / activation à la réception / expiration
+    IDEHostMenu.swift         Menu « Hôte IDE » de la barre de menus (périmètre + diagnostic)
+    IDEHostStatusView.swift   Panneau de diagnostic (port, périmètre, clients) — lecture seule
+  DiffReview/                 Surface de validation UNIQUE, toutes origines confondues
+    DiffReviewCenter.swift    ⭐ Singleton : file d'attente des demandes + résolution (verdict)
+    DiffReviewWindow.swift    NSPanel flottant (NSHostingController) + bannières + cycle de vie
+    DiffReviewView.swift      Corps : en-tête agent/fichier, unifié | côte à côte | édition, actions
+    DiffEditorView.swift      NSTextView monospace : amender le contenu avant de l'accepter
+  Diff/                       Moteur de diff PARTAGÉ (aucun lien avec git ni avec le pont IDE)
+    DiffModel.swift           DiffComputer / FileDiff / DiffLine (rognage préfixe/suffixe + LCS)
+    DiffLineRow.swift         Rendu d'une ligne (unifié) — revue des diffs + CommitDiffView
+    DiffHalfRow.swift         Demi-ligne (côte à côte) ; SideBySideDiff.swift apparie les lignes
+    DiffLayoutMode.swift      Enum unifié/côte à côte + DiffLayoutToggle (bascule façon WebStorm)
   FileTree/                   Arbre de fichiers GÉNÉRIQUE (aucune dépendance git), réutilisable
     FileTreeModel.swift       FileTreeItem/Node + FileTreeBuilder (build + compaction dossiers + flatten)
     FileTreeView.swift        Vue générique : slots onSelect/leading/trailing ; pliage détenu par
@@ -75,12 +104,7 @@ Tools/
     TerminalController.swift  Possède les LocalProcessTerminalView (PTY), spawn/kill, délégué SwiftTerm
     FavoritesStore.swift      Favoris (chemins absolus, UserDefaults)
     FolderItem.swift          Modèle dossier (name + url)
-    IDE/                      Pont IDE : aperçu des diffs Claude → docs/IDE_BRIDGE.md
-      IDEBridge.swift         Types (IDEDiffRequest/Verdict, IDEDiffHandlers) + logger IDELog
-      IDEServer.swift         Serveur MCP WebSocket + lock file ~/.claude/ide (1 par session)
-      IDEConnection.swift     Handshake WebSocket + framing RFC 6455 + JSON-RPC/MCP (openDiff)
-      DiffModel.swift         Diff ligne-à-ligne (rognage préfixe/suffixe + LCS + garde-fou)
-      DiffOverlayView.swift   Panneau SwiftUI : diff unifié + Accepter/Refuser
+                              (le pont IDE a quitté ce dossier → Core/IDEHost/)
   GitStuffs/                  Deuxième outil : explorer les repos git, rebase interactif + copie de travail
     GitStuffsView.swift       UI racine : sélection d'un worktree (favoris de projets) + fallback + onboarding
     Projects/                 ⭐ Favoris de PROJETS worktree-aware (unité = --git-common-dir, pas un dossier de repo)
@@ -152,8 +176,10 @@ sont automatiques. L'outil occupe tout le cadre sous le header et gère sa propr
   delegate SwiftTerm remarshalés). Détails → `docs/SESSIONS.md`.
 - **Changer d'outil ne perd jamais un terminal** : `RootView` pose `.id(tool.id)` sur la
   vue de l'outil → au switch, la vue ET ses `@StateObject` sont **détruits**. Tout état
-  process-backed vit donc dans des **singletons app-level** (`SessionStore.shared`,
-  `ScriptRunStore.shared` et leurs contrôleurs terminal), observés via `@ObservedObject`.
+  process-backed **ou connexion-backed** vit donc dans des **singletons app-level**
+  (`SessionStore.shared`, `ScriptRunStore.shared` et leurs contrôleurs terminal ;
+  `IDEHost.shared`, `DiffReviewCenter.shared`, `IDEContractGuard.shared` pour le pont
+  IDE), observés via `@ObservedObject`.
   Ne PAS revenir à des `@StateObject` pour ces stores (sinon terminaux orphelins :
   process vivants mais invisibles au retour sur l'outil).
 - **Login shell interactif pour le PATH** : on lance **`$SHELL -l -i`** (login + interactif
@@ -184,9 +210,11 @@ sont automatiques. L'outil occupe tout le cadre sous le header et gère sa propr
 - **Bannières natives gardées par `canUseUN`** (`Bundle.main.bundleURL.pathExtension == "app"`) :
   `UNUserNotificationCenter` crash sous `swift run` (pas de bundle). En dev, seules cloche +
   Dock marchent ; tester les bannières via l'app bundlée. Même logique que `applyDockIcon`.
-- **Persistance** : `@AppStorage("rootPath")` et `UserDefaults` clé `claudeLauncher.favorites`.
+- **Persistance** : `@AppStorage("rootPath")` et `UserDefaults` clés `claudeLauncher.favorites`,
+  `scriptRunner.packageDirs`, `ideHost.*` (périmètre de l'hôte IDE), `diffReview.layoutMode`.
   Stockage par domaine = bundle id → voir LIFECYCLE (dev et app bundlée = 2 stores). L'état
-  des sessions n'est **jamais** persisté (reflète les process vivants).
+  des sessions, des runs et des **demandes de revue** n'est **jamais** persisté (il reflète
+  des process et des connexions vivants).
 - **Icône / `Bundle.module`** : `applyDockIcon()` pose l'icône du Dock via `Bundle.module`
   **uniquement en dev** (`swift run`, exécutable nu). En app bundlée (`.app`) il fait
   **l'impasse** (`guard Bundle.main.bundleURL.pathExtension != "app"`) : l'accessor SwiftPM
@@ -194,15 +222,39 @@ sont automatiques. L'outil occupe tout le cadre sous le header et gère sa propr
   absent) et déclencherait un `fatalError` au démarrage. L'app bundlée tire son icône du
   `.icns` (Info.plist). ⚠️ Ne pas rappeler `Bundle.module` depuis un contexte bundlé, et
   garder le resource bundle dans `Contents/Resources/` (signable) dans `build-app.sh`.
-- **Pont IDE = aperçu des diffs, PAS l'écriture** (détails → `docs/IDE_BRIDGE.md`).
-  `TerminalController` ouvre un serveur MCP WebSocket par session et injecte
-  `CLAUDE_CODE_SSE_PORT` + `ENABLE_IDE_INTEGRATION` → `claude` route ses éditions via
-  l'outil `openDiff`. **Contrat non-officiel, vérifié empiriquement** (framing WebSocket
-  fait main via `Network.framework` — pas de dépendance ajoutée). Deux pièges à retenir :
-  (1) `openDiff` n'est qu'un **aperçu** ; en mode permission par défaut l'approbation
-  réelle est un **prompt de permission dans le terminal** → « Accepter » renvoie
-  `FILE_SAVED` **puis** répond « Yes » au prompt (`SessionStore.confirmEditInTerminal`).
-  (2) **Ne PAS lancer `claude` en `--permission-mode acceptEdits`** (Claude n'appelle
-  alors plus `openDiff` → plus d'aperçu). Le panneau **remplace** le terminal (pas un
-  overlay : au-dessus du `NSView` SwiftTerm, un overlay SwiftUI ne capte pas les clics).
-  L'app **n'écrit jamais** sur disque. `POTOF_SESSION_ID` reste la clé notifs, distincte.
+- **Pont IDE : le panneau de diff EST le prompt de permission** (détails →
+  `docs/IDE_BRIDGE.md`). L'app se fait passer pour un IDE Claude Code (serveur MCP
+  WebSocket, framing RFC 6455 fait main via `Network.framework` — pas de dépendance
+  ajoutée). **Contrat non-officiel, re-vérifié dans le binaire `claude 2.1.220`** ; il
+  a déjà dérivé une fois en silence. Les cinq points à ne pas casser :
+  1. **La réponse `FILE_SAVED` porte DEUX blocs** —
+     `[{text:"FILE_SAVED"}, {text:"<contenu final>"}]`. Le CLI teste
+     `typeof content[1].text === "string"` : à un seul bloc il part en `TypeError`,
+     l'édition n'est **jamais** appliquée, et personne ne le voit. Passer
+     exclusivement par `IDEProtocolContract.acceptedContent`. Le 2ᵉ bloc **devient
+     l'input réel** de l'outil `Edit`/`Write` → accepter en amendant est légitime ;
+     renvoyer un contenu identique au disque équivaut à un **refus**.
+  2. **Ne JAMAIS taper `Entrée` à l'aveugle dans un terminal.** Quand la réponse est
+     bien formée, `openDiff` rend un `allow`/`deny` et **aucun prompt n'apparaît**.
+     L'ancien `confirmEditInTerminal` (repli aveugle à 6 s) est supprimé : réintroduit,
+     il validerait n'importe quel prompt présent à cet instant. Il ne reste qu'une
+     surveillance **conditionnelle** qui lève le bandeau de dérive.
+  3. **L'app n'écrit JAMAIS sur disque** — elle ne produit qu'un verdict, c'est
+     `claude` qui applique. `IDEContractGuard` relit le fichier (≤ 3 s) après une
+     acceptation : c'est le seul signal qui ne suppose rien du protocole.
+  4. **Un lock global (`IDEHost`) sert tout `$HOME`** ; les sessions possédées gardent
+     leur `IDEServer` par session (port injecté = routage exact). Le matching côté
+     `claude` est **par préfixe de chemin**, et il ne s'auto-connecte que s'il trouve
+     **exactement un** IDE valide : un autre IDE actif sur le même arbre (WebStorm,
+     VS Code…) — ou une 2ᵉ instance de Potof lancée pour un test — **neutralise
+     l'auto-connexion des deux côtés**. Réglage de périmètre : menu « Hôte IDE ».
+  5. **La surface de validation est UNIQUE** : `DiffReviewCenter` (file d'attente
+     app-level, singleton) + la **fenêtre flottante** `DiffReviewWindow`. Plus d'aperçu
+     in situ à la place du terminal. Ne **jamais** supposer un seul `openDiff` en vol
+     ni un seul agent : les sous-agents `Task` en émettent en parallèle, l'appel est
+     **bloquant**, et une demande sans réponse fige un agent indéfiniment.
+
+  ⚠️ **Ne PAS lancer `claude` en `--permission-mode acceptEdits`** ni en
+  `--dangerously-skip-permissions` : sans demande de permission, plus aucun `openDiff`.
+  Le pont ne couvre de toute façon que `Edit`/`Write` (ni Bash, ni notebooks, ni outils
+  MCP). `POTOF_SESSION_ID` reste la clé notifs, distincte du pont.
