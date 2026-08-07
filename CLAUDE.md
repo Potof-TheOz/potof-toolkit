@@ -3,8 +3,10 @@
 App macOS native (SwiftUI + AppKit) servant de **toolkit d'outils de dev locaux**.
 **Local par défaut** : aucun compte, aucune télémétrie, aucune sortie réseau — à une
 exception **opt-in** près, la génération de message de commit de Git Stuffs, qui invoque
-`claude` (outil externe → réseau). Seule écoute : un socket **`127.0.0.1` uniquement**
-(pont IDE, cf. plus bas), protégé par un token. Trois outils à ce jour :
+`claude` (outil externe → réseau) et, depuis le Superset Scheduler, l'appel à la CLI `superset`
+(qui parle au host service en **loopback** et fait spawner des agents `claude` → réseau).
+Seule écoute : un socket **`127.0.0.1` uniquement**
+(pont IDE, cf. plus bas), protégé par un token. Quatre outils à ce jour :
 **Claude Launcher** — liste les sous-dossiers d'un dossier racine et lance `claude`
 dans un **terminal embarqué** (SwiftTerm) affiché **au centre de l'app** ; les
 sessions sont **possédées par l'app** (process enfant dans un PTY) : les fermer
@@ -13,7 +15,10 @@ du poste, **rebase interactivement** et **édite la copie de travail** (staging 
 hunk/ligne, commit, push/pull avec badge ahead/behind, résolution de conflits dans
 l'app). **Script Runner** — découvre les `package.json`
 et lance/arrête leurs scripts npm sur le même modèle de terminal possédé
-(voir `docs/SCRIPT_RUNNER.md`).
+(voir `docs/SCRIPT_RUNNER.md`). **Superset Scheduler** — écrit et entretient un **job launchd**
+par planification, qui rappelle le binaire de l'app en **mode headless**
+(`--run-schedule <uuid>`) pour lancer un agent Superset à heure fixe ; l'outil garantit le
+**lancement**, jamais le résultat (voir `docs/SCHEDULER.md`).
 Transversal aux outils : le **pont IDE** — l'app se fait passer pour un IDE Claude Code
 et **valide dans une fenêtre flottante** les modifications proposées par les agents
 `claude` du poste (Superset, terminaux, sessions embarquées) au lieu du prompt de
@@ -139,6 +144,25 @@ Tools/
     ScriptRunStore.swift      ⭐ Singleton : launch/stop/close/focus + machine à états de l'arrêt
     ScriptRunnerView.swift    UI : HSplitView(sidebar exécutions+projets | run ou détail au centre)
     PackageDetailView.swift   Détail d'un package : scripts + badge manager + ▶ (ou « voir le run »)
+  Scheduler/                  Quatrième outil : agents Superset à heure fixe → docs/SCHEDULER.md
+    Schedule.swift            ⭐ Modèles : Schedule + Action/Recurrence/Target (Codable À LA MAIN,
+                              discriminant "kind") + validate() + nommage gelé des workspaces neufs
+    ScheduleRun.swift         RunStatus (⭐ `launched`, pas `ok`) / RunLine / RunRecord.fold (PUR)
+    SchedulePaths.swift       ⭐ Tous les chemins + overrideRoot (probes sans effet de bord) +
+                              canInstallLaunchAgents + résolution du shim `superset`
+    SupersetCLI.swift         Shell-out CLI (gabarit Git.swift) + timeout + nettoyage d'env + JSON
+    AgentPresence.swift       « un agent claude vit-il dans ce worktree ? » (pgrep → lsof cwd)
+    LaunchAgentPlist.swift    Recurrence → StartCalendarInterval + génération du .plist (PUR)
+    SchedulerService.swift    bootout/enable/bootstrap + audit/repair + règle des DEUX conditions
+    ScheduleStore.swift       ⭐ Singleton : SEUL écrivain de schedules.json + tail du JSONL
+    RunLog.swift              JSONL append-only sous flock + compaction EN PLACE (jamais rename)
+    ScheduleRunner.swift      ⭐ Mode headless (`Foundation` SEUL) : la séquence et les garde-fous
+    ScheduleNotifier.swift    Bannière système du runner (UserNotifications, PAS osascript)
+    SchedulerSelfTest.swift   Dispatcher `--sched-selftest cli|plist|store|run` (figé)
+    ScheduleStoreProbe.swift / ScheduleRunnerProbe.swift   Auto-tests des lots correspondants
+    UI/SchedulerView.swift    HSplitView(liste | détail) + bandeaux audit/dev ; formulaire EN PLACE
+    UI/ScheduleRunHistoryView.swift  Historique alimenté par le tail (runs d'un autre process inclus)
+    UI/ScheduleFormView.swift / RecurrencePicker.swift / TargetPicker.swift   Formulaire et sélecteurs
 Resources/AppIcon.png         Icône 1024×1024 (→ Bundle.module en dev, → .icns en bundle)
 ```
 `Scripts/build-app.sh` : packaging en `.app` (voir LIFECYCLE). Détails du modèle de
@@ -212,6 +236,10 @@ sont automatiques. L'outil occupe tout le cadre sous le header et gère sa propr
   Dock marchent ; tester les bannières via l'app bundlée. Même logique que `applyDockIcon`.
 - **Persistance** : `@AppStorage("rootPath")` et `UserDefaults` clés `claudeLauncher.favorites`,
   `scriptRunner.packageDirs`, `ideHost.*` (périmètre de l'hôte IDE), `diffReview.layoutMode`.
+  ⚠️ **Exception : le Superset Scheduler persiste en FICHIERS, pas en `UserDefaults`** — c'est le
+  premier format d'**écriture** `Codable` de l'app (la lecture existait déjà :
+  `PreviousSessionsStore`, `NotificationChannel`). Raison : `UserDefaults` ne notifie pas de
+  façon fiable les écritures d'un **autre process**, or le mode headless en est un.
   Stockage par domaine = bundle id → voir LIFECYCLE (dev et app bundlée = 2 stores). L'état
   des sessions, des runs et des **demandes de revue** n'est **jamais** persisté (il reflète
   des process et des connexions vivants).
@@ -222,6 +250,44 @@ sont automatiques. L'outil occupe tout le cadre sous le header et gère sa propr
   absent) et déclencherait un `fatalError` au démarrage. L'app bundlée tire son icône du
   `.icns` (Info.plist). ⚠️ Ne pas rappeler `Bundle.module` depuis un contexte bundlé, et
   garder le resource bundle dans `Contents/Resources/` (signable) dans `build-app.sh`.
+- **Superset Scheduler : le mode headless est un AUTRE process, et c'est tout le sujet**
+  (détails → `docs/SCHEDULER.md`). launchd rappelle le binaire de l'app en
+  `--run-schedule <uuid>`, **avant `NSApplication`** (même emplacement que `--ide-selftest`
+  dans `main.swift`). Sept points à ne pas casser :
+  1. **`ScheduleRunner` n'importe que `Foundation`.** Garantie structurelle, pas convention :
+     avec ce seul import, `NSApp` devient une erreur de compilation. Et il ne réveille
+     **aucun** singleton — le plus vicieux étant `NotificationCenterCoordinator.shared`,
+     dont le `start()` fait `open(…, O_TRUNC)` sur `notifications.jsonl` et **effacerait le
+     canal de la GUI en cours d'exécution**. `IDEHost.shared` prendrait le lock `$HOME` et
+     tuerait l'auto-connexion des deux côtés. D'où le passage par le **statique**
+     `ScheduleStore.loadFromDisk()`, qui n'instancie rien.
+  2. **`schedules.json` a un seul écrivain : la GUI.** Le headless est lecteur seul, et
+     unique écrivain de sa portion du JSONL. Corollaire : **pas de `lastRunAt` dans
+     `Schedule`**, il est dérivé de `runs.jsonl`. Ne pas « améliorer » ça.
+  3. **`launched`, jamais `ok`.** Le runner sait seulement que `agents create` a rendu 0. Un
+     historique tout vert ne prouve que la mise à feu. Et `skipped` (garde-fou qui a joué)
+     reste distinct de `failed`.
+  4. **Compaction du JSONL EN PLACE** (`ftruncate`), **jamais par `rename`** : ça changerait
+     l'inode sous le nez d'un appender ayant déjà son `fd` ouvert.
+  5. **Écriture dans `~/Library/LaunchAgents` : les DEUX conditions**, nom
+     `com.potof.toolkit.schedule.<uuid>.plist` **ET** `ProgramArguments[0]` finissant par
+     `/potof-toolkit`. **Jamais de suppression par glob** — ce dossier exécute du code
+     arbitraire à l'ouverture de session.
+  6. **`StartCalendarInterval` : jamais `StartInterval`, `RunAtLoad = false`, pas de
+     `KeepAlive`, jamais de `Weekday` dans un mensuel** (`Day` + `Weekday` est un OU), et
+     **jamais de dictionnaire vide** (il vaut « toutes les minutes »). Cadences bornées aux
+     diviseurs de 24 et aux jours 1…28 (launchd ne clampe pas).
+  7. **Pas de `launchctl kickstart`, et `runNow` est le SEUL chemin de l'UI vers un run
+     réel.** Le kickstart a existé derrière un bouton « Tester le déclencheur » présenté
+     comme un diagnostic : il lançait un run complet (le plist fige son argv **sans**
+     `--dry-run`, donc launchd ne sait pas simuler) et a créé deux agents payants en trois
+     clics. Supprimé, pas renommé — même geste que `confirmEditInTerminal` côté pont IDE.
+     La simulation est en-process : `ScheduleRunner.executeReporting(…, dryRun: true)`,
+     bouton « Simuler » → onglet « Plan ».
+
+  ⚠️ `canInstallLaunchAgents` (= `pathExtension == "app"`, même garde que `canUseUN`)
+  **interdit d'installer depuis `swift run`** : le chemin `.build/debug/` est éphémère, un
+  plist pointant là serait mort au premier `swift package clean`, sans le moindre signal.
 - **Pont IDE : le panneau de diff EST le prompt de permission** (détails →
   `docs/IDE_BRIDGE.md`). L'app se fait passer pour un IDE Claude Code (serveur MCP
   WebSocket, framing RFC 6455 fait main via `Network.framework` — pas de dépendance
