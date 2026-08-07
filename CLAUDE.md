@@ -60,7 +60,10 @@ main.swift                    Entrée : NSApplication piloté à la main (pas de
 App/
   AppDelegate.swift           Fenêtre "Potof Toolkit", menus (dont « Hôte IDE »), icône du Dock,
                               démarrage/arrêt de l'hôte IDE + du canal de notifications
-  RootView.swift              Coquille : header = sélecteur d'outil (menu) + slot notif
+  RootView.swift              Coquille : DEUX états — home (aucun outil choisi, sans header)
+                              | header (sélecteur d'outil + slot notif) + outil
+  HomeView.swift              ⭐ Landing page du LANCEMENT : grille des cartes d'outils issue de
+                              ToolRegistry (+ ⌘1…⌘9). Aller-simple : on n'y revient jamais
 Core/
   Tool.swift                  Abstraction d'un outil (id, title, subtitle, icon, view)
   ToolRegistry.swift          ⭐ Registre central = POINT D'EXTENSION UNIQUE
@@ -181,8 +184,10 @@ d'arrêt des scripts npm → **`docs/SCRIPT_RUNNER.md`**.
        view: { MonOutilView() }
    )
    ```
-Rien d'autre à câbler : le **menu sélecteur d'outil** (dans le header) et le routage
-sont automatiques. L'outil occupe tout le cadre sous le header et gère sa propre chrome.
+Rien d'autre à câbler : la **carte sur la home** (avec son raccourci ⌘N), le **menu
+sélecteur d'outil** (dans le header) et le routage sont automatiques — tous les trois
+itèrent `ToolRegistry.all`, il n'y a **aucune liste d'outils à maintenir en double**.
+L'outil occupe tout le cadre sous le header et gère sa propre chrome.
 
 ## Invariants à NE PAS casser (et pourquoi)
 - **`NSHostingController`** (jamais `NSHostingView`) comme `contentViewController` de la fenêtre
@@ -191,6 +196,13 @@ sont automatiques. L'outil occupe tout le cadre sous le header et gère sa propr
   **menu dans une barre supérieure fixe** (le toggle auto de `NavigationSplitView` ne
   s'ancre pas dans une fenêtre hébergée manuellement et « saute »). Le split interne du
   Claude Launcher est un **`HSplitView`** (redimensionnable), c'est OK.
+- **La home est un ALLER-SIMPLE, visible au seul lancement** : `RootView` démarre avec
+  `selection == nil` → `HomeView` occupe toute la fenêtre, **sans header** (un sélecteur
+  d'outils au-dessus d'une grille d'outils ferait doublon). **Aucun chemin ne remet
+  `selection` à `nil`** : pas de bouton « accueil », pas d'entrée de menu. En ajouter un
+  ne romprait pas que la promesse produit — `.id(tool.id)` **détruirait l'outil quitté**
+  (et ses `@StateObject`), donc tout état non porté par un singleton app-level. La grille
+  se remplit seule depuis `ToolRegistry`.
 - **Focus fenêtre** : `NSApp.setActivationPolicy(.regular)` + `NSApp.activate(ignoringOtherApps: true)`
   sont requis pour que la fenêtre s'affiche et prenne le focus via `swift run`.
 - **Sessions = terminaux SwiftTerm possédés** : `TerminalController` possède un
