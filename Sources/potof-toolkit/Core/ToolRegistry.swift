@@ -26,6 +26,13 @@ enum ToolRegistry {
             subtitle: "Lancer les scripts npm de vos projets",
             icon: "play.rectangle.fill",
             view: { ScriptRunnerView() }
+        ),
+        Tool(
+            id: SchedulerView.toolID,
+            title: "Superset Scheduler",
+            subtitle: "Lancer des agents à heure fixe",
+            icon: "calendar.badge.clock",
+            view: { SchedulerView() }
         )
     ]
 }

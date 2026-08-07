@@ -14,6 +14,23 @@ if let idx = CommandLine.arguments.firstIndex(of: "--ide-selftest") {
     IDESelfTest.run(arguments: CommandLine.arguments, flagIndex: idx)   // -> Never
 }
 
+// Superset Scheduler — mode headless exécuté par launchd (un `.plist` par planification).
+// Vit ici, avant `NSApplication`, exactement pour la même raison que le mode ci-dessus :
+// aucune UI, aucun singleton de l'app, donc aucun risque de marcher sur l'instance GUI en
+// cours (le plus vicieux serait `NotificationChannel`, qui tronque `notifications.jsonl`).
+// Le prompt de l'utilisateur ne transite JAMAIS par ici : `ProgramArguments` ne porte que
+// `["<binaire>", "--run-schedule", "<uuid>"]`, donc aucun texte utilisateur n'atterrit
+// dans `~/Library/LaunchAgents`.
+//
+//   potof-toolkit --run-schedule <uuid> [--dry-run]
+//   potof-toolkit --sched-selftest cli | plist | store | run
+if let idx = CommandLine.arguments.firstIndex(of: "--run-schedule") {
+    ScheduleRunner.run(arguments: CommandLine.arguments, flagIndex: idx)      // -> Never
+}
+if let idx = CommandLine.arguments.firstIndex(of: "--sched-selftest") {
+    SchedulerSelfTest.run(arguments: CommandLine.arguments, flagIndex: idx)   // -> Never
+}
+
 // Point d'entrée : NSApplication piloté manuellement (voir AppDelegate).
 // Fichier nommé "main.swift" → pas de @main, ce qui est voulu.
 // Approche la plus fiable pour afficher et focaliser la fenêtre via `swift run`.

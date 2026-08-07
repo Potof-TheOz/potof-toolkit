@@ -25,6 +25,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Potof fantôme ferait deux IDE « valides » → plus d'auto-connexion du tout).
         IDEHost.shared.start()
 
+        // Superset Scheduler : diagnostic d'arrière-plan, jamais bloquant.
+        // - `auditOnLaunch` détecte les plists qui pointent vers un autre emplacement du
+        //   binaire (app déplacée ⇒ launchd tire un binaire absent et échoue EN SILENCE).
+        // - `compactIfNeeded` borne `runs.jsonl`. Ici et **uniquement ici** : compacter
+        //   depuis le mode headless serait une écriture concurrente sur un fichier qu'un
+        //   autre process est peut-être en train d'appender.
+        SchedulerService.shared.auditOnLaunch()
+        RunLog.compactIfNeeded()
+
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1040, height: 680),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
