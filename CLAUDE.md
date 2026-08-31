@@ -64,6 +64,8 @@ App/
                               | header (sélecteur d'outil + slot notif) + outil
   HomeView.swift              ⭐ Landing page du LANCEMENT : grille des cartes d'outils issue de
                               ToolRegistry (+ ⌘1…⌘9). Aller-simple : on n'y revient jamais
+  CLIHelp.swift               `--help`/`-h` en 1ʳᵉ position + texte d'usage. PUR (pas d'AppKit) pour
+                              être testable sans démarrer le binaire → docs/SCHEDULER.md, « Débogage »
 Core/
   Tool.swift                  Abstraction d'un outil (id, title, subtitle, icon, view)
   ToolRegistry.swift          ⭐ Registre central = POINT D'EXTENSION UNIQUE
