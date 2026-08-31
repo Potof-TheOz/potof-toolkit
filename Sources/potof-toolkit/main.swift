@@ -1,5 +1,24 @@
 import AppKit
 
+// `--help` / `-h` en PREMIÈRE POSITION : imprime l'aide et sort. **Cette garde n'est pas
+// cosmétique.** Sans elle, tout argument inconnu tombe jusqu'au `NSApplication.shared` en bas de
+// ce fichier et démarre une **SECONDE INSTANCE COMPLÈTE** de l'app — mesuré le 2026-08-11 avec
+// `--help`, le process est resté vivant jusqu'à être tué. Or une 2ᵉ instance pose un second lock
+// `~/.claude/ide/<port>.lock` (⇒ « deux IDE valides » ⇒ auto-connexion neutralisée des deux côtés)
+// et tronque `notifications.jsonl` de l'instance vivante. Un `--help` ne doit jamais coûter ça.
+//
+// La décision vit dans `CLIHelp` (pur, sans AppKit) pour être vérifiable SANS démarrer le binaire
+// — démarrer le binaire est justement l'acte interdit si la garde échoue. Elle est **ancrée sur le
+// premier argument** : un `contains("-h")` sur tout l'argv détournait `--sched-selftest -h` et
+// `--ide-selftest -h`, qui sortaient en 0 sans exécuter la moindre probe.
+//
+// Elle ne rejette PAS les argv inconnus (cf. `CLIHelp.isRequested`) : macOS en passe lui-même sur
+// certains chemins de lancement, un `exit 64` global casserait le démarrage de l'app.
+if CLIHelp.isRequested(CommandLine.arguments) {
+    print(CLIHelp.usage)
+    exit(0)
+}
+
 // Mode diagnostic (hors GUI) : rejoue le contrat protocolaire `claude` ↔ IDE contre le
 // binaire `claude` réellement installé. Il vit **avant** `NSApplication` et ne revient
 // jamais : ni l'UI, ni l'hôte IDE global de l'app (`IDEHost.shared`, démarré par
