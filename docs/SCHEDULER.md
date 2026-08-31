@@ -50,25 +50,119 @@ Le prompt ne traverse **jamais** de shell ni de plist : `ProgramArguments` ne po
 
 ## Ce que le Superset Scheduler ne fait pas
 
-C'est la partie la plus utile de cette doc, parce que le poste porte quatre automations
-`com.potof.*` et que **l'outil n'en remplace qu'une, partiellement** :
+C'est la partie la plus utile de cette doc : elle délimite ce que l'outil ne prend **pas**
+en charge. Elle a été écrite quand le poste portait **quatre** automations `com.potof.*`
+et que l'outil n'en remplaçait qu'une, partiellement. Depuis le **2026-08-11** il n'en
+reste que **deux** — les deux du coffre de connaissances — et ce sont précisément celles
+qu'il ne faut **pas** faire passer par ici :
 
-| Automation | Forme | Reprise ? |
+| Automation restante | Forme | Pourquoi elle reste en bash |
 |---|---|---|
-| `superset-daily-sentry.sh` | `superset agents create` | **le lancement seulement** |
-| `knowledge-garden.sh` | un agent `claude -p` **par note échue**, chien de garde TERM/KILL | non |
-| `sentry-daily-collect.sh` | vérifie le livrable, promeut un point de reprise | non |
-| `knowledge-sync.sh` | git pur (commit par pathspec), aucun agent | non |
+| `knowledge-garden.sh` | un agent `claude -p` **par note échue**, chien de garde TERM/KILL | boucle, budget et timeouts sont **dans** le script — le Scheduler ne lance qu'un agent, une fois |
+| `knowledge-sync.sh` | git pur (commit par pathspec), aucun agent | il n'y a aucun agent à lancer, donc rien à planifier côté Superset |
 
-Trois de ces quatre portent leurs garde-fous **dans** le script. Les planifier reviendrait
-à faire ce que launchd fait déjà. L'outil sert à créer la **prochaine** automation sans
-réécrire 500 lignes de bash, pas à absorber celles qui existent.
+Les deux portent leurs garde-fous dans le script et n'ont besoin ni de workspace, ni de
+worktree, ni de la CLI `superset`. Les planifier reviendrait à refaire ce que launchd fait
+déjà pour elles, en perdant leur logique propre. L'outil sert à créer la **prochaine**
+automation sans réécrire 500 lignes de bash, pas à absorber celles qui existent.
 
-**Le prompt est une chaîne littérale** : aucune substitution de jeton au lancement. Une
-veille qui a besoin d'une fenêtre temporelle doit la faire calculer **par l'agent**
-(« depuis le rapport le plus récent de tel dossier, celui du jour exclu ; à défaut les
-24 dernières heures ; jamais au-delà de 30 jours »). C'est un choix assumé : le
-planificateur ne connaît aucun métier.
+### La paire Sentry : le lancement est repris, la vérification du livrable est PERDUE
+
+Le pipeline bash Sentry — `superset-daily-sentry.sh` (le lancement),
+`sentry-daily-collect.sh` (vérification du livrable et promotion d'un point de reprise) et
+`sentry-report-promote.sh` — **n'existe plus.** Il a été supprimé du dépôt
+`potof-claude-skills` le 2026-08-11 (commit `2d21368`) avec ses deux LaunchAgents
+`com.potof.sentry-*`, `ARCHITECTURE_SENTRY.md` et les symlinks correspondants de
+`~/Scripts/`. Les deux labels sont `disabled` (`launchctl print-disabled gui/$UID`) et ne
+sont plus chargés.
+
+Il ne subsiste de ce pipeline que `scripts/sentry-report.settings.json`, parce que son
+chemin `~/Scripts/sentry-report.settings.json` est **codé en dur dans les `args`** de
+l'agent Superset `dc0a5495-…` (`--settings <chemin>`) qu'utilisent les deux planifications
+Sentry. Le déplacer sans corriger la config d'agent casserait les deux.
+
+Donc le Scheduler ne remplace pas « une automation partiellement » : il a repris à son
+compte **le lancement** des deux veilles Sentry. Mais le collecteur faisait **deux** choses,
+et il faut les séparer — les confondre a été une erreur de cette section :
+
+| Rôle du collecteur | Statut aujourd'hui |
+|---|---|
+| Calculer et promouvoir le **point de reprise** | **Sans objet** — émigré dans le livrable, voir ci-dessous |
+| Vérifier qu'un run a **effectivement produit** son rapport | ⚠️ **Supprimé sans remplaçant** |
+
+Le second rôle n'a **rien** qui le tienne. `RunStatus` ne va jamais plus loin que
+`launched` (la mise à feu, pas le résultat) et `SchedulerService.audit()` ne regarde que le
+nom, le chemin et l'orphelinat des `.plist` — **jamais la fraîcheur d'un run ni la présence
+d'un livrable**. C'est cohérent avec la promesse de l'outil affichée en tête de cette doc
+(« la vérification du livrable est du métier, elle reste hors de cet outil »), mais ça veut
+dire qu'un gel ne se signale pas tout seul.
+
+📎 **« Le script de référence »**, cité quatre fois plus bas dans cette doc (déroulé d'un
+run, matching de workspace, regex `pgrep`), désigne ce `superset-daily-sentry.sh` — ses
+541 lignes ne sont **plus sur le disque**. Les leçons qu'on lui a prises restent vraies et
+restent décrites ici ; pour relire l'original :
+`git -C ~/WebstormProjects/potof-claude-skills show 2d21368^:scripts/superset-daily-sentry.sh`.
+
+> ⚠️ **Résidu à connaître** : les deux `.plist` `com.potof.sentry-daily` et
+> `com.potof.sentry-collect` sont **toujours** dans `~/Library/LaunchAgents`, désactivés,
+> pointant vers des scripts qui n'existent plus. Le Scheduler ne les touchera **jamais** :
+> sa règle des deux conditions (nom `com.potof.toolkit.schedule.<uuid>.plist` **ET**
+> `ProgramArguments[0]` finissant par `/potof-toolkit`) le lui interdit, et c'est voulu —
+> voir « Écrire dans `~/Library/LaunchAgents` ». Leur suppression est un geste manuel.
+
+### Le prompt est une chaîne littérale — et c'est ce qui a absorbé le point de reprise
+
+**Aucune substitution de jeton au lancement.** Une veille qui a besoin d'une fenêtre
+temporelle doit la faire calculer **par l'agent** (« depuis le rapport le plus récent de
+tel dossier, celui du jour exclu ; à défaut les 24 dernières heures ; jamais au-delà de
+30 jours »). C'est un choix assumé : le planificateur ne connaît aucun métier.
+
+Ce n'est pas qu'une contrainte, c'est le mécanisme qui a rendu le promoteur inutile :
+**le point de reprise a émigré dans le livrable lui-même.** Le prompt des planifications
+Sentry impose les trois premières lignes du rapport :
+
+```
+STATUS: OK                                   ← ou « STATUS: ECHEC — <raison> »
+FENÊTRE-SUIVANTE: <date du jour>T00:00:00Z
+FENÊTRE-ANALYSÉE: <since> → aujourd'hui
+```
+
+et il le dit sans détour : « elles **SONT** le point de reprise du prochain run, il n'y en
+a pas d'autre ». Le run suivant relit le rapport le plus récent dont la ligne 1 vaut
+`STATUS: OK`, et repart de sa `FENÊTRE-SUIVANTE`. Deux propriétés en découlent :
+
+- Un `STATUS: ECHEC` s'écrit **sans** ligne `FENÊTRE-SUIVANTE` — donc la fenêtre non
+  couverte est reprise au run d'après, au lieu d'être perdue en silence. C'est exactement
+  le rôle que tenait le promoteur, rendu par une consigne de rédaction.
+- L'horodatage est **minuit UTC du jour**, jamais l'heure de fin d'analyse : le run suivant
+  re-couvre le temps passé à analyser plutôt que de le sauter.
+
+Plus de fichier d'état, plus de promoteur : l'agent lit sa propre production. Contrôle
+indépendant que **ce mécanisme-là** fonctionne — la chaîne de `~/sentry-reports/` est
+continue **du 6 au 11 août 2026**, week-end enjambé (le rapport du lundi 10 repart bien du
+vendredi 7 à `00:00:00Z`), sans un trou et sans collecteur.
+
+> ⚠️ **Ce contrôle ne prouve QUE le calcul de fenêtre — pas que la veille tourne.** Mesuré
+> le **2026-08-31** : les trois jobs sont chargés et `enabled`, et pourtant `~/sentry-reports/`
+> s'arrête au **11 août** et `runs.jsonl` n'a plus **une seule ligne** après
+> `2026-08-11T08:00:23Z`. Environ **13 occurrences ouvrées perdues**, sans un signal.
+>
+> La cause n'est pas un bug : le Mac est resté **éteint** (boot du 2026-08-31 08:59), donc le
+> domaine `gui/<uid>` n'existait pas et `StartCalendarInterval` ne rattrape rien — exactement
+> ce que décrit « Sommeil, extinction, rattrapage ». Le problème est qu'**absolument rien ne
+> le dit** : pas de ligne `skipped`, pas de bannière, pas de bandeau d'audit. Le trou ne se
+> voit qu'en regardant la date du dernier fichier de `~/sentry-reports/`.
+>
+> Et il se refermera **en silence** : le prochain run repartira du dernier
+> `FENÊTRE-SUIVANTE` connu et re-couvrira les 20 jours (la borne de 30 jours du prompt n'a
+> pas mordu), en le disant dans le rapport — mais personne n'aura été averti que la veille
+> était morte pendant trois semaines. Le profil de permissions de l'agent le note dans les
+> mêmes termes : « depuis le retrait du collecteur RIEN ne détecte plus ce gel […] ce qui
+> rattrape le trou sans le signaler ».
+>
+> **Chantier ouvert** : un contrôle de fraîcheur (« aucun run `launched` depuis N jours
+> ouvrés alors que la planification est active ») est la seule pièce du collecteur qui
+> mériterait d'être reprise côté outil. Elle n'existe pas.
 
 ## Les fichiers
 
@@ -385,10 +479,20 @@ un `O_TRUNC` — une notif écrite app fermée serait effacée à l'ouverture su
 
 C'était la première implémentation, calquée sur les scripts bash du poste. **Mesuré : elle
 ne délivre rien.** Quatre runs launchd conclus en `skipped` ont appelé `/usr/bin/osascript`
-avec un **code de sortie 0**, sans qu'aucune bannière n'apparaisse — et « Script Editor »
-ne figure même pas dans les réglages de notification du poste. Un `display notification`
-émis par le binaire `osascript` n'a pas d'identité d'app enregistrée, et macOS le jette en
-silence. L'`exit 0` ne prouvait donc rien, ce qui rendait la panne indétectable.
+avec un **code de sortie 0**, sans qu'aucune bannière n'apparaisse. Un `display
+notification` émis par le binaire `osascript` n'a pas d'identité d'app enregistrée, et
+macOS le jette en silence. L'`exit 0` ne prouvait donc rien, ce qui rendait la panne
+indétectable.
+
+⚠️ **Un argument d'appui de cette section était faux, ne pas le reprendre.** Il était écrit
+ici que « Script Editor ne figure même pas dans les réglages de notification du poste ».
+Mesuré le 2026-08-11 : `com.apple.ScriptEditor2` **est** bien présent dans
+`~/Library/Preferences/com.apple.ncprefs.plist`
+(`plutil -convert xml1 -o - ~/Library/Preferences/com.apple.ncprefs.plist`), avec son
+chemin `/System/Applications/Utilities/Script Editor.app` et une exigence de source
+`com.apple.osascript`. La conclusion tient — elle est même **plus dure** : figurer dans les
+réglages ne suffit pas, la bannière tombe quand même. C'est l'identité de l'**appelant**
+qui manque, pas une entrée de préférences.
 
 L'identité correcte était disponible depuis le début : l'app **est** enregistrée
 (`com.potof.potof-toolkit`) puisqu'elle pose déjà des bannières pour les sessions Claude.
@@ -399,6 +503,32 @@ ni AppKit ni SwiftUI, l'importer là ne met pas en péril la garantie structurel
 
 ⚠️ La garde `canPost` (= `pathExtension == "app"`, même garde que `canUseUN`) est
 obligatoire : `UNUserNotificationCenter` **plante** sur un binaire nu, donc en `swift run`.
+
+### Mais « osascript est muet » ≠ « bash ne peut pas notifier »
+
+À ne pas re-conclure à l'envers, parce que le raccourci coûte un aller-retour : il existe un
+canal qui fonctionne côté script. Cinq variantes mesurées le 2026-08-11, **présence à
+l'écran confirmée** :
+
+| Variante | Code retour | Bannière |
+|---|---|---|
+| `osascript` nu | 0 | non |
+| via `System Events` | 0 | non |
+| via `Script Editor` | 0 | non |
+| via `Finder` | **1** (`-1743`) | non |
+| **`terminal-notifier`** | 0 | **OUI** |
+
+`terminal-notifier` (`fr.julienxx.oss.terminal-notifier`, v2.0.0, `/opt/homebrew/bin`)
+délivre parce qu'il porte **sa propre identité d'app** — il embarque son `.app`, déjà
+autorisé dans les réglages de notification. `knowledge-garden.sh` et `knowledge-sync.sh`
+l'utilisent depuis le commit `284aab6` de `potof-claude-skills`, avec repli sur `osascript`
+qui **ne prétend plus avoir abouti** (il journalise que la livraison est invérifiable).
+
+En une ligne, la règle des deux mondes : **côté bash `terminal-notifier`, côté app
+`UNUserNotificationCenter`, et dans les deux cas le code de retour d'`osascript` n'est
+JAMAIS une preuve d'affichage.** L'app n'expose ni drapeau `--notify` ni scheme URL : il n'y
+a donc rien à router d'un script vers `ScheduleNotifier`, et en ajouter un serait la réponse
+propre le jour où `terminal-notifier` disparaîtrait du poste.
 
 ## Le mode headless et sa liste noire
 
@@ -452,6 +582,43 @@ manuelle.
 potof-toolkit --run-schedule <uuid> --dry-run    # plan complet, AUCUN effet de bord
 potof-toolkit --sched-selftest cli | plist | store | run
 ```
+
+Le binaire n'est **pas sur le `PATH`** : ces commandes s'appellent par chemin explicite,
+`~/Applications/Potof\ Toolkit.app/Contents/MacOS/potof-toolkit` (ou `.build/debug/` en dev
+— où l'installation de LaunchAgents est refusée, voir « Refus d'installer hors `.app` »).
+
+> ⚠️ **Un argument inconnu démarrait une SECONDE INSTANCE de l'app.** Mesuré le 2026-08-11 :
+> `potof-toolkit --help` n'imprimait aucune aide — l'argument traversait les trois gardes de
+> `main.swift` (`--ide-selftest`, `--run-schedule`, `--sched-selftest`) et tombait sur
+> `NSApplication.shared` + `app.run()`, montant une instance GUI complète restée vivante
+> jusqu'à être tuée. C'est une collision frontale avec l'interdit du dépôt (une 2ᵉ instance
+> pose un second lock `~/.claude/ide/<port>.lock` ⇒ « deux IDE valides » ⇒ **auto-connexion
+> neutralisée des deux côtés**, et `NotificationChannel.start()` tronque le
+> `notifications.jsonl` de l'instance vivante).
+>
+> **Corrigé** : la décision vit dans `App/CLIHelp.swift` — `isRequested(_:)`, **pur**, sans
+> AppKit — et `main.swift` l'appelle en tête. Le fichier est séparé exprès : le dispatch
+> d'argv de `main.swift` est en instructions top-level, donc inatteignable depuis une probe,
+> et démarrer le binaire pour tester la garde est justement l'acte interdit. Isolée, elle se
+> compile et s'exerce seule (`swiftc App/CLIHelp.swift <harnais>` — 16 cas d'argv, dont les
+> chemins où **macOS** passe ses propres arguments : `-psn_0_…`, `-NSDocumentRevisionsDebugMode`,
+> `-AppleLanguages`, tous correctement laissés au lancement normal).
+>
+> ⚠️ **L'ancrage sur le PREMIER argument n'est pas cosmétique.** La première version testait
+> `CommandLine.arguments.contains("-h")` sur tout l'argv, et comme la garde passe avant les
+> trois autres modes, `--sched-selftest -h` et `--ide-selftest -h` **imprimaient l'aide et
+> sortaient en 0 sans exécuter la moindre probe** : un faux vert sur les seuls diagnostics du
+> dépôt, qui n'a pas de test target. Ne pas « simplifier » en un `contains`.
+>
+> Le correctif ne prendra effet **qu'au prochain build/déploiement** : le bundle installé
+> garde son ancien binaire.
+>
+> **Reste ouvert, et ce n'est PAS un simple `exit 64`.** Les autres arguments inconnus
+> (`--verson`, une faute de frappe) tombent toujours dans la GUI. Mais rejeter *tout* argv
+> non reconnu **casserait le démarrage** : macOS en passe lui-même sur certains chemins de
+> lancement (LaunchServices `-psn_0_…`, Xcode `-NSDocumentRevisionsDebugMode YES`,
+> `-AppleLanguages (…)`). Un rejet correct doit donc porter une **liste blanche des
+> arguments système** — c'est cette liste, pas le `exit 64`, qui est le vrai travail.
 
 Le `--dry-run` imprime : santé du host service, workspace résolu (ou « serait créé »),
 worktree, verdict de chaque garde-fou, argv exact de `superset agents create` (un argument
