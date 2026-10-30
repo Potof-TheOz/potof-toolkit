@@ -78,9 +78,11 @@ enum ScheduleResume {
 /// (`send(source:data:)` ne transmet alors rien, la saisie est jetée) et la souris n'est
 /// pas rapportée.
 ///
-/// Grille **forcée à 120×40**, celle du PTY du runner : un autre format ferait réarranger
-/// à l'émulateur un rendu pensé pour 120 colonnes, et le TUI de `claude` en sortirait
-/// illisible. Si le panneau est plus petit, c'est le conteneur qui défile.
+/// **Toujours 120 colonnes**, celles du PTY du runner : un autre nombre ferait réarranger à
+/// l'émulateur un rendu pensé pour 120 colonnes, et le TUI de `claude` en sortirait
+/// illisible. Pour occuper toute la largeur du panneau, on joue sur la **police**, et la
+/// hauteur du panneau donne le **nombre de lignes** (en changer ne re-découpe rien : les
+/// lignes en trop passent dans l'historique). Voir `fit(to:)`.
 ///
 /// Suivi : `DispatchSource` vnode (`.write|.extend`) sur le fichier. Un run **terminé** est
 /// relu sans rien surveiller. Dans les deux cas la lecture se fait **par tranches**, avec
@@ -88,9 +90,8 @@ enum ScheduleResume {
 /// session de plusieurs dizaines de Mo est rejouée.
 final class TTYReplay: ObservableObject {
 
-    let terminalView: TerminalView
-    /// Cadre qui contient exactement 120×40 cellules (scroller compris).
-    let contentSize: NSSize
+    /// Remplacé, et le fichier rejoué depuis le début, quand la police change.
+    @Published private(set) var terminalView: TerminalView
     /// Le run est fini et n'a jamais écrit de `.tty` (échec avant le préscript et `claude`).
     @Published private(set) var noSession = false
 
@@ -102,17 +103,44 @@ final class TTYReplay: ObservableObject {
     private var draining = false
     private var stopped = false
 
+    /// Le rejeu n'est lancé qu'au premier `fit(to:)` : la police dépend de la largeur du
+    /// panneau, et rejouer d'abord à la taille par défaut ferait tout relire deux fois.
+    private var started = false
+    private var fontSize: CGFloat
+    private var panelSize: NSSize = .zero
+    private var pendingRebuild: DispatchWorkItem?
+
     /// Taille d'une tranche donnée à l'émulateur avant de rendre la main au runloop.
     private static let sliceSize = 256 * 1024
     /// Pause entre deux tranches : un `async` nu pourrait être servi à la suite, sans que
     /// le runloop traite la saisie ni le dessin ; une échéance le force.
     private static let sliceGap: TimeInterval = 0.002
+    static let fontSizeRange: ClosedRange<CGFloat> = 8...28
+    /// Pendant un redimensionnement à la souris, on ne reconstruit qu'une fois la taille posée.
+    private static let rebuildDelay: TimeInterval = 0.2
+    /// Police par défaut de SwiftTerm (son `FontSet` est interne) : on n'en change que la taille.
+    private static let defaultFont = TerminalView(frame: .zero).font
 
     init(url: URL, follow: Bool) {
         self.url = url
         self.following = follow
+        let view = Self.makeView(fontSize: nil)
+        fontSize = view.font.pointSize
+        terminalView = view
+        if follow { watch() } else { noSession = !FileManager.default.fileExists(atPath: url.path) }
+    }
 
-        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+    deinit { stop() }
+
+    /// Un terminal neuf de 120×40 à la police demandée (`nil` = police par défaut de
+    /// SwiftTerm). Jamais de changement de police sur un terminal déjà rempli : SwiftTerm
+    /// recalculerait les colonnes et re-découperait le contenu.
+    private static func makeView(fontSize: CGFloat?) -> TerminalView {
+        let font = fontSize.map { size in
+            NSFont(descriptor: defaultFont.fontDescriptor, size: size)
+                ?? .monospacedSystemFont(ofSize: size, weight: .regular)
+        }
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 800, height: 600), font: font)
         view.allowMouseReporting = false
         view.terminalDelegate = nil
         view.getTerminal().resize(cols: Int(PTYProcess.columns), rows: Int(PTYProcess.rows))
@@ -120,21 +148,72 @@ final class TTYReplay: ObservableObject {
         // exacte de `getOptimalFrameSize()`, un arrondi flottant peut donner 119 colonnes.
         // Une demi-cellule de marge ne coûte rien et ferme la porte.
         let optimal = view.getOptimalFrameSize()
-        contentSize = NSSize(width: optimal.width + 0.5, height: optimal.height + 0.5)
-        view.frame = NSRect(origin: .zero, size: contentSize)
-        terminalView = view
-
-        pump()
-        if follow { watch() } else { noSession = !FileManager.default.fileExists(atPath: url.path) }
+        view.frame = NSRect(x: 0, y: 0, width: optimal.width + 0.5, height: optimal.height + 0.5)
+        return view
     }
 
-    deinit { stop() }
+    /// Appelée par le conteneur à chaque changement de taille du panneau. La hauteur
+    /// s'applique tout de suite (nombre de lignes) ; la largeur choisit la police, et un
+    /// changement de police reconstruit le terminal, après `rebuildDelay`.
+    func fit(to size: NSSize) {
+        guard size.width > 0, size.height > 0, !stopped else { return }
+        panelSize = size
+        let target = targetFontSize(forWidth: size.width)
+        if !started {
+            started = true
+            // Hors de la passe de mise en page en cours : `rebuild` publie `terminalView`.
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if target != self.fontSize { self.rebuild(fontSize: target) } else { self.applyHeight(); self.pump() }
+            }
+            return
+        }
+        applyHeight()
+        pendingRebuild?.cancel()
+        guard target != fontSize else { return }
+        let work = DispatchWorkItem { [weak self] in self?.rebuild(fontSize: target) }
+        pendingRebuild = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.rebuildDelay, execute: work)
+    }
+
+    /// Police qui fait tenir 120 colonnes dans `width`, par pas d'un demi-point.
+    private func targetFontSize(forWidth width: CGFloat) -> CGFloat {
+        let raw = fontSize * width / terminalView.frame.width
+        let stepped = (raw * 2).rounded(.down) / 2
+        return min(max(stepped, Self.fontSizeRange.lowerBound), Self.fontSizeRange.upperBound)
+    }
+
+    /// Les colonnes restent celles du cadre actuel (120) ; seule la hauteur, donc le nombre
+    /// de lignes, suit le panneau.
+    private func applyHeight() {
+        let size = NSSize(width: terminalView.frame.width, height: panelSize.height)
+        if terminalView.frame.size != size { terminalView.frame = NSRect(origin: .zero, size: size) }
+    }
+
+    /// Terminal neuf à la nouvelle police, rejoué depuis le début du fichier. Une relecture
+    /// déjà en cours continue sur le nouveau terminal, depuis le nouvel `offset`.
+    private func rebuild(fontSize target: CGFloat) {
+        guard !stopped else { return }
+        var size = target
+        var view = Self.makeView(fontSize: size)
+        // La règle de trois ignore la barre de défilement, de largeur fixe : on redescend
+        // d'un cran tant que les 120 colonnes débordent.
+        while view.frame.width > panelSize.width, size > Self.fontSizeRange.lowerBound {
+            size -= 0.5
+            view = Self.makeView(fontSize: size)
+        }
+        fontSize = size
+        terminalView = view
+        applyHeight()
+        offset = 0
+        if !draining { pump() }
+    }
 
     /// Relit la suite du fichier et la donne à l'émulateur, une tranche à la fois.
     /// Thread principal. Sans effet si une relecture est déjà en cours : elle ira
     /// jusqu'à la fin du fichier, donc jusqu'aux octets que ce nouvel appel annonçait.
     func pump() {
-        guard !draining, !stopped else { return }
+        guard started, !draining, !stopped else { return }
         feedNextSlice()
     }
 
@@ -194,50 +273,48 @@ final class TTYReplay: ObservableObject {
     }
 }
 
-/// Conteneur qui **réduit** la grille 120×40 pour qu'elle tienne dans le panneau, au lieu de
-/// la faire défiler : le seul défilement reste celui du terminal (son historique). Une
-/// `ScrollView` autour donnait deux barres verticales dès que le panneau était moins haut
-/// que 40 lignes (vu en recette).
-///
-/// On met à l'échelle par les `bounds` et jamais par la police ni le cadre du terminal :
-/// changer l'une ou l'autre recalcule colonnes et lignes, et SwiftTerm re-découpe alors
-/// le contenu déjà rejoué. Jamais d'agrandissement (échelle ≤ 1) : un calque agrandi est flou.
-private final class FittingContainer: NSView {
+/// Conteneur du terminal de rejeu : il remplit le panneau et lui transmet sa taille
+/// (`TTYReplay.fit(to:)`), qui choisit la police et le nombre de lignes. Pas de
+/// `ScrollView` autour : elle donnait une 2ᵉ barre verticale à côté de celle de l'historique
+/// du terminal (vu en recette). Pas de mise à l'échelle non plus : SwiftTerm dessine sur un
+/// calque (`wantsLayer`), qu'un agrandissement rendrait flou.
+private final class ReplayContainer: NSView {
 
-    private let contentSize: NSSize
+    private let replay: TTYReplay
 
-    init(content: NSView, contentSize: NSSize) {
-        self.contentSize = contentSize
-        super.init(frame: NSRect(origin: .zero, size: contentSize))
-        attach(content)
+    init(replay: TTYReplay) {
+        self.replay = replay
+        super.init(frame: .zero)
+        attach(replay.terminalView)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) non pris en charge") }
 
     override var isFlipped: Bool { true }
 
-    func attach(_ content: NSView) {
-        if content.superview !== self { addSubview(content) }
-        content.frame = NSRect(origin: .zero, size: contentSize)
+    /// Place le terminal courant en haut à gauche, à la place de l'ancien s'il a été reconstruit.
+    func attach(_ terminal: NSView) {
+        guard terminal.superview !== self else { return }
+        subviews.forEach { $0.removeFromSuperview() }
+        addSubview(terminal)
+        terminal.setFrameOrigin(.zero)
     }
 
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
-        guard newSize.width > 0, newSize.height > 0 else { return }
-        let scale = min(1, newSize.width / contentSize.width, newSize.height / contentSize.height)
-        setBoundsSize(NSSize(width: newSize.width / scale, height: newSize.height / scale))
+        replay.fit(to: newSize)
     }
 }
 
-/// Place le terminal de rejeu dans le `FittingContainer`.
+/// Place le terminal de rejeu dans le `ReplayContainer`.
 private struct ReplayTerminal: NSViewRepresentable {
-    let replay: TTYReplay
+    @ObservedObject var replay: TTYReplay
 
-    func makeNSView(context: Context) -> FittingContainer {
-        FittingContainer(content: replay.terminalView, contentSize: replay.contentSize)
+    func makeNSView(context: Context) -> ReplayContainer {
+        ReplayContainer(replay: replay)
     }
 
-    func updateNSView(_ container: FittingContainer, context: Context) {
+    func updateNSView(_ container: ReplayContainer, context: Context) {
         container.attach(replay.terminalView)
     }
 }
