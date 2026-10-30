@@ -47,9 +47,9 @@ enum ClaudeInvocationProbe {
               sessionID: sid, settingsFile: settings, model: nil, effort: nil).last == "-rf $(x) 'q'\nfin")
         check("claude.shellArgs", ClaudeInvocation.claudeShellArguments(shell: "/bin/zsh",
               claudeCommand: "claude", claudeArguments: ["--", "p"])
-            == ["/bin/zsh", "-l", "-i", "-c", "exec 'claude' \"$@\"", "claude", "--", "p"])
+            == ["/bin/zsh", "-l", "-i", "+m", "-c", "exec 'claude' \"$@\"", "claude", "--", "p"])
         check("claude.shellPlain", ClaudeInvocation.shellArguments(shell: "/bin/zsh", command: "echo hi")
-            == ["/bin/zsh", "-l", "-i", "-c", "echo hi"])
+            == ["/bin/zsh", "-l", "-i", "+m", "-c", "set +m; echo hi"])
         check("claude.shellFallback", ClaudeInvocation.shell(from: ["SHELL": "/opt/homebrew/bin/fish"]) == "/bin/zsh"
               && ClaudeInvocation.shell(from: [:]) == "/bin/zsh")
         check("claude.shellKept", ClaudeInvocation.shell(from: ["SHELL": "/bin/bash"]) == "/bin/bash")

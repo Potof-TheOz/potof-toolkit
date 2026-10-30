@@ -79,6 +79,40 @@ enum PTYProcessProbe {
         check("pty.killsGroup", grandchild != nil && dead,
               grandchild.map { "pid \($0)" } ?? "pid illisible")
 
+        // pty.killsBackgroundJob — cas de la revue : un shell INTERACTIF avec un job de fond.
+        // Les arguments sont les vrais (`ClaudeInvocation.shellArguments`, donc `+m`) ; on
+        // n'y insère que de quoi ne pas sourcer les rc de la machine. Sans `+m`, le job
+        // partait dans son propre groupe et survivait au kill (vérifié en retirant `+m`).
+        let interactiveShells: [(path: String, skipRC: [String])] = [
+            ("/bin/zsh", ["-f"]), ("/bin/bash", ["--noprofile", "--norc"])]
+        for (index, shell) in interactiveShells.enumerated()
+        where FileManager.default.isExecutableFile(atPath: shell.path) {
+            let jobPidFile = dir.appendingPathComponent("job-\(index).pid")
+            let argv = ClaudeInvocation.shellArguments(
+                shell: shell.path, command: "/bin/sleep 71 & echo $! > '\(jobPidFile.path)'; wait")
+            let started = Date()
+            let result = PTYProcess.run(PTYRequest(
+                executable: shell.path,
+                arguments: [argv[0]] + shell.skipRC + argv.dropFirst(),
+                environment: ["PATH=/usr/bin:/bin", "HOME=\(dir.path)"],
+                directory: dir.path, ttyFile: nil, timeout: 1, stopMarker: nil,
+                detectTrustDialog: false, keepOutput: false))
+            let jobPid = (try? String(contentsOf: jobPidFile))
+                .flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            var jobDead = false
+            if let jobPid {
+                for _ in 0..<40 {
+                    if kill(jobPid, 0) != 0 { jobDead = true; break }
+                    usleep(50_000)
+                }
+                if !jobDead { kill(jobPid, SIGKILL) }       // ne laisse rien derrière une probe en échec
+            }
+            check("pty.killsBackgroundJob.\((shell.path as NSString).lastPathComponent)",
+                  result.end == .timedOut && jobPid != nil && jobDead,
+                  "\(result.end) en \(String(format: "%.1f", Date().timeIntervalSince(started))) s, "
+                  + (jobPid.map { "job \($0) \(jobDead ? "mort" : "VIVANT")" } ?? "pid illisible"))
+        }
+
         // pty.trustDialog — séquences de déplacement du curseur entre les mots, comme le vrai TUI
         let r5 = PTYProcess.run(req(
             "printf 'Do you\\033[1Ctrust\\033[1Cthis\\033[1Cfolder?'; sleep 60",
@@ -112,6 +146,20 @@ enum PTYProcessProbe {
                   && String(decoding: second.data, as: UTF8.self) == "c" && second.offset == 3
                   && absent.data.isEmpty && absent.offset == 7,
               "\(first.offset) / \(second.offset) / \(absent.offset)")
+
+        // pty.readerSliced — lecture par tranches : jamais plus que `limit`, et la suite reprend au bon octet
+        try? Data("abcdefg".utf8).write(to: readerFile)
+        var sliced = ""
+        var cursor: UInt64 = 0
+        var reads = 0
+        while reads < 10 {
+            let part = TTYFileReader.read(readerFile, from: cursor, limit: 3)
+            if part.data.isEmpty { break }
+            sliced += String(decoding: part.data, as: UTF8.self) + "|"
+            cursor = part.offset
+            reads += 1
+        }
+        check("pty.readerSliced", sliced == "abc|def|g|" && cursor == 7, sliced)
 
         out.append("")
         out.append(failures == 0

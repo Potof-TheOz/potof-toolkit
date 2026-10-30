@@ -313,7 +313,9 @@ L'outil occupe tout le cadre sous le header et gère sa propre chrome.
   8. **Session interactive dans un PTY possédé par le runner, fin par hook `Stop` puis
      `/exit`, toujours `--permission-mode dontAsk` et `CLAUDE_CODE_AUTO_CONNECT_IDE=false`.**
      Pas `claude -p` : le rendu CLI est voulu et les MCP de plugin y sont gardés
-     (`docs/adr/0002-…`). Grille fixe 120×40, signaux au **groupe**. Un dossier jamais
+     (`docs/adr/0002-…`). Grille fixe 120×40, signaux au **groupe**. Le shell du préscript tourne **sans contrôle
+     de jobs** (`-l -i +m`, plus `set +m;` en tête de commande — bash ignore `+m` avec `-i`) :
+     sinon jobs de fond et pipelines quittent le groupe et survivent au kill. Un dossier jamais
      approuvé par `claude` bloque sur « trust this folder » : le runner le détecte et échoue
      en quelques secondes. Les `CLAUDE_CODE_*` hérités sont retirés de l'env (sinon port IDE
      mort, ou conversation non enregistrée). Le prompt n'est **jamais** interprété par un

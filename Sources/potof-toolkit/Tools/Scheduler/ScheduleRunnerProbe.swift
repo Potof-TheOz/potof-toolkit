@@ -189,6 +189,8 @@ enum ScheduleRunnerProbe {
             let busy = execute(locked, mode: "ok")
             check("run.locked", busy.status == .skipped
                   && busy.message == "un run est déjà en cours" && argv() == nil, detail(busy))
+            check("run.lockCloexec", fcntl(fd, F_GETFD) & FD_CLOEXEC != 0,
+                  "le fd du verrou ne doit pas passer au préscript ni à claude")
             flock(fd, LOCK_UN)
             close(fd)
         } else {

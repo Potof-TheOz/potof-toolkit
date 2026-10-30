@@ -55,7 +55,7 @@ ScheduleStore.shared (⭐ singleton : SEUL écrivain de schedules.json)
 
 Le prompt ne traverse **jamais** un shell ni un plist. `ProgramArguments` ne porte que
 `["<binaire>", "--run-schedule", "<uuid>"]`. Le runner passe le prompt en argument
-positionnel : `$SHELL -l -i -c 'exec claude "$@"' claude <args> -- <prompt>`. Le shell
+positionnel : `$SHELL -l -i +m -c 'exec claude "$@"' claude <args> -- <prompt>`. Le shell
 reçoit `"$@"` tel quel, et `claude` lit le prompt après `--`. Un prompt qui contient `'`,
 `$(…)`, des retours à la ligne ou qui commence par `-` arrive intact (`run.argvIntact`).
 
@@ -66,7 +66,7 @@ reçoit `"$@"` tel quel, et `claude` lit le prompt après `--`. Un prompt qui co
  2. désactivée et déclencheur ≠ manual            → skipped « planification désactivée »
  3. flock(LOCK_EX|LOCK_NB) par planification      → skipped « un run est déjà en cours »
  4. le dossier existe et c'est un dossier ?       → failed « dossier introuvable : <chemin> »
- 5. préscript non vide → PTY, $SHELL -l -i -c     code ≠ 0 → failed « préscript en échec (code N) »
+ 5. préscript non vide → PTY, $SHELL -l -i +m -c  code ≠ 0 → failed « préscript en échec (code N) »
                                                   600 s    → failed « préscript : délai dépassé »
  6. MCP requis non vides → claude mcp list        indisponible → failed « MCP requis indisponibles : … »
                                                   90 s     → failed « claude mcp list : délai dépassé »
@@ -75,6 +75,7 @@ reçoit `"$@"` tel quel, et `claude` lit le prompt après `--`. Un prompt qui co
  8. session claude dans le PTY (délai = timeoutMinutes)
        hook Stop vu puis /exit          → completed « session terminée »
        sortie sans hook Stop            → failed « claude s'est arrêté avant la fin de sa réponse (code N) »
+       sortie 127 (exec impossible)     → failed « claude introuvable ou non exécutable (code 127) »
        délai dépassé                    → timedOut « délai de N min dépassé »
        dialogue de confiance            → failed « dossier non approuvé par Claude : ouvrez-le une fois dans Claude Launcher »
        fork impossible                  → failed « lancement impossible »
@@ -90,7 +91,7 @@ la conversation (`~/.claude/projects/<dossier encodé>/<sessionID>.jsonl`).
 
 ### Le préscript
 
-Facultatif. Exécuté dans le dossier par `$SHELL -l -i -c`, dans le même PTY enregistré
+Facultatif. Exécuté dans le dossier par `$SHELL -l -i +m -c`, dans le même PTY enregistré
 que la session. Il sert à préparer le dossier : `git pull`, un `npm install`, un export.
 **Il est attendu jusqu'au bout.** Un code ≠ 0 ou un délai dépassé (600 s, fixe) fait
 échouer le run, et `claude` n'est **pas** lancé : une session ne part pas sur un dossier à
@@ -99,6 +100,16 @@ donc en `failed` au bout du délai (`run.preScriptHangs`).
 
 `$SHELL` n'est retenu que si c'est zsh, bash ou sh ; sinon `/bin/zsh`. Le login shell
 interactif (`-l -i`) recharge le PATH des rc, comme les sessions de Claude Launcher.
+
+⚠️ **Le shell tourne SANS contrôle de jobs** (`+m` à l'invocation, `set +m;` en tête de la
+commande). Un shell interactif en active un : chaque commande, chaque job de fond
+(`npm run dev &`) et chaque pipeline (`claude mcp list | cat`) partirait alors dans son
+**propre groupe de process**, hors d'atteinte de `kill(-pid, …)`. Le délai dépassé aurait
+fini le run en `failed` en laissant le serveur orphelin, indéfiniment. Mesuré : `+m` suffit
+à zsh, mais **bash et sh l'ignorent quand `-i` est présent** — d'où le `set +m;` en tête,
+que ni les rc ni l'invocation ne peuvent défaire avant lui. Vérifié par
+`pty.killsBackgroundJob.zsh` / `.bash` (shell interactif, job de fond, délai 1 s : le job
+doit être mort). La session `claude` n'est pas concernée : `exec` en fait le chef de session.
 
 ### La session : un PTY 120×40 possédé par le runner
 
@@ -201,7 +212,15 @@ explicite. Le verrou par planification exclut un tir launchd simultané.
 L'onglet **« Session »** rejoue le `.tty` du run choisi dans un `TerminalView` SwiftTerm
 (pas `LocalProcessTerminalView` : aucun process côté GUI). Lecture seule : saisie jetée,
 souris non rapportée. Un `DispatchSource` vnode suit le fichier, et `TTYFileReader` ne lit
-que la suite depuis le dernier décalage. Un run terminé se lit d'une traite. L'onglet
+que la suite depuis le dernier décalage, **par tranches de 256 Ko** (`pty.readerSliced`) :
+le fichier n'est jamais chargé d'un bloc, et le runloop reprend la main entre deux
+tranches, donc une session de plusieurs dizaines de Mo ne fige pas la fenêtre. Un run
+terminé se relit de la même façon, sans rien surveiller.
+
+Tant que le run est en cours et que le `.tty` n'existe pas encore (il naît au premier
+octet), la vue réessaie toutes les 0,5 s. Dès que le run n'est plus « en cours », les
+réessais s'arrêtent ; s'il n'y a toujours pas de `.tty` (échec avant le préscript et
+`claude`), la vue affiche « Aucune session enregistrée pour ce run. ». L'onglet
 s'affiche par défaut quand un run tourne ; un clic dans l'historique y ouvre le run choisi.
 
 **« Reprendre dans Claude Launcher »** ouvre `claude --resume <sessionID>` dans le dossier
@@ -557,6 +576,13 @@ launchctl bootout gui/$(id -u)/$LABEL
 rm ~/Library/LaunchAgents/$LABEL.plist
 rm -rf ~/Library/Application\ Support/PotofToolkit/scheduler
 ```
+
+## Limites connues
+
+- **Faux positif du dialogue de confiance.** La détection cherche `trustthisfolder` dans
+  les 64 premiers Ko du flux, blancs et casse ignorés, écho du prompt par le TUI compris :
+  un prompt (ou un début de réponse) qui contient « trust this folder » tue la session et
+  finit en `failed « dossier non approuvé… »`, un message trompeur. Non corrigé.
 
 ## Hors périmètre
 
