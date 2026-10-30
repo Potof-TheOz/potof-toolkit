@@ -33,11 +33,24 @@ enum ScheduleResume {
 
     /// `<projectsRoot>/<dossier encodé>/<sessionID>.jsonl` — la conversation que `claude`
     /// a écrite. Sa présence est la seule preuve qu'il y a quelque chose à reprendre.
-    static func transcriptURL(folderPath: String, sessionID: String) -> URL {
-        PreviousSessionsStore.projectsRoot
+    ///
+    /// Cherchée par son **sessionID** (unique) dans tous les dossiers de projets, et non
+    /// recalculée depuis le chemin : `projectDirName` ne transforme que `/`, `.` et `_`,
+    /// alors qu'un dossier avec un espace, un lien ou un `/` final donne un autre nom côté
+    /// `claude`. Le nom calculé n'est qu'un premier essai, pour éviter le parcours.
+    static func transcriptURL(folderPath: String, sessionID: String) -> URL? {
+        let fm = FileManager.default
+        let root = PreviousSessionsStore.projectsRoot
+        let name = "\(sessionID).jsonl"
+        let guess = root
             .appendingPathComponent(PreviousSessionsStore.projectDirName(forPath: folderPath),
                                     isDirectory: true)
-            .appendingPathComponent("\(sessionID).jsonl")
+            .appendingPathComponent(name)
+        if fm.fileExists(atPath: guess.path) { return guess }
+        let projects = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []
+        return projects.lazy
+            .map { $0.appendingPathComponent(name) }
+            .first { fm.fileExists(atPath: $0.path) }
     }
 
     static func canResume(_ run: RunRecord, folderPath: String) -> Bool {
@@ -50,9 +63,8 @@ enum ScheduleResume {
         guard let sessionID = run.sessionID, !sessionID.isEmpty else {
             return "Aucune conversation enregistrée : ce run n'est pas allé jusqu'à claude."
         }
-        let transcript = transcriptURL(folderPath: folderPath, sessionID: sessionID)
-        guard FileManager.default.fileExists(atPath: transcript.path) else {
-            return "Aucune conversation enregistrée : \(transcript.lastPathComponent) est introuvable."
+        guard transcriptURL(folderPath: folderPath, sessionID: sessionID) != nil else {
+            return "Aucune conversation enregistrée : \(sessionID).jsonl est introuvable."
         }
         return nil
     }
@@ -120,6 +132,10 @@ final class TTYReplay: ObservableObject {
     private static let rebuildDelay: TimeInterval = 0.2
     /// Police par défaut de SwiftTerm (son `FontSet` est interne) : on n'en change que la taille.
     private static let defaultFont = TerminalView(frame: .zero).font
+    /// Historique du terminal de rejeu. SwiftTerm en garde 500 lignes par défaut : sur une
+    /// longue session, le début (préscript, premiers outils) sortait de la vue alors qu'il
+    /// est dans le `.tty`.
+    static let scrollbackLines = 10_000
 
     init(url: URL, follow: Bool) {
         self.url = url
@@ -143,6 +159,7 @@ final class TTYReplay: ObservableObject {
         let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 800, height: 600), font: font)
         view.allowMouseReporting = false
         view.terminalDelegate = nil
+        view.getTerminal().changeScrollback(scrollbackLines)
         view.getTerminal().resize(cols: Int(PTYProcess.columns), rows: Int(PTYProcess.rows))
         // ⚠️ `setFrameSize` recalcule la grille par `Int(largeur / cellule)` : à la valeur
         // exacte de `getOptimalFrameSize()`, un arrondi flottant peut donner 119 colonnes.
