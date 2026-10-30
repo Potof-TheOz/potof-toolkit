@@ -23,6 +23,9 @@ enum PTYEnd: Equatable {
 struct PTYResult {
     let end: PTYEnd
     let output: Data
+    /// Groupe de process de la commande (= pid de son chef) ; 0 si elle n'a pas démarré.
+    /// À passer à `PTYProcess.sweepGroup` en fin de run.
+    let processGroup: pid_t
 }
 
 /// Exécute une commande dans un PTY que **le runner possède**, enregistre tout le flux
@@ -51,10 +54,29 @@ enum PTYProcess {
                                                      env: request.environment,
                                                      currentDirectory: request.directory,
                                                      desiredWindowSize: &size) else {
-            return PTYResult(end: .spawnFailed, output: Data())
+            return PTYResult(end: .spawnFailed, output: Data(), processGroup: 0)
         }
         let session = Session(request: request, pid: child.pid, master: child.masterFd)
         return session.drive()
+    }
+
+    /// Termine ce qui reste du groupe `pgid` une fois son chef récolté : jobs de fond d'un
+    /// préscript sorti normalement, serveurs MCP stdio laissés par `claude`… `run` ne s'en
+    /// charge que sur ses chemins d'arrêt forcé ; le runner appelle ceci **en fin de run**,
+    /// pas à la fin de chaque commande, pour qu'un préscript puisse démarrer un serveur
+    /// dont la session a besoin.
+    ///
+    /// Ne fait rien si le groupe est vide, ni si un process vivant porte le pid `pgid` :
+    /// le chef étant mort, ce pid aurait été réattribué et le groupe ne serait plus le nôtre.
+    /// (Tant qu'un membre survit, le noyau ne réattribue pas un pid égal à son pgid.)
+    static func sweepGroup(_ pgid: pid_t) {
+        guard pgid > 1 else { return }
+        guard kill(pgid, 0) != 0, errno == ESRCH else { return }   // chef vivant ou pid réutilisé
+        guard kill(-pgid, 0) == 0 else { return }                   // groupe vide
+        kill(-pgid, SIGTERM)
+        let limit = Date().addingTimeInterval(killGrace)
+        while kill(-pgid, 0) == 0, Date() < limit { usleep(100_000) }
+        if kill(-pgid, 0) == 0 { kill(-pgid, SIGKILL) }
     }
 
     /// Vrai si le flux contient le dialogue « Do you trust this folder? » de `claude`.
@@ -163,7 +185,7 @@ enum PTYProcess {
         }
 
         private func finish(_ end: PTYEnd) -> PTYResult {
-            PTYResult(end: end, output: request.keepOutput ? output : Data())
+            PTYResult(end: end, output: request.keepOutput ? output : Data(), processGroup: pid)
         }
 
         private func openTTYFile() {
