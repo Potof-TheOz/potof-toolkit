@@ -60,7 +60,14 @@ enum ClaudeInvocation {
         return env.map { "\($0.key)=\($0.value)" }.sorted()
     }
 
-    /// Ajoute en fin de `hooks.Stop` un hook qui pose `stopMarker` ; le reste est intact.
+    /// Ajoute en fin de `hooks.Stop` un hook qui pose `stopMarker`, et impose `"tui": "default"`.
+    /// Le reste est intact.
+    ///
+    /// ⚠️ `tui` est imposé même si le fichier de l'utilisateur dit autre chose : en `fullscreen`,
+    /// `claude` dessine sur l'écran ALTERNATIF (`ESC[?1049h`) et le quitte à `/exit`. Le rejeu
+    /// d'un run terminé ne montrait alors que « Resume this session with… » (mesuré le
+    /// 2026-10-30, `claude` 2.1.314). Le rendu classique écrit dans l'écran principal, donc
+    /// tout le déroulé reste dans le `.tty`.
     static func runSettings(userSettings: Data?, stopMarker: URL) throws -> Data {
         var root: [String: Any] = [:]
         if let data = userSettings {
@@ -86,6 +93,7 @@ enum ClaudeInvocation {
         stop.append(["hooks": [["type": "command", "command": "touch " + shellQuote(stopMarker.path)]]])
         hooks["Stop"] = stop
         root["hooks"] = hooks
+        root["tui"] = "default"
         return try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
     }
 
