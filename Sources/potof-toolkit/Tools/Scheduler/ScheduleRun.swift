@@ -2,20 +2,23 @@ import Foundation
 
 /// Issue d'un run.
 ///
-/// ⭐ `launched` et **pas** `ok` : le runner ne sait rien du résultat de l'agent, il sait
-/// seulement que `superset agents create` a rendu 0. L'UI dit « agent lancé à 10:00 »,
-/// jamais « réussi ». Un historique tout vert ne doit pas se lire comme une garantie de
-/// livrable — la vérification du livrable est **hors périmètre** et reste côté métier.
+/// ⭐ `completed` et **pas** `ok` : la session a rendu la main (hook `Stop` vu, puis
+/// `/exit`), rien de plus. Le runner ne juge pas ce que `claude` a produit — un historique
+/// tout vert ne doit pas se lire comme une garantie de livrable.
 ///
-/// `skipped` **n'est pas un échec** : c'est un garde-fou qui a joué (agent encore vif,
-/// run déjà en cours, planification désactivée). L'UI les distingue — orange contre
-/// rouge — sans quoi on crie au loup tous les jours et on finit par ne plus regarder.
+/// `skipped` **n'est pas un échec** : c'est un garde-fou qui a joué (run déjà en cours,
+/// planification désactivée). L'UI les distingue — orange contre rouge — sans quoi on crie
+/// au loup tous les jours et on finit par ne plus regarder. `timedOut` a sa propre couleur :
+/// la session tournait encore, elle a été tuée.
+///
+/// `running` et `interrupted` ne sont jamais écrits : ils sont **dérivés** par le pliage
+/// (`start` sans `end`, pid vivant ou mort).
 enum RunStatus: String, Codable, Hashable {
-    case launched, failed, skipped, running, interrupted
+    case completed, failed, skipped, timedOut, running, interrupted
 
-    /// Un run qui mérite une bannière système (§6.7). `launched` n'en mérite pas.
+    /// Un run qui mérite une bannière système (§6.7). `completed` n'en mérite pas.
     var deservesNotification: Bool {
-        self == .failed || self == .skipped
+        self == .failed || self == .skipped || self == .timedOut
     }
 }
 
@@ -27,7 +30,9 @@ enum RunStatus: String, Codable, Hashable {
 struct RunLine: Codable, Hashable {
     enum Phase: String, Codable, Hashable { case start, end }
 
-    var v: Int = 1
+    /// `2` depuis le Claude Scheduler. Les lignes v1 (statut `launched`) ne se décodent
+    /// plus et sont sautées par `RunLog.loadLines` : leurs planifications ont été purgées.
+    var v: Int = 2
     let runID: UUID
     let scheduleID: UUID
     let phase: Phase
@@ -39,13 +44,14 @@ struct RunLine: Codable, Hashable {
 
     // Renseignés sur `end` seulement.
     var status: RunStatus?
-    var workspaceID: String?
-    var worktreePath: String?
+    /// `--session-id` de la session `claude`, en minuscules. Présent dès que le runner a
+    /// tenté de lancer la session (étape 8), absent avant.
+    var sessionID: String?
     var message: String?
     var logPath: String?
 
     /// Plafond du champ `message`. Jamais de corps de log dans le JSONL : le corps va
-    /// dans `logs/<runID>.log`. C'est ce qui garantit qu'une écriture reste un `write(2)`
+    /// dans `logs/<runID>.log` (et le flux du terminal dans `logs/<runID>.tty`). C'est ce qui garantit qu'une écriture reste un `write(2)`
     /// unique et court (< 4 Ko), donc atomique en pratique sous `flock`.
     static let maxMessageLength = 500
 
@@ -56,12 +62,11 @@ struct RunLine: Codable, Hashable {
 
     static func end(
         runID: UUID, scheduleID: UUID, at: Date, status: RunStatus, message: String,
-        workspaceID: String?, worktreePath: String?, logPath: String?
+        sessionID: String?, logPath: String?
     ) -> RunLine {
         RunLine(runID: runID, scheduleID: scheduleID, phase: .end, at: at,
                 status: status,
-                workspaceID: workspaceID,
-                worktreePath: worktreePath,
+                sessionID: sessionID,
                 message: String(message.prefix(maxMessageLength)),
                 logPath: logPath)
     }
@@ -77,8 +82,8 @@ struct RunRecord: Identifiable, Hashable {
     let endedAt: Date?
     let status: RunStatus
     let message: String
-    let workspaceID: String?
-    let worktreePath: String?
+    /// Conversation à reprendre dans Claude Launcher (`claude --resume`).
+    let sessionID: String?
     let logPath: String?
 
     var duration: TimeInterval? {
@@ -140,8 +145,7 @@ extension RunRecord {
                 endedAt: end?.at,
                 status: status,
                 message: end?.message ?? (status == .running ? "en cours…" : "run interrompu"),
-                workspaceID: end?.workspaceID,
-                worktreePath: end?.worktreePath,
+                sessionID: end?.sessionID,
                 logPath: end?.logPath
             )
         }

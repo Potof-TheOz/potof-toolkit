@@ -41,12 +41,15 @@ enum CLIHelp {
       --help, -h                              cette aide (en 1ʳᵉ position)
 
     Modes hors GUI (ils vivent avant NSApplication et ne montent aucune UI) :
-      --run-schedule <uuid> [--dry-run]       exécute une planification du Superset Scheduler
+      --run-schedule <uuid> [--dry-run]       exécute une planification du Claude Scheduler
                                               (mode headless appelé par launchd ; --dry-run
                                               imprime le plan sans écrire d'historique ni
                                               poser de verrou)
-      --sched-selftest [cli|plist|store|run]  auto-tests du Superset Scheduler
+      --sched-selftest [pty|claude|plist|store|run]
+                                              auto-tests du Claude Scheduler
                                               (sans sous-commande : liste les sous-commandes)
+      --sched-selftest live <dossier>         run réel avec le VRAI claude (haiku, ~0,01 $)
+                                              dans un dossier déjà approuvé
 
     ⚠️ Bancs d'essai du pont IDE — PAS des diagnostics anodins : ils montent le serveur IDE de
        PRODUCTION, posent un second verrou dans le vrai $HOME et ne rendent jamais la main.

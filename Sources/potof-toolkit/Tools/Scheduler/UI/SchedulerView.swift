@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Outil « Superset Scheduler » — **lot L4**.
+/// Outil « Claude Scheduler ».
 ///
 /// Disposition en deux volets (`HSplitView`, **jamais `NavigationSplitView`** : son toggle
 /// automatique ne s'ancre pas dans une fenêtre hébergée manuellement et « saute ») :
@@ -178,8 +178,8 @@ struct SchedulerView: View {
         VStack(spacing: 0) {
             if store.schedules.isEmpty {
                 emptyMessage(icon: "calendar.badge.plus",
-                             text: "Aucune planification.\nCréez-en une pour lancer un agent "
-                                 + "Superset à heure fixe.")
+                             text: "Aucune planification.\nCréez-en une pour lancer claude "
+                                 + "à heure fixe dans un dossier.")
             } else {
                 ScrollView {
                     VStack(spacing: 4) {
@@ -312,8 +312,12 @@ struct SchedulerView: View {
         VStack(alignment: .leading, spacing: 8) {
             fact("Cadence", LaunchAgentPlist.humanDescription(schedule.recurrence))
             fact("Prochaine exécution", nextFireText(schedule))
-            fact("Agent", agentText(schedule))
-            fact("Cible", schedule.target.summary)
+            fact("Dossier", (schedule.folderPath as NSString).abbreviatingWithTildeInPath)
+            fact("Claude", claudeText(schedule))
+            if !schedule.requiredMCPServers.isEmpty {
+                fact("MCP requis", schedule.requiredMCPServers.joined(separator: ", "))
+            }
+            fact("Préscript", preScriptText(schedule))
         }
     }
 
@@ -344,9 +348,20 @@ struct SchedulerView: View {
         return formatter.string(from: date)
     }
 
-    private func agentText(_ schedule: Schedule) -> String {
-        let effort = schedule.action.effort.map { " · effort \($0)" } ?? ""
-        return schedule.action.agentRef + effort
+    private func claudeText(_ schedule: Schedule) -> String {
+        var parts = ["modèle \(schedule.action.model ?? "par défaut")",
+                     "effort \(schedule.action.effort ?? "par défaut")",
+                     "délai \(schedule.timeoutMinutes) min"]
+        if let settingsPath = schedule.action.settingsPath {
+            parts.append("settings \((settingsPath as NSString).abbreviatingWithTildeInPath)")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func preScriptText(_ schedule: Schedule) -> String {
+        let lines = schedule.preScript.split(separator: "\n", omittingEmptySubsequences: true)
+        guard let first = lines.first else { return "aucun" }
+        return lines.count == 1 ? String(first) : "\(first) (+ \(lines.count - 1) ligne(s))"
     }
 
     // MARK: - Top bar d'actions
@@ -371,17 +386,12 @@ struct SchedulerView: View {
                       help: "Modifier cette planification.") {
                 editing = .existing(schedule.id)
             }
-            barButton("arrow.up.forward.app", label: "Ouvrir le workspace dans Superset",
-                      help: "Ouvre le workspace dans Superset — celui du dernier run s'il y "
-                          + "en a eu un, sinon celui que désigne la cible.") {
-                openWorkspace(schedule)
-            }
             barButton("doc.text.magnifyingglass", label: "Simuler le prochain run",
-                      help: "Simulation (dry-run) : déroule exactement ce que ferait le "
-                          + "déclenchement de 10:00 — argv, prompt, garde-fous qui "
-                          + "bloqueraient — et l'affiche dans l'onglet « Plan ». "
-                          + "AUCUN effet de bord : ni workspace, ni agent, ni ligne "
-                          + "d'historique.",
+                      help: "Simulation (dry-run) : déroule ce que ferait le prochain "
+                          + "déclenchement — dossier, préscript, MCP requis, argv de claude, "
+                          + "garde-fous qui bloqueraient — et l'affiche dans l'onglet « Plan ». "
+                          + "Rien n'est exécuté hormis « claude mcp list » : ni préscript, ni "
+                          + "session, ni ligne d'historique.",
                       disabled: simulating) {
                 simulate(schedule)
             }
@@ -522,55 +532,6 @@ struct SchedulerView: View {
         plan = nil
     }
 
-    /// Ouvre le workspace dans Superset. Deux sources d'identifiant, dans cet ordre :
-    /// 1. **le dernier run** — c'est presque toujours ce qu'on veut voir après coup, et
-    ///    c'est la seule source possible pour une cible « nouveau workspace à chaque run » ;
-    /// 2. à défaut, la résolution par coordonnées `(projet, nom)` de la cible permanente.
-    ///
-    /// La planification ne stocke **pas** d'identifiant de workspace (il change si on le
-    /// supprime puis le recrée), d'où cette résolution à la demande.
-    private func openWorkspace(_ schedule: Schedule) {
-        let lastKnown = store.lastRun(of: schedule.id)?.workspaceID
-        diagnostic = "Ouverture du workspace…"
-        DispatchQueue.global(qos: .userInitiated).async {
-            var workspaceID = lastKnown
-            var problem: String?
-
-            if workspaceID == nil {
-                if case .permanentWorkspace(let projectID, _, let name, _, _, _) = schedule.target {
-                    let matches = (SupersetCLI.workspaces() ?? [])
-                        .filter { $0.projectId == projectID && $0.name == name }
-                    if matches.count > 1 {
-                        // Même règle que le runner : plusieurs homonymes ⇒ ambigu, on
-                        // n'en choisit pas un au hasard.
-                        problem = "\(matches.count) workspaces s'appellent « \(name) » dans "
-                                + "ce projet : impossible de choisir."
-                    } else if let found = matches.first {
-                        workspaceID = found.id
-                    } else {
-                        problem = "Le workspace « \(name) » n'existe pas encore — "
-                                + "il sera créé au premier run."
-                    }
-                } else {
-                    problem = "Aucun run enregistré : le workspace n'a pas encore été créé."
-                }
-            }
-
-            let message: String
-            if let problem {
-                message = problem
-            } else if let workspaceID {
-                let result = SupersetCLI.openWorkspace(id: workspaceID)
-                message = result.ok
-                    ? "Workspace ouvert dans Superset."
-                    : "Ouverture impossible : \(result.message)"
-            } else {
-                message = "Workspace introuvable."
-            }
-            DispatchQueue.main.async { diagnostic = message }
-        }
-    }
-
     /// Simulation du prochain déclenchement — **le seul « test » de cette UI**.
     ///
     /// ⭐ `trigger: launchd` et non `"cli"` : on simule le tir de 10:00, pas un lancement
@@ -580,8 +541,8 @@ struct SchedulerView: View {
     /// `notify` n'est appelée que hors dry-run.
     ///
     /// Effets de bord : **aucun**. Le `Reporter` n'a pas de `RunLog`, aucun verrou n'est
-    /// posé, aucun `create` n'est exécuté. Les seuls appels sortants sont des lectures
-    /// (`status`, `workspaces list`), d'où la file de fond : c'est bloquant.
+    /// posé, ni le préscript ni la session ne sont lancés. Seule lecture réelle :
+    /// `claude mcp list` (jusqu'à 90 s), d'où la file de fond : c'est bloquant.
     private func simulate(_ schedule: Schedule) {
         guard !simulating else { return }
         simulating = true
@@ -694,8 +655,8 @@ private struct ScheduleRow: View {
 
 /// Pastille de statut du dernier run.
 ///
-/// ⚠️ `launched` ne s'écrit **jamais** « réussi » : le runner sait seulement qu'il a su
-/// lancer l'agent, pas ce que celui-ci a produit. Et `skipped` (orange) se distingue de
+/// ⚠️ `completed` s'écrit « terminé », **jamais** « réussi » : la session a rendu la main,
+/// le runner ne juge pas ce qu'elle a produit. Et `skipped` (orange) se distingue de
 /// `failed` (rouge) — un garde-fou qui joue n'est pas une panne, et les confondre revient
 /// à crier au loup tous les jours jusqu'à ne plus regarder.
 struct RunStatusPill: View {
@@ -715,9 +676,10 @@ struct RunStatusPill: View {
 
     private var label: String {
         switch status {
-        case .launched:    return "agent lancé"
+        case .completed:   return "terminé"
         case .failed:      return "échec"
         case .skipped:     return "sauté"
+        case .timedOut:    return "délai dépassé"
         case .running:     return "en cours"
         case .interrupted: return "interrompu"
         }
@@ -725,9 +687,10 @@ struct RunStatusPill: View {
 
     private var tint: Color {
         switch status {
-        case .launched:    return .green
+        case .completed:   return .green
         case .failed:      return .red
         case .skipped:     return .orange
+        case .timedOut:    return .purple
         case .running:     return .blue
         case .interrupted: return .gray
         }
