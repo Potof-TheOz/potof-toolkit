@@ -70,8 +70,18 @@ enum SchedulePaths {
         logsDirectory.appendingPathComponent("\(runID.uuidString).settings.json", isDirectory: false)
     }
 
-    static func lockFile(scheduleID: UUID) -> URL {
-        locksDirectory.appendingPathComponent("\(scheduleID.uuidString).lock", isDirectory: false)
+    /// Verrou **par dossier**, pas par planification : deux planifications qui visent le même
+    /// dossier ne doivent jamais lancer deux sessions sur la même copie de travail. Nom =
+    /// FNV-1a 64 bits du chemin normalisé (liens résolus, sans `/` final) : stable d'un
+    /// process à l'autre, contrairement à `hashValue`, et sans `CryptoKit` (mode headless en
+    /// `Foundation` seul).
+    static func lockFile(folderPath: String) -> URL {
+        let normalized = URL(fileURLWithPath: folderPath, isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL.path
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in normalized.utf8 { hash = (hash ^ UInt64(byte)) &* 0x0000_0100_0000_01b3 }
+        return locksDirectory.appendingPathComponent("folder-\(String(hash, radix: 16)).lock",
+                                                     isDirectory: false)
     }
 
     // MARK: - launchd

@@ -92,13 +92,6 @@ enum ScheduleRunner {
 
     // MARK: - Exécution
 
-    /// Signature du contrat. Utilisée telle quelle par « Lancer maintenant »
-    /// (`ScheduleStore.runNow`, sur une file de fond).
-    @discardableResult
-    static func execute(_ schedule: Schedule, trigger: String, dryRun: Bool) -> RunStatus {
-        executeReporting(schedule, trigger: trigger, dryRun: dryRun).status
-    }
-
     /// La séquence complète. Rend aussi le compte rendu, dont le `--dry-run` fait sa
     /// sortie encadrée.
     ///
@@ -141,16 +134,18 @@ enum ScheduleRunner {
             return done
         }
 
-        // ── 3. Verrou inter-process ──────────────────────────────────────────────
+        // ── 3. Verrou inter-process, PAR DOSSIER ─────────────────────────────────
         // C'est LUI qui rend « Lancer maintenant » compatible avec un tir launchd
-        // simultané : `flock` est partagé entre process, pas entre threads d'un seul.
+        // simultané : `flock` est partagé entre process, pas entre threads d'un seul. Il
+        // porte sur le dossier et non sur la planification : deux planifications sur le
+        // même dossier lanceraient sinon deux sessions sur la même copie de travail.
         var lockDescriptor: Int32?
         if !dryRun {
-            switch acquireLock(schedule.id) {
+            switch acquireLock(folderPath: schedule.folderPath) {
             case .acquired(let fd):
                 lockDescriptor = fd
             case .busy:
-                return reporter.conclude(.skipped, "un run est déjà en cours",
+                return reporter.conclude(.skipped, "un run est déjà en cours dans ce dossier",
                                          schedule: schedule, trigger: trigger)
             case .unavailable(let why):
                 // Verrou impossible à poser (disque, permissions) : on continue plutôt
@@ -164,6 +159,13 @@ enum ScheduleRunner {
                 close(lockDescriptor)
             }
         }
+        // Groupes de process lancés par ce run (préscript, `mcp list`, session). Ce qu'ils
+        // ont laissé derrière eux (job `nohup` du préscript, serveur MCP stdio…) est tué en
+        // FIN de run, verrou encore tenu : un préscript peut démarrer un serveur pour la
+        // session, mais rien ne doit lui survivre. Ce `defer`, déclaré après celui du verrou,
+        // s'exécute avant lui.
+        var processGroups: [pid_t] = []
+        defer { processGroups.forEach(PTYProcess.sweepGroup) }
 
         let folder = schedule.folderPath
         let environment = ClaudeInvocation.environment(base: ProcessInfo.processInfo.environment)
@@ -211,6 +213,7 @@ enum ScheduleRunner {
                 stopMarker: nil,
                 detectTrustDialog: false,
                 keepOutput: false))
+            processGroups.append(result.processGroup)
             switch result.end {
             case .exited(code: 0):
                 reporter.note("préscript : terminé (code 0)")
@@ -261,6 +264,7 @@ enum ScheduleRunner {
                 stopMarker: nil,
                 detectTrustDialog: false,
                 keepOutput: true))
+            processGroups.append(result.processGroup)
             let states = MCPList.parse(String(decoding: result.output, as: UTF8.self))
             var problem: String?
             switch result.end {
@@ -303,7 +307,12 @@ enum ScheduleRunner {
                 if !dryRun {
                     SchedulePaths.ensureDirectories()
                     do {
-                        try data.write(to: settingsURL)
+                        // 0600 : copie des settings de l'utilisateur, qui peuvent porter des
+                        // secrets (`env`, `apiKeyHelper`). Même règle que le `.tty`.
+                        guard fm.createFile(atPath: settingsURL.path, contents: data,
+                                            attributes: [.posixPermissions: 0o600]) else {
+                            throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: settingsURL.path])
+                        }
                     } catch {
                         return reporter.conclude(
                             .failed, "settings du run impossibles à écrire : \(error.localizedDescription)",
@@ -363,6 +372,7 @@ enum ScheduleRunner {
             stopMarker: stopURL,
             detectTrustDialog: true,
             keepOutput: false))
+        processGroups.append(session.processGroup)
 
         let status: RunStatus
         let message: String
@@ -411,9 +421,9 @@ enum ScheduleRunner {
 
     /// Interne (et non `private`) pour que l'auto-test puisse prouver l'exclusion, qui est
     /// la seule chose empêchant deux sessions de partir dans le même dossier.
-    static func acquireLock(_ scheduleID: UUID) -> LockOutcome {
+    static func acquireLock(folderPath: String) -> LockOutcome {
         SchedulePaths.ensureDirectories()
-        let url = SchedulePaths.lockFile(scheduleID: scheduleID)
+        let url = SchedulePaths.lockFile(folderPath: folderPath)
         // O_CLOEXEC : `forkpty` + `execve` transmettraient sinon le fd du verrou au préscript,
         // à `claude` et à leurs descendants ; un orphelin garderait alors le verrou tenu.
         let fd = open(url.path, O_WRONLY | O_CREAT | O_CLOEXEC, 0o644)

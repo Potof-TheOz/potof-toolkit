@@ -97,7 +97,7 @@ enum ScheduleRunnerProbe {
         }
 
         struct Outcome { let status: RunStatus; let message: String; let sessionID: String?
-                         let tty: String; let seconds: TimeInterval }
+                         let tty: String; let seconds: TimeInterval; let runID: UUID? }
 
         /// Un run réel (hors dry-run) sous la racine jetable, relu depuis sa ligne `end`.
         func execute(_ s: Schedule, mode: String, trigger: String = "cli",
@@ -110,7 +110,7 @@ enum ScheduleRunnerProbe {
             let end = RunLog.loadLines().last { $0.phase == .end && $0.scheduleID == s.id }
             let tty = end.flatMap { try? String(contentsOf: SchedulePaths.ttyFile(runID: $0.runID)) } ?? ""
             return Outcome(status: result.status, message: end?.message ?? "(pas de ligne end)",
-                           sessionID: end?.sessionID, tty: tty, seconds: seconds)
+                           sessionID: end?.sessionID, tty: tty, seconds: seconds, runID: end?.runID)
         }
         func detail(_ o: Outcome) -> String {
             "\(o.status.rawValue) · \(o.message) · \(String(format: "%.1f", o.seconds)) s"
@@ -127,6 +127,24 @@ enum ScheduleRunnerProbe {
               && pre != nil && fake != nil && pre!.lowerBound < fake!.lowerBound, detail(ok))
         check("run.sessionIDLowercase", ok.sessionID.map { $0 == $0.lowercased()
               && argv()?.contains("--session-id\n\($0)\n") == true } == true, ok.sessionID ?? "nil")
+        // Copie des settings de l'utilisateur (secrets possibles dans `env`) : jamais lisible par d'autres.
+        let settingsMode = ok.runID.flatMap {
+            (try? fm.attributesOfItem(atPath: SchedulePaths.runSettingsFile(runID: $0).path))?[.posixPermissions] as? Int
+        }
+        check("run.settingsPrivate", settingsMode == 0o600,
+              settingsMode.map { String($0, radix: 8) } ?? "fichier absent")
+
+        // Un job `nohup` du préscript vit le temps du run (la session peut s'en servir), pas au-delà.
+        let bgFile = folder.appendingPathComponent("bg.pid")
+        // `sleep 0.3` : laisser `nohup` ignorer SIGHUP avant la sortie du shell (test racé sinon).
+        let swept = execute(schedule(preScript: "nohup sleep 60 >/dev/null 2>&1 & echo $! > bg.pid; sleep 0.3"),
+                            mode: "ok")
+        let bgPID = Int32((try? String(contentsOf: bgFile, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? 0
+        usleep(200_000)
+        check("run.sweepsPreScriptJobs", swept.status == .completed && bgPID > 0 && kill(bgPID, 0) != 0,
+              "job \(bgPID) · \(detail(swept))")
+        if bgPID > 0 { kill(bgPID, SIGKILL) }
 
         let trap = "-x 'q' $(y)\nfin"
         let trapped = execute(schedule(prompt: trap), mode: "ok")
@@ -184,11 +202,14 @@ enum ScheduleRunnerProbe {
         // ── 2. Verrou inter-process ──────────────────────────────────────────────
         out.append("")
         out.append("— verrou inter-process —")
+        // Verrou PAR DOSSIER : une AUTRE planification sur le même dossier doit être sautée.
         let locked = schedule()
-        if case .acquired(let fd) = ScheduleRunner.acquireLock(locked.id) {
-            let busy = execute(locked, mode: "ok")
-            check("run.locked", busy.status == .skipped
-                  && busy.message == "un run est déjà en cours" && argv() == nil, detail(busy))
+        if case .acquired(let fd) = ScheduleRunner.acquireLock(folderPath: locked.folderPath + "/") {
+            let other = schedule()
+            let busy = execute(other, mode: "ok")
+            check("run.locked", other.id != locked.id && busy.status == .skipped
+                  && busy.message == "un run est déjà en cours dans ce dossier" && argv() == nil,
+                  detail(busy))
             check("run.lockCloexec", fcntl(fd, F_GETFD) & FD_CLOEXEC != 0,
                   "le fd du verrou ne doit pas passer au préscript ni à claude")
             flock(fd, LOCK_UN)

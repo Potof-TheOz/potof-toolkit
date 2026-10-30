@@ -161,6 +161,23 @@ enum PTYProcessProbe {
         }
         check("pty.readerSliced", sliced == "abc|def|g|" && cursor == 7, sliced)
 
+        // pty.sweepGroup — le chef sort normalement en laissant un job de fond dans son groupe.
+        // `nohup` : sans lui, le SIGHUP envoyé au groupe à la mort du chef de session suffit.
+        // Le `sleep 0.3` laisse à `nohup` le temps d'ignorer SIGHUP avant que le shell sorte
+        // (sinon le test est racé). `run` ne tue pas le job (un préscript peut démarrer un
+        // serveur pour la session), mais `sweepGroup` doit l'achever ensuite.
+        let orphanFile = dir.appendingPathComponent("orphan.pid")
+        let left = PTYProcess.run(req("nohup sleep 60 >/dev/null 2>&1 & echo $! > \"$1\"; sleep 0.3; exit 0",
+                                      args: [orphanFile.path], timeout: 10))
+        let orphan = Int32((try? String(contentsOf: orphanFile, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? 0
+        let aliveAfterRun = orphan > 0 && kill(orphan, 0) == 0
+        PTYProcess.sweepGroup(left.processGroup)
+        usleep(200_000)
+        check("pty.sweepGroup", left.end == .exited(code: 0) && aliveAfterRun && kill(orphan, 0) != 0,
+              "groupe \(left.processGroup), job \(orphan) vivant après run : \(aliveAfterRun)")
+        if orphan > 0 { kill(orphan, SIGKILL) }
+
         out.append("")
         out.append(failures == 0
                    ? "RÉSULTAT : tous les invariants sont vérifiés."
