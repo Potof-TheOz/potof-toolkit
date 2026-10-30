@@ -116,7 +116,10 @@ doit être mort). La session `claude` n'est pas concernée : `exec` en fait le c
 `PTYProcess` lance la commande par `PseudoTerminalHelpers.fork` (SwiftTerm, sans vue) dans
 une grille **fixe de 120 colonnes × 40 lignes**. La GUI rejoue le flux dans un
 `TerminalView` forcé à la même grille : un autre format ferait mal rendre un TUI dessiné
-pour 120 colonnes. Si le panneau est plus petit, le conteneur défile.
+pour 120 colonnes. Si le panneau est plus petit, la grille est **réduite** (échelle par les
+`bounds` du conteneur, jamais par la police ni le cadre, qui feraient re-découper le
+contenu) ; elle n'est jamais agrandie. Pas de `ScrollView` autour : elle ajoutait une 2ᵉ
+barre verticale à celle de l'historique du terminal.
 
 `forkpty` fait de l'enfant le chef de session et de son groupe. Tous les signaux visent le
 **groupe** (`kill(-pid, …)`), petits-enfants compris (`pty.killsGroup`). Arrêt gradué :

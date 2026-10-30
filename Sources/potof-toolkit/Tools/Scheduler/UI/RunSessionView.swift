@@ -194,22 +194,51 @@ final class TTYReplay: ObservableObject {
     }
 }
 
-/// Place le terminal de rejeu dans un conteneur à taille fixe (celle de la grille).
+/// Conteneur qui **réduit** la grille 120×40 pour qu'elle tienne dans le panneau, au lieu de
+/// la faire défiler : le seul défilement reste celui du terminal (son historique). Une
+/// `ScrollView` autour donnait deux barres verticales dès que le panneau était moins haut
+/// que 40 lignes (vu en recette).
+///
+/// On met à l'échelle par les `bounds` et jamais par la police ni le cadre du terminal :
+/// changer l'une ou l'autre recalcule colonnes et lignes, et SwiftTerm re-découpe alors
+/// le contenu déjà rejoué. Jamais d'agrandissement (échelle ≤ 1) : un calque agrandi est flou.
+private final class FittingContainer: NSView {
+
+    private let contentSize: NSSize
+
+    init(content: NSView, contentSize: NSSize) {
+        self.contentSize = contentSize
+        super.init(frame: NSRect(origin: .zero, size: contentSize))
+        attach(content)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) non pris en charge") }
+
+    override var isFlipped: Bool { true }
+
+    func attach(_ content: NSView) {
+        if content.superview !== self { addSubview(content) }
+        content.frame = NSRect(origin: .zero, size: contentSize)
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        guard newSize.width > 0, newSize.height > 0 else { return }
+        let scale = min(1, newSize.width / contentSize.width, newSize.height / contentSize.height)
+        setBoundsSize(NSSize(width: newSize.width / scale, height: newSize.height / scale))
+    }
+}
+
+/// Place le terminal de rejeu dans le `FittingContainer`.
 private struct ReplayTerminal: NSViewRepresentable {
     let replay: TTYReplay
 
-    func makeNSView(context: Context) -> NSView {
-        let container = NSView(frame: NSRect(origin: .zero, size: replay.contentSize))
-        container.addSubview(replay.terminalView)
-        return container
+    func makeNSView(context: Context) -> FittingContainer {
+        FittingContainer(content: replay.terminalView, contentSize: replay.contentSize)
     }
 
-    func updateNSView(_ container: NSView, context: Context) {
-        let view = replay.terminalView
-        if view.superview !== container { container.addSubview(view) }
-        if view.frame.size != replay.contentSize {
-            view.frame = NSRect(origin: .zero, size: replay.contentSize)
-        }
+    func updateNSView(_ container: FittingContainer, context: Context) {
+        container.attach(replay.terminalView)
     }
 }
 
@@ -246,11 +275,9 @@ struct RunSessionView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(Color(nsColor: .textBackgroundColor))
             } else {
-                ScrollView([.horizontal, .vertical]) {
-                    ReplayTerminal(replay: replay)
-                        .frame(width: replay.contentSize.width, height: replay.contentSize.height)
-                }
-                .background(Color(nsColor: .textBackgroundColor))
+                ReplayTerminal(replay: replay)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color(nsColor: .textBackgroundColor))
             }
         }
         // La ligne `end` arrive après le dernier octet du flux : une relecture à la fin
