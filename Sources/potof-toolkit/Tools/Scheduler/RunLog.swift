@@ -61,7 +61,8 @@ final class RunLog {
     }
 
     /// Ajoute une ligne au log **du run** (`logs/<runID>.log`), pas au JSONL. C'est ici
-    /// que va tout ce qui est volumineux : sortie de `superset`, détail des garde-fous.
+    /// que va tout ce qui est volumineux : détail des étapes et des garde-fous. Le flux du
+    /// terminal, lui, va dans `logs/<runID>.tty` (écrit par `PTYProcess`).
     func note(_ text: String) {
         SchedulePaths.ensureDirectories()
         let stamp = ISO8601DateFormatter().string(from: Date())
@@ -76,8 +77,7 @@ final class RunLog {
         }
     }
 
-    func finish(status: RunStatus, message: String,
-                workspaceID: String?, worktreePath: String?) {
+    func finish(status: RunStatus, message: String, sessionID: String?) {
         let logURL = SchedulePaths.logFile(runID: runID)
         let logPath = FileManager.default.fileExists(atPath: logURL.path) ? logURL.path : nil
         Self.append(RunLine.end(
@@ -86,8 +86,7 @@ final class RunLog {
             at: Date(),
             status: status,
             message: message,
-            workspaceID: workspaceID,
-            worktreePath: worktreePath,
+            sessionID: sessionID,
             logPath: logPath))
     }
 

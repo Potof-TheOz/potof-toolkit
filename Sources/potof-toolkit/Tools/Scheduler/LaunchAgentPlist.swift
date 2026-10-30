@@ -110,9 +110,10 @@ enum LaunchAgentPlist {
             // réinstallation ⇒ `true` lancerait un agent à chaque fois.
             "RunAtLoad": false,
             "EnvironmentVariables": [
-                // Le PATH par défaut sous launchd est `/usr/bin:/bin:/usr/sbin:/sbin` :
-                // sans ça, `superset` est introuvable. Chemins littéraux — launchd ne
-                // développe pas `$HOME`.
+                // Le PATH par défaut sous launchd est `/usr/bin:/bin:/usr/sbin:/sbin`.
+                // Plancher seulement : le runner passe par un shell de login interactif
+                // qui recharge celui des rc. Chemins littéraux — launchd ne développe pas
+                // `$HOME`.
                 "PATH": SchedulePaths.searchPath,
                 triggerEnvironmentKey: launchdTriggerValue
             ],
@@ -233,18 +234,11 @@ enum LaunchAgentPlist {
             Schedule(
                 id: UUID(uuidString: uuid) ?? UUID(),
                 name: name,
-                action: .supersetAgent(
-                    agentRef: "dc0a5495-9d1e-45ef-a3c9-b63949e6a48f",
-                    effort: nil,
-                    prompt: "Prompt d'exemple du probe L2 — assez long pour passer validate()."),
-                recurrence: recurrence,
-                target: .permanentWorkspace(
-                    projectID: "6ccf66bf-1780-40fc-b7e9-256fcd01c51c",
-                    projectName: "Shopify-Apps",
-                    workspaceName: "Veille Sentry",
-                    branch: "veille-sentry",
-                    baseBranch: "main",
-                    refreshWorktree: true))
+                folderPath: NSHomeDirectory() + "/Projets/veille-sentry",
+                action: .claude(
+                    prompt: "Prompt d'exemple du probe L2 — assez long pour passer validate().",
+                    model: nil, effort: nil, settingsPath: nil),
+                recurrence: recurrence)
         }
         return [
             make("11111111-1111-4111-8111-111111111111", "Toutes les 6 h",

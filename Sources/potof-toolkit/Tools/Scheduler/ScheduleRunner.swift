@@ -1,10 +1,37 @@
 import Foundation   // ⚠️ JAMAIS AppKit, JAMAIS SwiftUI — garantie STRUCTURELLE : avec ce
                     //    seul import, `NSApp` devient une erreur de compilation.
 
+/// Ce dont le runner a besoin du poste. `live` en production ; les probes substituent un
+/// shell, un faux `claude` et des délais courts.
+struct RunnerHost {
+    var shell: String
+    /// `"claude"` en vrai (résolu par le PATH du shell de login) ; un faux script en probe.
+    var claudeCommand: String
+    var preScriptTimeout: TimeInterval
+    var mcpListTimeout: TimeInterval
+    /// Remplace `timeoutMinutes × 60` (probe seulement).
+    var sessionTimeoutOverride: TimeInterval?
+
+    static var live: RunnerHost {
+        RunnerHost(shell: ClaudeInvocation.shell(from: ProcessInfo.processInfo.environment),
+                   claudeCommand: "claude",
+                   preScriptTimeout: 600,
+                   mcpListTimeout: 90,
+                   sessionTimeoutOverride: nil)
+    }
+}
+
 /// Mode **headless** du binaire : `potof-toolkit --run-schedule <uuid> [--dry-run]`.
 ///
 /// Vit **avant** `NSApplication` (cf. `main.swift`) et ne revient jamais. Même contrat
 /// que `IDESelfTest.run(arguments:flagIndex:)`.
+///
+/// ## La séquence
+/// Dossier → préscript (dans un PTY, attendu jusqu'au bout) → `claude mcp list` si des MCP
+/// sont requis → settings du run (ceux de la planification + un hook `Stop`) → session
+/// `claude` interactive dans un PTY 120×40 que le runner possède, enregistrée dans
+/// `logs/<runID>.tty`, fermée par `/exit` dès que le hook `Stop` a posé son marqueur.
+/// Les messages de chaque issue sont vérifiés au mot près par `--sched-selftest run`.
 ///
 /// ## Liste noire — ce que ce mode ne doit JAMAIS toucher
 /// Les singletons du dépôt sont tous lazy : aucun ne s'initialise au démarrage du
@@ -16,22 +43,24 @@ import Foundation   // ⚠️ JAMAIS AppKit, JAMAIS SwiftUI — garantie STRUCTU
 /// - `IDEHost.shared` — prend le lock `~/.claude/ide/<port>.lock` sur tout `$HOME` : deux
 ///   IDE « valides » ⇒ plus aucune auto-connexion, des deux côtés.
 /// - `IDELog.startSession()` — tronque `ide.log` de l'app vivante.
-/// - `SessionStore` / `ScriptRunStore` / les `TerminalController` — tirent SwiftTerm.
+/// - `SessionStore` / `ScriptRunStore` / les `TerminalController` — tirent les vues SwiftTerm.
+///   (`PTYProcess` n'utilise de SwiftTerm que `PseudoTerminalHelpers`, sans vue.)
 /// - `Bundle.module` — `fatalError` en contexte bundlé.
 ///
 /// `ScheduleStore.shared` n'est pas touché non plus : on passe par le **statique**
 /// `ScheduleStore.loadFromDisk()`, qui n'instancie rien et n'arme aucune surveillance.
+///
+/// `claude` est lancé avec `--permission-mode dontAsk` et `CLAUDE_CODE_AUTO_CONNECT_IDE=false`
+/// (cf. `ClaudeInvocation`) : personne n'est devant l'écran pour répondre à un prompt de
+/// permission ni à la fenêtre de revue du pont IDE.
 enum ScheduleRunner {
-
-    /// Fenêtre laissée au host service pour répondre (réveil de Superset.app compris).
-    private static let hostServiceTimeout: TimeInterval = 150
 
     // MARK: - Point d'entrée du drapeau
 
     /// Codes de sortie (conventions `sysexits.h`) :
-    /// `64` argv invalide · `66` planification introuvable · `1` run en échec ·
-    /// `0` agent lancé **ou** run sauté (un garde-fou qui joue n'est pas une panne, et
-    /// launchd n'a pas à voir un échec là où le système s'est protégé).
+    /// `64` argv invalide · `66` planification introuvable · `1` run en échec ou délai
+    /// dépassé · `0` session terminée **ou** run sauté (un garde-fou qui joue n'est pas une
+    /// panne, et launchd n'a pas à voir un échec là où le système s'est protégé).
     static func run(arguments: [String], flagIndex: Int) -> Never {
         let dryRun = arguments.contains("--dry-run")
 
@@ -58,7 +87,7 @@ enum ScheduleRunner {
 
         let outcome = executeReporting(schedule, trigger: trigger, dryRun: dryRun)
         print(outcome.report)
-        exit(outcome.status == .failed ? 1 : 0)
+        exit(outcome.status == .failed || outcome.status == .timedOut ? 1 : 0)
     }
 
     // MARK: - Exécution
@@ -70,35 +99,46 @@ enum ScheduleRunner {
         executeReporting(schedule, trigger: trigger, dryRun: dryRun).status
     }
 
-    /// La séquence complète du §6.1. Rend aussi le compte rendu, dont le `--dry-run` fait
-    /// sa sortie encadrée.
-    static func executeReporting(_ schedule: Schedule, trigger: String,
-                                 dryRun: Bool) -> (status: RunStatus, report: String) {
+    /// La séquence complète. Rend aussi le compte rendu, dont le `--dry-run` fait sa
+    /// sortie encadrée.
+    ///
+    /// Dry-run (« Simuler ») : aucun PTY pour le préscript ni pour la session, aucun
+    /// fichier écrit, aucun verrou. Seule lecture réelle : `claude mcp list`. Un garde-fou
+    /// qui aurait arrêté un run réel est **annoté** et le plan continue — c'est justement
+    /// quand quelque chose bloque qu'on a besoin de le voir en entier.
+    static func executeReporting(_ schedule: Schedule, trigger: String, dryRun: Bool,
+                                 host: RunnerHost = .live) -> (status: RunStatus, report: String) {
         let runID = UUID()
+        let fm = FileManager.default
         let reporter = Reporter(
             dryRun: dryRun,
             log: dryRun ? nil : RunLog(runID: runID, scheduleID: schedule.id, trigger: trigger))
 
+        /// Fin du run en réel ; simple annotation en dry-run (rend alors `nil`).
+        func halt(_ status: RunStatus, _ message: String,
+                  sessionID: String? = nil) -> (status: RunStatus, report: String)? {
+            if dryRun {
+                reporter.blocker(message)
+                return nil
+            }
+            return reporter.conclude(status, message, schedule: schedule, trigger: trigger,
+                                     sessionID: sessionID)
+        }
+
         reporter.header(schedule: schedule, trigger: trigger, runID: runID)
 
         // ── 1. Ouverture du run ──────────────────────────────────────────────────
-        // Écart assumé au §6.1, qui plaçait `start()` après les deux garde-fous : on
-        // ouvre AVANT, pour que même un run sauté forme une paire start/end complète
-        // dans le JSONL et porte son déclencheur. Un `end` orphelin resterait lisible
-        // (`fold` le gère) mais afficherait un déclencheur inconnu dans l'historique.
+        // AVANT les garde-fous : même un run sauté forme une paire start/end complète dans
+        // le JSONL et porte son déclencheur.
         reporter.start()
 
         // ── 2. Planification désactivée ──────────────────────────────────────────
         // Un plist peut survivre à une désactivation (fichier resté là, job encore
         // chargé). En revanche « Lancer maintenant » sur une planification désactivée
         // est un geste explicite de l'utilisateur : on l'exécute.
-        if !schedule.enabled && trigger != "manual" {
-            if dryRun {
-                reporter.blocker("planification désactivée")
-            } else {
-                return reporter.conclude(.skipped, "planification désactivée",
-                                         schedule: schedule, trigger: trigger)
-            }
+        if !schedule.enabled && trigger != "manual",
+           let done = halt(.skipped, "planification désactivée") {
+            return done
         }
 
         // ── 3. Verrou inter-process ──────────────────────────────────────────────
@@ -125,291 +165,236 @@ enum ScheduleRunner {
             }
         }
 
-        // ── 4. Host service ──────────────────────────────────────────────────────
-        guard SupersetCLI.isInstalled() else {
-            return reporter.conclude(.failed, "Superset introuvable sur ce poste",
-                                     schedule: schedule, trigger: trigger)
+        let folder = schedule.folderPath
+        let environment = ClaudeInvocation.environment(base: ProcessInfo.processInfo.environment)
+        let ttyURL = SchedulePaths.ttyFile(runID: runID)
+
+        // ── 4. Dossier ───────────────────────────────────────────────────────────
+        var isDirectory: ObjCBool = false
+        let folderExists = fm.fileExists(atPath: folder, isDirectory: &isDirectory)
+            && isDirectory.boolValue
+        if !folderExists, let done = halt(.failed, "dossier introuvable : \(folder)") {
+            return done
         }
         if dryRun {
-            let healthy = SupersetCLI.hostStatus()?.healthy == true
-            reporter.note("host service : \(healthy ? "SAIN" : "INJOIGNABLE — un run réel tenterait « open -g -a Superset » puis « superset start --daemon »")")
+            // Indicatif seulement : en réel, c'est la détection du dialogue dans le PTY
+            // qui fait foi (étape 8).
+            let trusted = ClaudeInvocation.isTrusted(
+                folderPath: folder, claudeJSON: try? Data(contentsOf: ClaudeInvocation.claudeJSONURL))
+            reporter.note("dossier : \(folder) — \(folderExists ? "existe" : "INTROUVABLE")")
+            if trusted {
+                reporter.note("approuvé par Claude : oui")
+            } else {
+                reporter.blocker("dossier non approuvé par Claude : ouvrez-le une fois dans Claude Launcher")
+            }
+        }
+
+        // ── 5. Préscript ─────────────────────────────────────────────────────────
+        // Attendu jusqu'au bout ; un code ≠ 0 ou un délai dépassé annule le run AVANT
+        // `claude` — un préscript qui demande un mot de passe ne doit pas laisser partir
+        // une session sur un dossier à moitié préparé.
+        if schedule.preScript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            reporter.note("préscript : aucun")
+        } else if dryRun {
+            reporter.block("préscript (non exécuté, $SHELL -l -i -c dans le dossier)",
+                           schedule.preScript)
         } else {
-            guard SupersetCLI.ensureHostServiceHealthy(timeout: hostServiceTimeout) else {
-                return reporter.conclude(.failed, "host service injoignable",
+            appendBanner("\r\n── préscript ──\r\n", to: ttyURL)
+            let result = PTYProcess.run(PTYRequest(
+                executable: host.shell,
+                arguments: ClaudeInvocation.shellArguments(shell: host.shell,
+                                                           command: schedule.preScript),
+                environment: environment,
+                directory: folder,
+                ttyFile: ttyURL,
+                timeout: host.preScriptTimeout,
+                stopMarker: nil,
+                detectTrustDialog: false,
+                keepOutput: false))
+            switch result.end {
+            case .exited(code: 0):
+                reporter.note("préscript : terminé (code 0)")
+            case .exited(let code):
+                return reporter.conclude(.failed, "préscript en échec (code \(code))",
+                                         schedule: schedule, trigger: trigger)
+            case .timedOut:
+                return reporter.conclude(.failed, "préscript : délai dépassé",
+                                         schedule: schedule, trigger: trigger)
+            case .spawnFailed:
+                return reporter.conclude(.failed, "préscript : lancement impossible",
+                                         schedule: schedule, trigger: trigger)
+            case .stopped, .trustDialog:
+                // Ni marqueur ni détection demandés : impossible, mais pas de `default`
+                // muet pour autant.
+                return reporter.conclude(.failed, "préscript : fin inattendue (\(result.end))",
                                          schedule: schedule, trigger: trigger)
             }
-            reporter.note("host service : sain")
         }
 
-        // ── 5. Résolution de la cible ────────────────────────────────────────────
-        let resolution = resolveTarget(schedule, reporter: reporter, dryRun: dryRun)
-        switch resolution {
-        case .abort(let status, let message):
-            return reporter.conclude(status, message, schedule: schedule, trigger: trigger)
-        case .planned(let message):
-            // Dry-run : la cible n'existe pas encore, donc aucun `workspaceID` à mettre
-            // dans l'argv de `agents create`. On imprime malgré tout le reste du plan —
-            // c'est justement quand quelque chose manque qu'on lit un dry-run.
-            reporter.blocker(message)
-            reporter.prompt(schedule.action.prompt)
+        // ── 6. MCP requis ────────────────────────────────────────────────────────
+        // `claude mcp list` et pas `-p` : en session interactive les MCP de plugin sont
+        // gardés, c'est donc la liste qui reflète ce que la session aura.
+        let required = schedule.requiredMCPServers
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if required.isEmpty {
+            reporter.note("MCP requis : aucun")
+        } else if !folderExists {
+            reporter.note("claude mcp list : non exécuté (dossier introuvable)")
+        } else {
+            // ⚠️ stdout de `claude` sur un TUBE (`| cat`), pas sur le PTY. Mesuré le
+            // 2026-10-30 (`claude` 2.1.314) : face à un terminal, `mcp list` remplace les
+            // espaces par des déplacements de curseur (`ESC [ n G`), coupe les lignes à la
+            // largeur de la grille et réécrit ses premières lignes — illisible pour
+            // `MCPList.parse`. Sur un tube il imprime des lignes simples. Le shell de login
+            // et l'environnement restent ceux de la session ; `pipefail` garde le code de
+            // sortie de `claude` et non celui de `cat`.
+            let command = "set -o pipefail; "
+                + ClaudeInvocation.shellQuote(host.claudeCommand) + " mcp list | cat"
+            let result = PTYProcess.run(PTYRequest(
+                executable: host.shell,
+                arguments: ClaudeInvocation.shellArguments(shell: host.shell, command: command),
+                environment: environment,
+                directory: folder,
+                ttyFile: nil,
+                timeout: host.mcpListTimeout,
+                stopMarker: nil,
+                detectTrustDialog: false,
+                keepOutput: true))
+            let states = MCPList.parse(String(decoding: result.output, as: UTF8.self))
+            var problem: String?
+            switch result.end {
+            case .timedOut:
+                problem = "claude mcp list : délai dépassé"
+            case .spawnFailed:
+                problem = "claude mcp list : lancement impossible"
+            case .exited(let code) where code != 0 && states.isEmpty:
+                problem = "claude mcp list en échec (code \(code))"
+            default:
+                reporter.note("claude mcp list : \(states.count) serveur(s) lu(s)")
+                let missing = MCPList.unavailable(required: required, in: states)
+                if missing.isEmpty {
+                    reporter.note("MCP requis connectés : \(required.joined(separator: ", "))")
+                } else {
+                    problem = "MCP requis indisponibles : " + missing.joined(separator: ", ")
+                }
+            }
+            if let problem, let done = halt(.failed, problem) { return done }
+        }
+
+        // ── 7. Settings du run ───────────────────────────────────────────────────
+        // Ceux de la planification (facultatifs), plus le hook `Stop` qui pose le
+        // marqueur : c'est lui qui dit « la réponse est finie », pas un délai.
+        let settingsURL = SchedulePaths.runSettingsFile(runID: runID)
+        let stopURL = SchedulePaths.stopMarker(runID: runID)
+        var settingsReady = true
+        var userSettings: Data?
+        if let path = schedule.action.settingsPath {
+            userSettings = try? Data(contentsOf: URL(fileURLWithPath: path))
+            if userSettings == nil {
+                settingsReady = false
+                if let done = halt(.failed, "fichier de settings illisible : \(path)") { return done }
+            }
+        }
+        if settingsReady {
+            do {
+                let data = try ClaudeInvocation.runSettings(userSettings: userSettings,
+                                                            stopMarker: stopURL)
+                if !dryRun {
+                    SchedulePaths.ensureDirectories()
+                    do {
+                        try data.write(to: settingsURL)
+                    } catch {
+                        return reporter.conclude(
+                            .failed, "settings du run impossibles à écrire : \(error.localizedDescription)",
+                            schedule: schedule, trigger: trigger)
+                    }
+                }
+                reporter.note("settings du run : \(settingsURL.path)")
+            } catch {
+                if let done = halt(.failed, "fichier de settings illisible : "
+                                   + (schedule.action.settingsPath ?? "?")) {
+                    return done
+                }
+            }
+        }
+
+        // ── 8. Session claude ────────────────────────────────────────────────────
+        // Un `sessionID` neuf par run, toujours en minuscules : dans l'argv, dans la ligne
+        // `end`, et pour retrouver la conversation (`claude --resume`).
+        let sessionUUID = UUID()
+        let sessionID = sessionUUID.uuidString.lowercased()
+        let model = schedule.action.model?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let claudeArguments = ClaudeInvocation.claudeArguments(
+            prompt: schedule.action.prompt,
+            sessionID: sessionUUID,
+            settingsFile: settingsURL,
+            model: model?.isEmpty == false ? model : nil,
+            effort: schedule.action.effort)
+        let argv = ClaudeInvocation.claudeShellArguments(
+            shell: host.shell, claudeCommand: host.claudeCommand, claudeArguments: claudeArguments)
+        reporter.argv(dryRun ? "argv de la session (sessionID d'exemple)" : "argv de la session", argv)
+
+        if dryRun {
+            reporter.block("prompt intégral", schedule.action.prompt)
             reporter.plist(schedule)
-            return reporter.conclude(.skipped, message, schedule: schedule, trigger: trigger)
-        case .resolved(let workspaceID, let worktree):
-            reporter.note("workspace : \(workspaceID)")
-            reporter.note("worktree  : \(worktree.path)")
-
-            // ── 6. Garde worktree ────────────────────────────────────────────────
-            var isDirectory: ObjCBool = false
-            let worktreeExists = FileManager.default
-                .fileExists(atPath: worktree.path, isDirectory: &isDirectory) && isDirectory.boolValue
-            if !worktreeExists {
-                if dryRun {
-                    reporter.blocker("worktree absent : \(worktree.path)")
-                } else {
-                    return reporter.conclude(
-                        .failed, "worktree absent : \(worktree.path)",
-                        schedule: schedule, trigger: trigger,
-                        workspaceID: workspaceID)
-                }
-            }
-
-            // ── 7. Garde « agent encore vif » ────────────────────────────────────
-            // Seulement sur un workspace permanent : un workspace neuf ne peut pas
-            // héberger d'agent d'un run précédent. Deux agents dans le même worktree
-            // s'écrasent l'un l'autre.
-            if case .permanentWorkspace = schedule.target, worktreeExists {
-                if AgentPresence.isAlive(in: worktree) {
-                    if dryRun {
-                        // §8.1 : « agent encore vif ? OUI → un run réel sauterait ». On
-                        // l'annonce et on continue d'imprimer le plan.
-                        reporter.blocker("un agent claude vit encore dans le worktree")
-                    } else {
-                        return reporter.conclude(
-                            .skipped, "un agent claude vit encore dans le worktree",
-                            schedule: schedule, trigger: trigger,
-                            workspaceID: workspaceID, worktreePath: worktree.path)
-                    }
-                } else {
-                    reporter.note("garde agent vif : aucun agent dans ce worktree")
-                }
-            }
-
-            // ── 8. Rafraîchissement — par le RUNNER, jamais par l'agent ──────────
-            if case .permanentWorkspace(_, _, _, _, let baseBranch, let refresh) = schedule.target,
-               refresh {
-                guard let baseBranch, !baseBranch.isEmpty else {
-                    return reporter.conclude(
-                        .failed, "rafraîchissement demandé sans branche de base",
-                        schedule: schedule, trigger: trigger,
-                        workspaceID: workspaceID, worktreePath: worktree.path)
-                }
-                if dryRun {
-                    reporter.note("rafraîchissement : git fetch origin --prune "
-                                  + "puis git reset --hard origin/\(baseBranch) (non exécuté)")
-                } else {
-                    let fetch = Git.run(["fetch", "origin", "--prune"], in: worktree)
-                    guard fetch.ok else {
-                        return reporter.conclude(
-                            .failed, "git fetch a échoué : \(fetch.message)",
-                            schedule: schedule, trigger: trigger,
-                            workspaceID: workspaceID, worktreePath: worktree.path)
-                    }
-                    // Pas de `git clean` : bien trop risqué sur un worktree permanent,
-                    // où l'utilisateur peut avoir laissé des fichiers non suivis.
-                    let reset = Git.run(["reset", "--hard", "origin/\(baseBranch)"], in: worktree)
-                    guard reset.ok else {
-                        return reporter.conclude(
-                            .failed, "git reset --hard a échoué : \(reset.message)",
-                            schedule: schedule, trigger: trigger,
-                            workspaceID: workspaceID, worktreePath: worktree.path)
-                    }
-                    reporter.note("worktree remis à plat sur origin/\(baseBranch)")
-                }
-            }
-
-            // ── 9. Lancement de l'agent ──────────────────────────────────────────
-            let argv = SupersetCLI.createAgentArguments(
-                workspaceID: workspaceID,
-                agent: schedule.action.agentRef,
-                effort: schedule.action.effort,
-                prompt: schedule.action.prompt)
-            reporter.argv("superset agents create", argv)
-
-            if dryRun {
-                reporter.prompt(schedule.action.prompt)
-                reporter.plist(schedule)
-                // Le verdict reflète ce qu'un run RÉEL aurait fait : s'il se serait
-                // arrêté à un garde-fou, on le dit — sinon le dry-run laisserait croire
-                // que tout est prêt alors que rien ne partirait.
-                return reporter.conclude(
-                    .skipped,
-                    reporter.blockers.isEmpty
-                        ? "dry-run : aucun agent lancé, mais un run réel irait au bout"
-                        : "dry-run : un run réel s'arrêterait — "
-                          + reporter.blockers.joined(separator: " ; "),
-                    schedule: schedule, trigger: trigger,
-                    workspaceID: workspaceID, worktreePath: worktree.path)
-            }
-
-            let created = SupersetCLI.createAgent(
-                workspaceID: workspaceID,
-                agent: schedule.action.agentRef,
-                effort: schedule.action.effort,
-                prompt: schedule.action.prompt)
-            reporter.note("sortie de agents create : \(created.message)")
-
-            guard created.ok else {
-                return reporter.conclude(
-                    .failed, "agents create a échoué (\(created.code)) : \(created.message)",
-                    schedule: schedule, trigger: trigger,
-                    workspaceID: workspaceID, worktreePath: worktree.path)
-            }
-
-            // ── 10. Succès : l'agent est LANCÉ, rien de plus n'est promis ────────
+            // Le verdict reflète ce qu'un run RÉEL aurait fait : s'il se serait arrêté à
+            // un garde-fou, on le dit — sinon le dry-run laisserait croire que tout est
+            // prêt alors que rien ne partirait.
             return reporter.conclude(
-                .launched, "agent \(schedule.action.agentRef) lancé",
-                schedule: schedule, trigger: trigger,
-                workspaceID: workspaceID, worktreePath: worktree.path)
+                .skipped,
+                reporter.blockers.isEmpty
+                    ? "dry-run : rien n'a été lancé, mais un run réel irait au bout"
+                    : "dry-run : un run réel s'arrêterait — "
+                      + reporter.blockers.joined(separator: " ; "),
+                schedule: schedule, trigger: trigger)
         }
+
+        appendBanner("\r\n── claude ──\r\n", to: ttyURL)
+        let timeout = host.sessionTimeoutOverride ?? TimeInterval(schedule.timeoutMinutes * 60)
+        reporter.note("session \(sessionID) : délai \(Int(timeout)) s")
+        let session = PTYProcess.run(PTYRequest(
+            executable: host.shell,
+            arguments: argv,
+            environment: environment,
+            directory: folder,
+            ttyFile: ttyURL,
+            timeout: timeout,
+            stopMarker: stopURL,
+            detectTrustDialog: true,
+            keepOutput: false))
+
+        let status: RunStatus
+        let message: String
+        switch session.end {
+        case .stopped:
+            status = .completed
+            message = "session terminée"
+        case .exited(let code):
+            status = .failed
+            message = "claude s'est arrêté avant la fin de sa réponse (code \(code))"
+        case .timedOut:
+            status = .timedOut
+            message = "délai de \(schedule.timeoutMinutes) min dépassé"
+        case .trustDialog:
+            status = .failed
+            message = "dossier non approuvé par Claude : ouvrez-le une fois dans Claude Launcher"
+        case .spawnFailed:
+            status = .failed
+            message = "lancement impossible"
+        }
+        return reporter.conclude(status, message, schedule: schedule, trigger: trigger,
+                                 sessionID: sessionID)
     }
 
-    // MARK: - Résolution de la cible
-
-    private enum Resolution {
-        case resolved(workspaceID: String, worktree: URL)
-        /// Dry-run : ce qui serait fait, sans le faire.
-        case planned(String)
-        case abort(RunStatus, String)
-    }
-
-    private static func resolveTarget(_ schedule: Schedule, reporter: Reporter,
-                                      dryRun: Bool) -> Resolution {
-        // ⚠️ `nil` = liste ILLISIBLE, ce qui n'est PAS une liste vide. Sur une liste
-        // illisible on abandonne : créer à l'aveugle dupliquerait le workspace permanent.
-        // Leçon payée en production, pas précaution théorique.
-        guard let workspaces = SupersetCLI.workspaces() else {
-            return .abort(.failed,
-                          "liste des workspaces illisible — abandon (créer à l'aveugle "
-                          + "dupliquerait le workspace permanent)")
-        }
-        reporter.note("workspaces lus : \(workspaces.count)")
-
-        switch schedule.target {
-
-        case .permanentWorkspace(let projectID, _, let workspaceName, let branch,
-                                 let baseBranch, _):
-            // ⭐ Matching sur (projectId, name), JAMAIS sur le nom seul : plusieurs
-            // projets peuvent héberger un workspace homonyme — c'est le cas sur ce poste
-            // avec « Sentry report », un par projet suivi.
-            // ⚠️ Le nom n'est PAS unique, même dans un projet : Superset accepte deux
-            // workspaces homonymes (vérifié en production). En choisir un « au hasard »
-            // ferait travailler l'agent dans un worktree que l'utilisateur ne regarde
-            // pas. On préfère abandonner en le disant.
-            let matches = workspaces.filter {
-                $0.projectId == projectID && $0.name == workspaceName
-            }
-            if matches.count > 1 {
-                return .abort(.failed,
-                              "\(matches.count) workspaces s'appellent « \(workspaceName) » "
-                              + "dans ce projet : cible ambiguë, renommez-en un")
-            }
-            if let found = matches.first {
-                guard let path = found.worktreePath, !path.isEmpty else {
-                    return .abort(.failed, "le workspace « \(workspaceName) » n'a pas de worktree")
-                }
-                return .resolved(workspaceID: found.id, worktree: URL(fileURLWithPath: path))
-            }
-
-            let argv = SupersetCLI.createWorkspaceArguments(
-                projectID: projectID, name: workspaceName, branch: branch,
-                baseBranch: baseBranch, agent: nil, prompt: nil)
-            reporter.argv("superset workspaces create", argv)
-
-            if dryRun {
-                return .planned("workspace « \(workspaceName) » absent → serait créé")
-            }
-            let created = SupersetCLI.createWorkspace(
-                projectID: projectID, name: workspaceName, branch: branch,
-                baseBranch: baseBranch, agent: nil, prompt: nil)
-            guard created.ok else {
-                return .abort(.failed, "création du workspace échouée : \(created.message)")
-            }
-            return relist(projectID: projectID, name: workspaceName,
-                          knownBefore: Set(workspaces.map(\.id)), reporter: reporter)
-
-        case .freshWorkspace(let projectID, _, let namePrefix, let branchPrefix, let baseBranch):
-            // Plafond : on ne supprime JAMAIS automatiquement — détruire un workspace où
-            // un agent travaille encore serait destructif. On refuse d'en créer un de plus.
-            let prefix = Target.freshWorkspaceNamePrefix(namePrefix)
-            let existing = workspaces.filter {
-                $0.projectId == projectID && $0.name.hasPrefix(prefix)
-            }.count
-            reporter.note("workspaces « \(namePrefix) … » déjà présents : \(existing)"
-                          + " (plafond \(Target.freshWorkspaceCap))")
-            guard existing < Target.freshWorkspaceCap else {
-                return .abort(.skipped,
-                              "trop de workspaces accumulés (\(existing) ≥ "
-                              + "\(Target.freshWorkspaceCap)), faites le ménage")
-            }
-
-            let now = Date()
-            let name = Target.freshWorkspaceName(prefix: namePrefix, date: now)
-            let branch = Target.freshWorkspaceBranch(
-                prefix: branchPrefix.isEmpty ? namePrefix : branchPrefix, date: now)
-            // `workspaces create` sait poser `--agent` et `--prompt` d'un coup, mais on ne
-            // s'en sert pas : ça sauterait les gardes 6 à 8. Un seul chemin de lancement,
-            // c'est un seul endroit où les garde-fous s'appliquent.
-            let argv = SupersetCLI.createWorkspaceArguments(
-                projectID: projectID, name: name, branch: branch,
-                baseBranch: baseBranch, agent: nil, prompt: nil)
-            reporter.argv("superset workspaces create", argv)
-
-            if dryRun {
-                return .planned("workspace « \(name) » serait créé (branche « \(branch) »)")
-            }
-            let created = SupersetCLI.createWorkspace(
-                projectID: projectID, name: name, branch: branch,
-                baseBranch: baseBranch, agent: nil, prompt: nil)
-            guard created.ok else {
-                return .abort(.failed, "création du workspace échouée : \(created.message)")
-            }
-            return relist(projectID: projectID, name: name,
-                          knownBefore: Set(workspaces.map(\.id)), reporter: reporter)
-        }
-    }
-
-    /// ⚠️ **On ne parse jamais la sortie de `create`** : sa forme JSON n'est pas un
-    /// contrat public. On relit la liste, qui en est un — une seule forme de données à
-    /// connaître, et c'est celle qu'on sait déjà décoder.
-    private static func relist(projectID: String, name: String,
-                               knownBefore: Set<String>,
-                               reporter: Reporter) -> Resolution {
-        guard let workspaces = SupersetCLI.workspaces() else {
-            return .abort(.failed, "workspace créé mais liste illisible ensuite")
-        }
-        let candidates = workspaces.filter { $0.projectId == projectID && $0.name == name }
-
-        // ⭐ On identifie le workspace qu'on VIENT de créer par **différence
-        // d'identifiants**, jamais par son nom. Superset accepte deux workspaces
-        // homonymes dans un même projet : chercher par nom après un `create` peut rendre
-        // un workspace PRÉEXISTANT, et l'agent partirait alors dans le worktree de
-        // quelqu'un d'autre pendant que celui qu'on vient de créer reste vide. C'est
-        // exactement ce qui s'est produit en recette.
-        let created = candidates.filter { !knownBefore.contains($0.id) }
-        guard let found = created.first ?? (candidates.count == 1 ? candidates.first : nil) else {
-            return .abort(.failed, candidates.isEmpty
-                ? "workspace créé mais introuvable à la relecture"
-                : "workspace créé mais impossible de distinguer le nouveau parmi "
-                  + "\(candidates.count) homonymes")
-        }
-        if created.count > 1 {
-            reporter.note("⚠︎ \(created.count) workspaces créés portent ce nom — le premier est retenu")
-        }
-        guard let path = found.worktreePath, !path.isEmpty else {
-            return .abort(.failed, "workspace créé mais sans worktree")
-        }
-        reporter.note("workspace créé puis relu : \(found.id)")
-        return .resolved(workspaceID: found.id, worktree: URL(fileURLWithPath: path))
+    /// Bandeau de séparation dans le `.tty` : il est rejoué tel quel par la GUI.
+    private static func appendBanner(_ text: String, to url: URL) {
+        SchedulePaths.ensureDirectories()
+        let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT, 0o600)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+        let bytes = Array(text.utf8)
+        _ = write(fd, bytes, bytes.count)
     }
 
     // MARK: - Verrou
@@ -421,7 +406,7 @@ enum ScheduleRunner {
     }
 
     /// Interne (et non `private`) pour que l'auto-test puisse prouver l'exclusion, qui est
-    /// la seule chose empêchant deux agents de partir dans le même worktree.
+    /// la seule chose empêchant deux sessions de partir dans le même dossier.
     static func acquireLock(_ scheduleID: UUID) -> LockOutcome {
         SchedulePaths.ensureDirectories()
         let url = SchedulePaths.lockFile(scheduleID: scheduleID)
@@ -440,12 +425,9 @@ enum ScheduleRunner {
 
     // MARK: - Notification (§6.7)
 
-    /// Bannière système sur `failed`/`skipped`, et **uniquement** pour un tir launchd —
-    /// « Lancer maintenant » n'a rien à notifier, l'utilisateur regarde déjà l'écran.
-    ///
-    /// La remise est déléguée à `ScheduleNotifier`, qui poste sous l'identité de l'app.
-    /// L'implémentation précédente passait par `osascript` : elle sortait en 0 sans jamais
-    /// rien délivrer (§ commentaire de `ScheduleNotifier`).
+    /// Bannière système sur `failed`/`skipped`/`timedOut`, et **uniquement** pour un tir
+    /// launchd — « Lancer maintenant » n'a rien à notifier, l'utilisateur regarde déjà
+    /// l'écran.
     ///
     /// ⚠️ Appelée **après** l'écriture de la ligne `end` du JSONL, jamais avant : un canal
     /// de notification défaillant ne doit pas coûter la trace du run.
@@ -460,11 +442,14 @@ enum ScheduleRunner {
                        message: String, trigger: String) -> String? {
         guard shouldNotify(status: status, trigger: trigger) else { return nil }
 
-        // Le titre distingue les deux cas : un garde-fou qui joue n'est pas une panne, et
-        // les confondre dans la bannière revient à crier au loup jusqu'à ne plus regarder.
-        let title = status == .failed
-            ? "Superset Scheduler — échec"
-            : "Superset Scheduler — run sauté"
+        // Le titre distingue les cas : un garde-fou qui joue n'est pas une panne, et les
+        // confondre dans la bannière revient à crier au loup jusqu'à ne plus regarder.
+        let title: String
+        switch status {
+        case .skipped:  title = "Claude Scheduler — run sauté"
+        case .timedOut: title = "Claude Scheduler — délai dépassé"
+        default:        title = "Claude Scheduler — échec"
+        }
         return ScheduleNotifier.post(title: title, subtitle: scheduleName, body: message)
     }
 
@@ -483,6 +468,7 @@ enum ScheduleRunner {
         }
 
         func header(schedule: Schedule, trigger: String, runID: UUID) {
+            let action = schedule.action
             lines.append("╭─ \(dryRun ? "DRY-RUN — aucun effet de bord" : "RUN") "
                          + "─────────────────────────────")
             lines.append("│  planification   \(schedule.name)")
@@ -490,8 +476,16 @@ enum ScheduleRunner {
             lines.append("│  déclencheur     \(trigger)")
             lines.append("│  run             \(runID.uuidString)")
             lines.append("│  cadence         \(LaunchAgentPlist.humanDescription(schedule.recurrence))")
-            lines.append("│  agent           \(schedule.action.agentRef)"
-                         + (schedule.action.effort.map { " · effort \($0)" } ?? ""))
+            lines.append("│  dossier         \(schedule.folderPath)")
+            lines.append("│  claude          modèle \(action.model ?? "par défaut")"
+                         + " · effort \(action.effort ?? "par défaut")"
+                         + " · délai \(schedule.timeoutMinutes) min")
+            if let settingsPath = action.settingsPath {
+                lines.append("│  settings        \(settingsPath)")
+            }
+            if !schedule.requiredMCPServers.isEmpty {
+                lines.append("│  MCP requis      \(schedule.requiredMCPServers.joined(separator: ", "))")
+            }
         }
 
         func start() { log?.start() }
@@ -513,16 +507,18 @@ enum ScheduleRunner {
         func argv(_ title: String, _ arguments: [String]) {
             lines.append("│")
             lines.append("│  \(title) — argv exact :")
-            lines.append("│     [--] \(SchedulePaths.supersetExecutablePath ?? "(superset introuvable)")")
             for (index, argument) in arguments.enumerated() {
-                lines.append(String(format: "│     [%02d] %@", index, argument))
+                // Un argument multiligne (le prompt) reste lisible ligne à ligne.
+                let shown = argument.replacingOccurrences(of: "\n", with: "\n│          ")
+                lines.append(String(format: "│     [%02d] ", index) + shown)
             }
             log?.note("\(title) : \(arguments.count) argument(s)")
         }
 
-        func prompt(_ text: String) {
+        /// Texte multiligne encadré (préscript, prompt).
+        func block(_ title: String, _ text: String) {
             lines.append("│")
-            lines.append("│  prompt intégral :")
+            lines.append("│  \(title) :")
             for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
                 lines.append("│    \(line)")
             }
@@ -544,14 +540,11 @@ enum ScheduleRunner {
 
         func conclude(_ status: RunStatus, _ message: String,
                       schedule: Schedule, trigger: String,
-                      workspaceID: String? = nil,
-                      worktreePath: String? = nil) -> (status: RunStatus, report: String) {
-            log?.finish(status: status, message: message,
-                        workspaceID: workspaceID, worktreePath: worktreePath)
+                      sessionID: String? = nil) -> (status: RunStatus, report: String) {
+            log?.finish(status: status, message: message, sessionID: sessionID)
             if !dryRun {
-                // Le sort de la bannière est TRACÉ dans le journal du run. C'est ce qui
-                // manquait : l'ancienne implémentation ne pouvait pas dire qu'elle n'avait
-                // rien délivré, donc l'absence de notification restait inexplicable.
+                // Le sort de la bannière est TRACÉ dans le journal du run : c'est le seul
+                // moyen de savoir, après coup, pourquoi une notification n'est pas arrivée.
                 if let outcome = ScheduleRunner.notify(
                     status: status, scheduleName: schedule.name,
                     message: message, trigger: trigger) {

@@ -29,8 +29,8 @@ enum ToolRegistry {
         ),
         Tool(
             id: SchedulerView.toolID,
-            title: "Superset Scheduler",
-            subtitle: "Lancer des agents à heure fixe",
+            title: "Claude Scheduler",
+            subtitle: "Lance claude à heure fixe dans un dossier",
             icon: "calendar.badge.clock",
             view: { SchedulerView() }
         )

@@ -1,17 +1,17 @@
 import SwiftUI
 
-/// Historique des runs d'une planification — **lot L4**.
+/// Historique des runs d'une planification.
 ///
 /// Alimenté par `ScheduleStore.runs`, lui-même reconstruit à chaque écriture du JSONL par
 /// le tail (`DispatchSource` vnode). Un run déclenché par **launchd**, dans un autre
 /// process, apparaît donc ici sans que l'app ait rien à demander.
 ///
 /// ⚠️ Deux règles d'affichage qui ne sont pas cosmétiques :
-/// - `launched` s'écrit « agent lancé », **jamais** « réussi ». Le runner rend la main dès
-///   que `superset agents create` sort en 0 ; ce que l'agent a produit ensuite, personne
-///   ici ne le sait. Un historique tout vert ne prouve que la mise à feu.
-/// - `skipped` est **orange**, pas rouge : c'est un garde-fou qui a joué (agent encore
-///   vif, run déjà en cours, planification désactivée), pas une panne.
+/// - `completed` s'écrit « terminé », **jamais** « réussi ». La session a rendu la main
+///   (hook `Stop` puis `/exit`) ; ce qu'elle a produit, le runner ne le juge pas. Un
+///   historique tout vert ne prouve que des sessions menées à leur terme.
+/// - `skipped` est **orange**, pas rouge : c'est un garde-fou qui a joué (run déjà en
+///   cours, planification désactivée), pas une panne.
 struct ScheduleRunHistoryView: View {
 
     let scheduleID: UUID

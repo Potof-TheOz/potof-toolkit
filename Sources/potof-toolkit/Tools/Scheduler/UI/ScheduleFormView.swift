@@ -1,25 +1,22 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
 
-/// Formulaire de création / édition — **lot L4bis**.
+/// Formulaire de création / édition d'une planification.
 ///
 /// **Présenté en place au centre, PAS en `.sheet`** : le dépôt n'a aucune `.sheet`, refus
 /// documenté dans `RebasePanelView`.
 ///
 /// ## La règle qui gouverne tout ce fichier
-/// **Aucune indisponibilité de Superset ne doit empêcher d'enregistrer.** Le host service
-/// peut être éteint alors que la planification est parfaitement valide — et elle sera
-/// exécutée dans six heures, quand il aura redémarré. Toute information venue de la CLI
-/// est donc un **confort** (liste d'agents, liste de projets), jamais une condition :
-/// `validate()` ne regarde que des données locales, et le sélecteur d'agent retombe en
-/// saisie libre quand la liste est illisible.
+/// `validate()` ne regarde que des données locales (le dossier et le fichier de settings
+/// existent-ils ?). Ce que `claude` pense du dossier — l'a-t-il déjà approuvé ? — est un
+/// **avertissement non bloquant** : le fichier `~/.claude.json` peut être en retard sur
+/// l'état réel, et le runner détecte de toute façon le dialogue de confiance.
 ///
 /// ## Sections repliables, et pourquoi
-/// Cinq volets — Identité, Agent, Cadence, Cible, Prompt — chacun repliable et **montrant
-/// son résumé une fois fermé**. En déroulé complet, le formulaire faisait cohabiter trois
-/// conventions d'étiquetage (titre au-dessus ici, gouttière à gauche dans `TargetPicker`,
-/// phrases inline dans `RecurrencePicker`) : l'œil ne retrouvait jamais le même point de
-/// départ. Replié, chaque volet se lit d'une ligne et l'inspection d'ensemble redevient
-/// possible sans dérouler deux écrans.
+/// Six volets — Identité, Dossier, Préscript, Claude, Cadence, Prompt — chacun repliable
+/// et **montrant son résumé une fois fermé**. Replié, chaque volet se lit d'une ligne et
+/// l'inspection d'ensemble reste possible sans dérouler deux écrans.
 ///
 /// ⚠️ **Deux règles qui font que le pliage ne cache rien :**
 /// 1. En **création**, tout est déplié — replier des champs obligatoires encore vides
@@ -42,11 +39,16 @@ struct ScheduleFormView: View {
 
         let seed = draft ?? Self.blank()
         _name = State(initialValue: seed.name)
-        _prompt = State(initialValue: seed.action.prompt)
-        _agentRef = State(initialValue: seed.action.agentRef)
+        _enabled = State(initialValue: seed.enabled)
+        _folderPath = State(initialValue: seed.folderPath)
+        _preScript = State(initialValue: seed.preScript)
+        _model = State(initialValue: seed.action.model ?? "")
         _effort = State(initialValue: seed.action.effort ?? "")
+        _settingsPath = State(initialValue: seed.action.settingsPath ?? "")
+        _mcpText = State(initialValue: seed.requiredMCPServers.joined(separator: "\n"))
+        _timeoutMinutes = State(initialValue: seed.timeoutMinutes)
         _recurrence = State(initialValue: seed.recurrence)
-        _target = State(initialValue: seed.target)
+        _prompt = State(initialValue: seed.action.prompt)
         // Création : tout ouvert (cf. règle 1 de l'en-tête). Modification : on n'ouvre que
         // l'identité et le prompt, le reste se relit dans les résumés.
         _expanded = State(initialValue: draft == nil
@@ -57,14 +59,20 @@ struct ScheduleFormView: View {
     @ObservedObject private var store = ScheduleStore.shared
 
     @State private var name: String
-    @State private var prompt: String
-    @State private var agentRef: String
+    @State private var enabled: Bool
+    @State private var folderPath: String
+    @State private var preScript: String
+    @State private var model: String
     @State private var effort: String
+    @State private var settingsPath: String
+    /// Un MCP par ligne.
+    @State private var mcpText: String
+    @State private var timeoutMinutes: Int
     @State private var recurrence: Recurrence
-    @State private var target: Target
+    @State private var prompt: String
 
-    @State private var agents: [SupersetAgentConfig] = []
-    @State private var agentsUnavailable = false
+    /// `nil` tant que `~/.claude.json` n'a pas été relu pour le dossier courant.
+    @State private var trusted: Bool?
     @State private var showErrors = false
     @State private var expanded: Set<FormSection>
 
@@ -72,59 +80,70 @@ struct ScheduleFormView: View {
     /// la volée en aurait produit un différent à chaque lecture, et `report` en fait deux.
     @State private var newID = UUID()
 
-    /// Les cinq volets, dans l'ordre d'affichage.
+    /// Les six volets, dans l'ordre d'affichage.
     private enum FormSection: String, CaseIterable, Hashable {
-        case identity, agent, recurrence, target, prompt
+        case identity, folder, preScript, claude, recurrence, prompt
 
         var title: String {
             switch self {
             case .identity:   return "Identité"
-            case .agent:      return "Agent"
+            case .folder:     return "Dossier"
+            case .preScript:  return "Préscript"
+            case .claude:     return "Claude"
             case .recurrence: return "Cadence"
-            case .target:     return "Cible"
             case .prompt:     return "Prompt"
             }
         }
     }
 
-    /// `nil` = « laisser l'agent décider », ce que la CLI documente comme le défaut.
-    private static let efforts = ["", "low", "medium", "high", "xhigh"]
-
     private static func blank() -> Schedule {
         Schedule(
             name: "",
-            action: .supersetAgent(agentRef: Action.defaultAgentRef, effort: nil, prompt: ""),
-            recurrence: .daily(hour: 9, minute: 0),
-            target: .permanentWorkspace(projectID: "", projectName: "", workspaceName: "",
-                                        branch: "", baseBranch: "main", refreshWorktree: true))
+            folderPath: "",
+            action: .claude(prompt: "", model: nil, effort: nil, settingsPath: nil),
+            recurrence: .daily(hour: 9, minute: 0))
     }
 
-    /// Le préfixe de nom laissé vide reprend le **nom de la planification**, et il est
-    /// matérialisé ici plutôt que déduit au lancement : un préfixe implicite qui changerait
-    /// le jour où l'on renomme la planification ferait perdre au plafond le compte des
-    /// workspaces déjà créés.
-    private var normalizedTarget: Target {
-        guard case .freshWorkspace(let projectID, let projectName, let namePrefix,
-                                   let branchPrefix, let baseBranch) = target,
-              namePrefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else { return target }
-        return .freshWorkspace(
-            projectID: projectID, projectName: projectName,
-            namePrefix: name.trimmingCharacters(in: .whitespacesAndNewlines),
-            branchPrefix: branchPrefix, baseBranch: baseBranch)
+    private static func trimmed(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Un champ vide vaut « non renseigné » : `nil` dans le modèle.
+    private static func optional(_ value: String) -> String? {
+        let value = trimmed(value)
+        return value.isEmpty ? nil : value
+    }
+
+    /// Les lignes vides sont ignorées ; une ligne faite d'espaces reste, pour que la
+    /// validation la signale au lieu de la jeter en silence.
+    private var mcpServers: [String] {
+        mcpText.components(separatedBy: .newlines)
+            .filter { !$0.isEmpty }
+            .map { $0.trimmingCharacters(in: .whitespaces).isEmpty ? $0 : Self.trimmed($0) }
+    }
+
+    private var normalizedFolder: String {
+        let path = Self.trimmed(folderPath)
+        return path.hasPrefix("~") ? (path as NSString).expandingTildeInPath : path
     }
 
     private var candidate: Schedule {
         Schedule(
             id: draft?.id ?? newID,
-            name: name.trimmingCharacters(in: .whitespacesAndNewlines),
-            enabled: draft?.enabled ?? true,
-            action: .supersetAgent(
-                agentRef: agentRef,
-                effort: effort.isEmpty ? nil : effort,
-                prompt: prompt),
+            name: Self.trimmed(name),
+            enabled: enabled,
+            folderPath: normalizedFolder,
+            preScript: Self.trimmed(preScript).isEmpty ? "" : preScript,
+            action: .claude(
+                prompt: prompt,
+                model: Self.optional(model),
+                effort: Self.optional(effort),
+                settingsPath: Self.optional(settingsPath).map {
+                    $0.hasPrefix("~") ? ($0 as NSString).expandingTildeInPath : $0
+                }),
             recurrence: recurrence,
-            target: normalizedTarget,
+            timeoutMinutes: timeoutMinutes,
+            requiredMCPServers: mcpServers,
             createdAt: draft?.createdAt ?? Date(),
             updatedAt: Date())
     }
@@ -141,41 +160,45 @@ struct ScheduleFormView: View {
     private func invalidSections(_ report: Schedule.ValidationReport) -> Set<FormSection> {
         var result: Set<FormSection> = []
         if !report.identity.isEmpty   { result.insert(.identity) }
-        if !report.agent.isEmpty      { result.insert(.agent) }
-        if !report.prompt.isEmpty     { result.insert(.prompt) }
+        if !report.folder.isEmpty     { result.insert(.folder) }
+        if !report.claude.isEmpty     { result.insert(.claude) }
         if !report.recurrence.isEmpty { result.insert(.recurrence) }
-        if !report.target.isEmpty     { result.insert(.target) }
+        if !report.prompt.isEmpty     { result.insert(.prompt) }
         return result
     }
 
     // MARK: - Résumés des volets repliés
 
-    private var identitySummary: String {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? "sans nom" : trimmed
-    }
-
-    private var agentSummary: String {
-        let display = agents.first { $0.id == agentRef }?.displayName
-            ?? (agentRef.isEmpty ? "aucun agent" : agentRef)
-        return effort.isEmpty ? "\(display) · effort par défaut" : "\(display) · effort \(effort)"
-    }
-
-    private var promptSummary: String {
-        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "vide" }
-        let firstLine = trimmed.split(separator: "\n", maxSplits: 1,
-                                      omittingEmptySubsequences: false).first ?? ""
-        return "\(trimmed.count) caractères — \(firstLine)"
-    }
-
     private func summary(_ section: FormSection) -> String {
         switch section {
-        case .identity:   return identitySummary
-        case .agent:      return agentSummary
-        case .recurrence: return LaunchAgentPlist.humanDescription(recurrence)
-        case .target:     return normalizedTarget.summary
-        case .prompt:     return promptSummary
+        case .identity:
+            let trimmed = Self.trimmed(name)
+            return (trimmed.isEmpty ? "sans nom" : trimmed) + (enabled ? "" : " · désactivée")
+        case .folder:
+            let path = normalizedFolder
+            guard !path.isEmpty else { return "aucun dossier" }
+            return (path as NSString).abbreviatingWithTildeInPath
+                + (trusted == false ? " · non approuvé par Claude" : "")
+        case .preScript:
+            let trimmed = Self.trimmed(preScript)
+            guard !trimmed.isEmpty else { return "aucun" }
+            let lines = trimmed.split(separator: "\n", omittingEmptySubsequences: true)
+            return "\(lines.count) ligne(s) — \(lines.first ?? "")"
+        case .claude:
+            var parts = ["modèle \(Self.optional(model) ?? "par défaut")",
+                         "effort \(Self.optional(effort) ?? "par défaut")",
+                         "\(timeoutMinutes) min"]
+            if Self.optional(settingsPath) != nil { parts.append("settings") }
+            if !mcpServers.isEmpty { parts.append("\(mcpServers.count) MCP requis") }
+            return parts.joined(separator: " · ")
+        case .recurrence:
+            return LaunchAgentPlist.humanDescription(recurrence)
+        case .prompt:
+            let trimmed = Self.trimmed(prompt)
+            guard !trimmed.isEmpty else { return "vide" }
+            let firstLine = trimmed.split(separator: "\n", maxSplits: 1,
+                                          omittingEmptySubsequences: false).first ?? ""
+            return "\(trimmed.count) caractères — \(firstLine)"
         }
     }
 
@@ -188,17 +211,13 @@ struct ScheduleFormView: View {
                     Text(draft == nil ? "Nouvelle planification" : "Modifier la planification")
                         .font(.system(size: 17, weight: .semibold))
 
-                    disclosure(.identity, invalid: invalid) {
-                        TextField("Relevé Sentry — Shopify-Apps", text: $name)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(maxWidth: 420)
-                            .accessibilityLabel("Nom de la planification")
-                    }
-                    disclosure(.agent, invalid: invalid) { agentControls }
+                    disclosure(.identity, invalid: invalid) { identityControls }
+                    disclosure(.folder, invalid: invalid) { folderControls }
+                    disclosure(.preScript, invalid: invalid) { preScriptEditor }
+                    disclosure(.claude, invalid: invalid) { claudeControls }
                     disclosure(.recurrence, invalid: invalid) {
                         RecurrencePicker(recurrence: $recurrence)
                     }
-                    disclosure(.target, invalid: invalid) { TargetPicker(target: $target) }
                     disclosure(.prompt, invalid: invalid, separator: false) { promptEditor }
 
                     if showErrors && !report.all.isEmpty { errorBox(report.all) }
@@ -209,7 +228,8 @@ struct ScheduleFormView: View {
             Divider()
             footer
         }
-        .onAppear(perform: loadAgents)
+        .onAppear(perform: refreshTrust)
+        .onChange(of: folderPath) { _ in refreshTrust() }
     }
 
     // MARK: - Volet repliable
@@ -280,114 +300,149 @@ struct ScheduleFormView: View {
         }
     }
 
-    // MARK: - Agent
+    // MARK: - Identité
 
-    @ViewBuilder
-    private var agentControls: some View {
+    private var identityControls: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if agentsUnavailable {
-                // Repli en saisie libre : refuser d'enregistrer parce que la liste est
-                // illisible serait pire que de laisser saisir une référence à la main.
-                HStack(spacing: 8) {
-                    TextField("claude, ou l'identifiant d'une configuration d'agent",
-                              text: $agentRef)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(maxWidth: 420)
-                        .accessibilityLabel("Référence de l'agent")
-                    Button("Réessayer") {
-                        agentsUnavailable = false
-                        loadAgents()
-                    }
-                    .help("Relire la liste des agents configurés sur cette machine.")
-                }
-                Text("Liste des agents indisponible (Superset injoignable) — saisie libre.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.orange)
-            } else {
-                Picker("", selection: $agentRef) {
-                    if !agents.contains(where: { $0.id == agentRef }) {
-                        Text(agentRef.isEmpty ? "— choisir —" : agentRef).tag(agentRef)
-                    }
-                    ForEach(agents) { Text($0.displayName).tag($0.id) }
-                }
-                .labelsHidden()
+            TextField("Relevé Sentry — Shopify-Apps", text: $name)
+                .textFieldStyle(.roundedBorder)
                 .frame(maxWidth: 420)
-            }
+                .accessibilityLabel("Nom de la planification")
+            Toggle("Active", isOn: $enabled)
+                .toggleStyle(.checkbox)
+                .help("Désactivée, la planification ne part plus d'elle-même ; "
+                      + "« Lancer maintenant » reste possible.")
+        }
+    }
 
+    // MARK: - Dossier
+
+    private var folderControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Text("Effort")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-                Picker("", selection: $effort) {
-                    ForEach(Self.efforts, id: \.self) { value in
-                        Text(value.isEmpty ? "défaut de l'agent" : value).tag(value)
+                TextField("/Users/…/mon-projet", text: $folderPath)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 420)
+                    .accessibilityLabel("Dossier où la session est lancée")
+                Button("Choisir…") {
+                    if let path = Self.choose(directories: true, startingAt: normalizedFolder) {
+                        folderPath = path
                     }
+                }
+                .help("Choisir le dossier dans lequel le préscript puis claude sont lancés.")
+            }
+            // Non bloquant : `~/.claude.json` peut être en retard sur l'état réel.
+            if trusted == false && !normalizedFolder.isEmpty {
+                warning("Claude n'a jamais approuvé ce dossier : le run échouera. "
+                        + "Ouvrez-le une fois dans Claude Launcher.")
+            }
+        }
+    }
+
+    /// Relit `~/.claude.json` hors du thread principal : le fichier grossit avec
+    /// l'historique des projets et ne doit pas geler la frappe.
+    private func refreshTrust() {
+        let path = normalizedFolder
+        guard path.hasPrefix("/") else {
+            trusted = nil
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = ClaudeInvocation.isTrusted(
+                folderPath: path,
+                claudeJSON: try? Data(contentsOf: ClaudeInvocation.claudeJSONURL))
+            DispatchQueue.main.async {
+                // Le champ a pu changer entre-temps : on ne publie que la réponse à jour.
+                if normalizedFolder == path { trusted = result }
+            }
+        }
+    }
+
+    // MARK: - Préscript
+
+    private var preScriptEditor: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            TextEditor(text: $preScript)
+                .font(.system(size: 12, design: .monospaced))
+                .frame(minHeight: 70)
+                .overlay(RoundedRectangle(cornerRadius: 6)
+                    .stroke(Color.secondary.opacity(0.3), lineWidth: 1))
+                .accessibilityLabel("Préscript exécuté avant claude")
+            Text("Exécuté avec $SHELL -l -i -c dans le dossier. "
+                 + "Un code de sortie ≠ 0 annule le run.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Claude
+
+    private var claudeControls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            labeled("Modèle") {
+                TextField("défaut de claude (ex. haiku, sonnet, opus)", text: $model)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 300)
+                    .accessibilityLabel("Modèle passé à claude --model")
+            }
+            labeled("Effort") {
+                Picker("", selection: $effort) {
+                    Text("défaut de claude").tag("")
+                    ForEach(Schedule.effortLevels, id: \.self) { Text($0).tag($0) }
                 }
                 .labelsHidden()
                 .frame(width: 180)
-                .help("Laisser « défaut de l'agent » sauf besoin précis : la valeur dépend "
-                      + "de l'agent, et une valeur inconnue serait refusée au lancement.")
-                Spacer()
+                .accessibilityLabel("Effort passé à claude --effort")
             }
-
-            // ⚠️ Point de sécurité, pas de confort. On ne devine plus d'après le nom :
-            // on regarde les `args` de la configuration, exactement comme le script de
-            // référence, qui REFUSE de lancer si l'agent ne charge pas son `--settings`.
-            if let selected = agents.first(where: { $0.id == agentRef }),
-               !selected.loadsCustomSettings {
-                HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: "lock.open.trianglebadge.exclamationmark")
-                        .foregroundStyle(.orange).font(.system(size: 11))
-                        .accessibilityHidden(true)
-                    Text("« \(selected.displayName) » ne charge aucun profil de permissions "
-                         + "(pas de `--settings` dans ses arguments) : la session tournera "
-                         + "avec les permissions par défaut. Pour un agent qui s'exécute "
-                         + "seul, préférez une configuration au périmètre restreint.")
+            labeled("Settings") {
+                HStack(spacing: 8) {
+                    TextField("facultatif : fichier JSON de settings", text: $settingsPath)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 300)
+                        .accessibilityLabel("Fichier de settings fusionné dans ceux du run")
+                    Button("Choisir…") {
+                        if let path = Self.choose(directories: false,
+                                                  startingAt: Self.trimmed(settingsPath)) {
+                            settingsPath = path
+                        }
+                    }
+                    .help("Choisir un fichier de settings claude (permissions, hooks…). "
+                          + "Il est fusionné avec le hook Stop du run.")
+                }
+            }
+            labeled("MCP requis") {
+                VStack(alignment: .leading, spacing: 4) {
+                    TextEditor(text: $mcpText)
+                        .font(.system(size: 12, design: .monospaced))
+                        .frame(width: 300, height: 54)
+                        .overlay(RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color.secondary.opacity(0.3), lineWidth: 1))
+                        .accessibilityLabel("MCP requis, un par ligne")
+                    Text("Un par ligne, nommés comme dans « claude mcp list ». "
+                         + "S'il en manque un, le run échoue avant de lancer claude.")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
-                .padding(8)
-                .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 6))
             }
-        }
-    }
-
-    /// `agents list` **synthétise** une entrée « Superset » (`id == "superset"`,
-    /// `command == "(superset runtime)"`) qui n'existe pas dans `host_agent_configs` —
-    /// impossible à supprimer côté Superset, et ce n'est pas un agent de code. Un
-    /// planificateur n'a rien à en faire.
-    private static let syntheticAgentIDs: Set<String> = ["superset"]
-
-    private func loadAgents() {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let found = SupersetCLI.isInstalled() ? SupersetCLI.agentConfigs() : nil
-            let usable = found?.filter { !Self.syntheticAgentIDs.contains($0.id) }
-            DispatchQueue.main.async {
-                if let usable, !usable.isEmpty {
-                    agents = usable
-                    normalizeAgentRef()
-                    agentsUnavailable = false
-                } else {
-                    agentsUnavailable = true
+            labeled("Délai") {
+                Stepper(value: $timeoutMinutes, in: Schedule.timeoutRange) {
+                    Text("\(timeoutMinutes) min").monospacedDigit()
                 }
+                .help("Au-delà, la session est tuée et le run finit en « délai dépassé ».")
+                .accessibilityLabel("Délai maximal de la session, en minutes")
             }
         }
     }
 
-    /// `Action.defaultAgentRef` vaut `"claude"`, qui est un **preset id** — alors que la
-    /// configuration correspondante a un **UUID**. Sans normalisation, le sélecteur
-    /// affichait « claude » (l'entrée de repli, chaîne brute) À CÔTÉ de « Claude »
-    /// (la vraie configuration) : deux lignes pour la même chose.
-    ///
-    /// On bascule donc vers l'UUID dès que la liste est connue. C'est aussi le bon
-    /// stockage : seul l'UUID d'une `HostAgentConfig` porte un profil de permissions,
-    /// alors que le preset nu tourne avec les permissions par défaut.
-    private func normalizeAgentRef() {
-        guard !agents.contains(where: { $0.id == agentRef }) else { return }
-        if let match = agents.first(where: { $0.preset == agentRef }) {
-            agentRef = match.id
-        } else if agentRef.isEmpty, let first = agents.first {
-            agentRef = first.id
+    private func labeled<Content: View>(_ label: String,
+                                        @ViewBuilder content: () -> Content) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 80, alignment: .leading)
+            content()
+            Spacer(minLength: 0)
         }
     }
 
@@ -400,13 +455,48 @@ struct ScheduleFormView: View {
                 .frame(minHeight: 180)
                 .overlay(RoundedRectangle(cornerRadius: 6)
                     .stroke(Color.secondary.opacity(0.3), lineWidth: 1))
-                .accessibilityLabel("Prompt envoyé à l'agent")
+                .accessibilityLabel("Prompt envoyé à claude")
             Text("Texte littéral : aucune substitution n'est faite au lancement. "
                  + "Une veille qui doit connaître sa fenêtre temporelle doit la faire "
-                 + "calculer par l'agent (« depuis le rapport le plus récent… »).")
+                 + "calculer par claude (« depuis le rapport le plus récent… »).")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
         }
+    }
+
+    // MARK: - Fragments
+
+    private func warning(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange).font(.system(size: 11))
+                .accessibilityHidden(true)
+            Text(text)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
+        .padding(8)
+        .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 6))
+    }
+
+    private static func choose(directories: Bool, startingAt path: String) -> String? {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = directories
+        panel.canChooseFiles = !directories
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.prompt = "Choisir"
+        if directories {
+            panel.message = "Choisissez le dossier où lancer claude"
+        } else {
+            panel.message = "Choisissez un fichier de settings claude"
+            panel.allowedContentTypes = [.json]
+        }
+        if !path.isEmpty {
+            let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+            panel.directoryURL = directories ? url : url.deletingLastPathComponent()
+        }
+        return panel.runModal() == .OK ? panel.url?.path : nil
     }
 
     // MARK: - Erreurs et actions

@@ -1,6 +1,6 @@
 import Foundation
 
-/// Tous les chemins du Superset Scheduler, en un seul endroit.
+/// Tous les chemins du Claude Scheduler, en un seul endroit.
 ///
 /// Même construction inline que `ConventionsProfile` / `NotificationChannel` / `IDELog` :
 /// **pas de helper partagé**, on reste sur le pattern déjà en place dans le repo.
@@ -54,6 +54,22 @@ enum SchedulePaths {
         logsDirectory.appendingPathComponent("\(runID.uuidString).log", isDirectory: false)
     }
 
+    /// Flux brut du pseudo-terminal du run (préscript puis session `claude`), rejoué
+    /// tel quel par la GUI.
+    static func ttyFile(runID: UUID) -> URL {
+        logsDirectory.appendingPathComponent("\(runID.uuidString).tty", isDirectory: false)
+    }
+
+    /// Posé par le hook `Stop` injecté dans les settings du run : « la réponse est finie ».
+    static func stopMarker(runID: UUID) -> URL {
+        logsDirectory.appendingPathComponent("\(runID.uuidString).stop", isDirectory: false)
+    }
+
+    /// Settings passés à `claude --settings` : ceux de la planification + le hook `Stop`.
+    static func runSettingsFile(runID: UUID) -> URL {
+        logsDirectory.appendingPathComponent("\(runID.uuidString).settings.json", isDirectory: false)
+    }
+
     static func lockFile(scheduleID: UUID) -> URL {
         locksDirectory.appendingPathComponent("\(scheduleID.uuidString).lock", isDirectory: false)
     }
@@ -103,29 +119,14 @@ enum SchedulePaths {
         Bundle.main.bundleURL.pathExtension == "app"
     }
 
-    /// `~/.superset/bin/superset` n'est **pas** un exécutable Mach-O : c'est un shim
-    /// `#!/bin/sh` qui `exec` le vrai binaire dans `Superset.app`. `posix_spawn` suit le
-    /// shebang, donc `Process.executableURL` sur le shim fonctionne — c'est le point
-    /// d'entrée stable et supporté, on l'essaie en premier.
-    static let supersetShimPath = NSHomeDirectory() + "/.superset/bin/superset"
-    static let supersetBundledPath =
-        "/Applications/Superset.app/Contents/Resources/resources/bin/superset"
-
-    /// `nil` si aucun des deux n'existe → message explicite « Superset introuvable »,
-    /// plutôt qu'un run en échec muet.
-    static var supersetExecutablePath: String? {
-        let fm = FileManager.default
-        if fm.isExecutableFile(atPath: supersetShimPath) { return supersetShimPath }
-        if fm.isExecutableFile(atPath: supersetBundledPath) { return supersetBundledPath }
-        return nil
-    }
-
-    /// PATH complet posé par le runner **et** recopié dans le plist. Le PATH par défaut
-    /// sous launchd est `/usr/bin:/bin:/usr/sbin:/sbin` : sans ça, `superset` est
-    /// introuvable. Chemins littéraux — launchd ne développe pas `$HOME`.
+    /// PATH recopié dans le plist. Le PATH par défaut sous launchd est
+    /// `/usr/bin:/bin:/usr/sbin:/sbin`. Le runner passe de toute façon par un shell de
+    /// login interactif (`$SHELL -l -i`), qui recharge le PATH des rc ; celui-ci n'est que
+    /// le plancher, avec `~/.local/bin` où l'installeur natif pose `claude`. Chemins
+    /// littéraux — launchd ne développe pas `$HOME`.
     static var searchPath: String {
         [
-            NSHomeDirectory() + "/.superset/bin",
+            NSHomeDirectory() + "/.local/bin",
             "/opt/homebrew/bin", "/usr/local/bin",
             "/usr/bin", "/bin", "/usr/sbin", "/sbin"
         ].joined(separator: ":")

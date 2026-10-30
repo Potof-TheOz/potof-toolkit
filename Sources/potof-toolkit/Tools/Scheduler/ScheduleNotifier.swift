@@ -48,7 +48,7 @@ enum ScheduleNotifier {
         let semaphore = DispatchSemaphore(value: 0)
         // Verrouillée, et pas un simple `var` capturé : sur le chemin du délai dépassé, le
         // callback du Centre de notifications peut écrire à l'instant même où l'appelant
-        // renonce et relit. Même idiome que `SupersetCLI.Flag` / `OutputBox`.
+        // renonce et relit.
         let outcome = Outcome("bannière : aucune réponse du Centre de notifications")
 
         center.requestAuthorization(options: [.alert, .sound]) { granted, error in

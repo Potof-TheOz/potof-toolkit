@@ -1,15 +1,26 @@
 import Foundation
 
-/// Auto-test du lot L5 — `potof-toolkit --sched-selftest run`.
+/// Auto-test du runner — `potof-toolkit --sched-selftest run` (et `live`, opt-in).
 ///
-/// Opère dans un dossier jetable (`SchedulePaths.overrideRoot`) et n'appelle de la CLI
-/// `superset` que des commandes de **lecture**. Il ne crée aucun workspace, ne lance aucun
-/// agent, n'écrit aucune ligne d'historique et ne fait apparaître aucune bannière.
+/// `run` opère dans un dossier jetable (`SchedulePaths.overrideRoot`) avec un **faux
+/// `claude`** (script sh écrit dans ce dossier) : aucun vrai `claude`, aucun réseau, aucune
+/// bannière. Il déroule la séquence complète du runner — préscript, contrôle des MCP,
+/// settings du run, session dans un PTY — et vérifie chaque issue du tableau de séquence
+/// au mot près, plus les garde-fous transverses (verrou, politique de notification,
+/// dry-run sans trace).
 ///
-/// Ce qu'il prouve : la politique de notification, la garde de bundle du canal de remise,
-/// l'exclusion inter-process du verrou, et — le plus important — qu'un **dry-run ne laisse
-/// aucune trace**, condition sans laquelle on n'oserait pas s'en servir pour déboguer.
+/// `live <dossier approuvé>` lance le VRAI `claude` (haiku, environ 0,01 $) : c'est la
+/// seule preuve que le hook `Stop`, `/exit` et le retrait de `CLAUDE_CODE_*` tiennent
+/// face au binaire réel.
 enum ScheduleRunnerProbe {
+
+    /// Extrait réel de `claude mcp list` (2026-10-30), couleurs ANSI comprises — le même
+    /// que celui de la probe `claude`.
+    private static let mcpSample = "Checking MCP server health…\r\n\r\n"
+        + "claude.ai Asana: https://mcp.asana.com/sse - ! Needs authentication\r\n"
+        + "plugin:sentry-mcp:sentry: https://mcp.sentry.dev/mcp (HTTP) - \u{1B}[32m✔ Connected\u{1B}[39m\r\n"
+        + "webstorm: http://127.0.0.1:64342/sse (SSE) - ✘ Failed to connect — SSE error: ECONNREFUSED\r\n"
+        + "n8n-prod: /Users/x/.nvm/versions/node/v26.5.0/bin/n8n-mcp  - ✔ Connected\r\n"
 
     static func run() -> String {
         var out: [String] = []
@@ -24,153 +35,267 @@ enum ScheduleRunnerProbe {
             }
         }
 
+        let fm = FileManager.default
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("potof-sched-runner-probe-\(UUID().uuidString)",
                                     isDirectory: true)
         SchedulePaths.overrideRoot = root
         defer { SchedulePaths.overrideRoot = nil }
 
-        out.append("── ScheduleRunner — auto-test (lot L5) ──────────────────────────")
+        // Le faux `claude` vit hors du dossier de la planification : ses fichiers de
+        // contrôle (`argv.txt`, `FAKE_MODE`, `mcp.txt`) ne se mélangent pas au travail.
+        let sandbox = root.appendingPathComponent("sandbox", isDirectory: true)
+        let folder = root.appendingPathComponent("dossier projet", isDirectory: true)
+        try? fm.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        try? fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        let argvFile = sandbox.appendingPathComponent("argv.txt")
+        let modeFile = sandbox.appendingPathComponent("FAKE_MODE")
+        let mcpFile = sandbox.appendingPathComponent("mcp.txt")
+        let fakeClaude = sandbox.appendingPathComponent("claude")
+        try? Data(mcpSample.utf8).write(to: mcpFile)
+
+        let q = ClaudeInvocation.shellQuote
+        let script = """
+        #!/bin/sh
+        if [ "$1" = mcp ] && [ "$2" = list ]; then
+          cat \(q(mcpFile.path))
+          exit 0
+        fi
+        for a in "$@"; do printf '%s\\n' "$a"; done > \(q(argvFile.path))
+        echo FAKE-CLAUDE
+        settings=""; prev=""
+        for a in "$@"; do [ "$prev" = --settings ] && settings="$a"; prev="$a"; done
+        case "$(cat \(q(modeFile.path)) 2>/dev/null)" in
+          ok)
+            eval "$(grep -o "touch '[^']*'" "$settings" | sed 's#\\\\/#/#g')"
+            read l; [ "$l" = /exit ] && exit 0; exit 9 ;;
+          crash) exit 1 ;;
+          trust) printf 'Do you\\033[1Ctrust\\033[1Cthis\\033[1Cfolder?'; sleep 60 ;;
+          *) sleep 60 ;;
+        esac
+        """
+        try? Data(script.utf8).write(to: fakeClaude)
+        chmod(fakeClaude.path, 0o755)
+
+        var host = RunnerHost.live
+        host.shell = "/bin/sh"
+        host.claudeCommand = fakeClaude.path
+        host.preScriptTimeout = 20
+        host.mcpListTimeout = 20
+
+        out.append("── ScheduleRunner — auto-test (faux claude) ─────────────────────")
         out.append("Racine jetable : \(root.path)")
         out.append("")
 
-        // ── 1. Politique de notification ─────────────────────────────────────────
-        out.append("— politique de notification (§6.7) —")
-        check("échec sous launchd → bannière",
-              ScheduleRunner.shouldNotify(status: .failed, trigger: "launchd"))
-        check("run sauté sous launchd → bannière",
-              ScheduleRunner.shouldNotify(status: .skipped, trigger: "launchd"))
-        check("agent lancé → PAS de bannière (un succès n'a rien à annoncer)",
-              !ScheduleRunner.shouldNotify(status: .launched, trigger: "launchd"))
-        check("« Lancer maintenant » → PAS de bannière (l'utilisateur regarde l'écran)",
-              !ScheduleRunner.shouldNotify(status: .failed, trigger: "manual"))
-        check("lancement manuel en ligne de commande → PAS de bannière",
-              !ScheduleRunner.shouldNotify(status: .failed, trigger: "cli"))
-
-        // ── 2. Canal de remise ───────────────────────────────────────────────────
-        out.append("")
-        out.append("— canal de remise —")
-        // `canPost` est faux hors bundle : c'est le cas quand ce probe tourne depuis
-        // `.build/debug/`. Sous launchd, le runner vit dans le `.app` et la garde passe.
-        out.append("  bundle courant : \(Bundle.main.bundleURL.lastPathComponent)")
-        check("la garde de bundle répond sans planter",
-              ScheduleNotifier.canPost || !ScheduleNotifier.canPost,
-              ScheduleNotifier.canPost ? "bundlé → bannières possibles"
-                                       : "non bundlé → bannières ignorées (attendu en dev)")
-        if !ScheduleNotifier.canPost {
-            let outcome = ScheduleNotifier.post(title: "t", subtitle: "t", body: "t")
-            check("hors bundle, `post` refuse proprement au lieu de planter",
-                  outcome.contains("non bundlé"), outcome)
+        func schedule(preScript: String = "", prompt: String = "Prompt de la probe, assez long.",
+                      mcp: [String] = [], enabled: Bool = true) -> Schedule {
+            Schedule(name: "Sonde", enabled: enabled, folderPath: folder.path,
+                     preScript: preScript,
+                     action: .claude(prompt: prompt, model: nil, effort: nil, settingsPath: nil),
+                     recurrence: .daily(hour: 10, minute: 0),
+                     requiredMCPServers: mcp)
         }
 
-        // ── 3. Exclusion du verrou ───────────────────────────────────────────────
+        struct Outcome { let status: RunStatus; let message: String; let sessionID: String?
+                         let tty: String; let seconds: TimeInterval }
+
+        /// Un run réel (hors dry-run) sous la racine jetable, relu depuis sa ligne `end`.
+        func execute(_ s: Schedule, mode: String, trigger: String = "cli",
+                     host: RunnerHost = host) -> Outcome {
+            try? fm.removeItem(at: argvFile)
+            try? Data(mode.utf8).write(to: modeFile)
+            let t0 = Date()
+            let result = ScheduleRunner.executeReporting(s, trigger: trigger, dryRun: false, host: host)
+            let seconds = Date().timeIntervalSince(t0)
+            let end = RunLog.loadLines().last { $0.phase == .end && $0.scheduleID == s.id }
+            let tty = end.flatMap { try? String(contentsOf: SchedulePaths.ttyFile(runID: $0.runID)) } ?? ""
+            return Outcome(status: result.status, message: end?.message ?? "(pas de ligne end)",
+                           sessionID: end?.sessionID, tty: tty, seconds: seconds)
+        }
+        func detail(_ o: Outcome) -> String {
+            "\(o.status.rawValue) · \(o.message) · \(String(format: "%.1f", o.seconds)) s"
+        }
+        func argv() -> String? { try? String(contentsOf: argvFile) }
+
+        // ── 1. Séquence ──────────────────────────────────────────────────────────
+        out.append("— séquence du runner —")
+        let preFile = folder.appendingPathComponent("pre.txt")
+        let ok = execute(schedule(preScript: "echo PRE | tee pre.txt"), mode: "ok")
+        let pre = ok.tty.range(of: "PRE"), fake = ok.tty.range(of: "FAKE-CLAUDE")
+        check("run.completed", ok.status == .completed && ok.message == "session terminée"
+              && ok.sessionID != nil && fm.fileExists(atPath: preFile.path)
+              && pre != nil && fake != nil && pre!.lowerBound < fake!.lowerBound, detail(ok))
+        check("run.sessionIDLowercase", ok.sessionID.map { $0 == $0.lowercased()
+              && argv()?.contains("--session-id\n\($0)\n") == true } == true, ok.sessionID ?? "nil")
+
+        let trap = "-x 'q' $(y)\nfin"
+        let trapped = execute(schedule(prompt: trap), mode: "ok")
+        check("run.argvIntact", trapped.status == .completed
+              && argv()?.hasSuffix("--\n\(trap)\n") == true
+              && argv()?.contains("--permission-mode\ndontAsk\n") == true,
+              argv()?.replacingOccurrences(of: "\n", with: "⏎") ?? "argv.txt absent")
+
+        let preFails = execute(schedule(preScript: "exit 4"), mode: "ok")
+        check("run.preScriptFails", preFails.status == .failed
+              && preFails.message == "préscript en échec (code 4)" && argv() == nil, detail(preFails))
+
+        var shortPre = host
+        shortPre.preScriptTimeout = 2
+        let hangs = execute(schedule(preScript: "read x"), mode: "ok", host: shortPre)
+        check("run.preScriptHangs", hangs.status == .failed
+              && hangs.message == "préscript : délai dépassé" && argv() == nil, detail(hangs))
+
+        let missing = execute(schedule(mcp: ["claude.ai Asana"]), mode: "ok")
+        check("run.mcpMissing", missing.status == .failed
+              && missing.message == "MCP requis indisponibles : claude.ai Asana (needs-auth)"
+              && argv() == nil, detail(missing))
+
+        let mcpOK = execute(schedule(mcp: ["plugin:sentry-mcp:sentry"]), mode: "ok")
+        check("run.mcpOk", mcpOK.status == .completed, detail(mcpOK))
+
+        let crash = execute(schedule(), mode: "crash")
+        check("run.crash", crash.status == .failed
+              && crash.message == "claude s'est arrêté avant la fin de sa réponse (code 1)"
+              && crash.sessionID != nil, detail(crash))
+
+        let untrusted = execute(schedule(), mode: "trust")
+        check("run.untrusted", untrusted.status == .failed
+              && untrusted.message == "dossier non approuvé par Claude : ouvrez-le une fois dans Claude Launcher"
+              && untrusted.seconds < 10, detail(untrusted))
+
+        var shortSession = host
+        shortSession.sessionTimeoutOverride = 2
+        let hang = execute(schedule(), mode: "hang", host: shortSession)
+        check("run.timeout", hang.status == .timedOut && hang.sessionID != nil
+              && hang.tty.contains("FAKE-CLAUDE"), detail(hang))
+
+        let disabled = execute(schedule(enabled: false), mode: "ok", trigger: "launchd")
+        check("run.disabled", disabled.status == .skipped
+              && disabled.message == "planification désactivée" && argv() == nil, detail(disabled))
+        let manual = execute(schedule(enabled: false), mode: "ok", trigger: "manual")
+        check("run.disabledManual", manual.status == .completed, detail(manual))
+
+        var gone = schedule()
+        gone.folderPath = folder.path + "-supprimé"
+        let lost = execute(gone, mode: "ok")
+        check("run.missingFolder", lost.status == .failed
+              && lost.message == "dossier introuvable : \(gone.folderPath)", detail(lost))
+
+        // ── 2. Verrou inter-process ──────────────────────────────────────────────
         out.append("")
         out.append("— verrou inter-process —")
-        let lockID = UUID()
-        let first = ScheduleRunner.acquireLock(lockID)
-        var firstDescriptor: Int32?
-        if case .acquired(let fd) = first { firstDescriptor = fd }
-        check("premier verrou obtenu", firstDescriptor != nil)
-
-        // Deuxième prise DANS LE MÊME process : `flock` étant associé à la description de
-        // fichier ouverte (et pas au process), un second `open` + `flock` se voit bien
-        // refuser. C'est ce qui exclut un tir launchd pendant un « Lancer maintenant ».
-        let second = ScheduleRunner.acquireLock(lockID)
-        check("second verrou refusé (busy)", second == .busy, "\(second)")
-
-        if let firstDescriptor {
-            flock(firstDescriptor, LOCK_UN)
-            close(firstDescriptor)
-        }
-        let third = ScheduleRunner.acquireLock(lockID)
-        var thirdDescriptor: Int32?
-        if case .acquired(let fd) = third { thirdDescriptor = fd }
-        check("verrou repris après libération", thirdDescriptor != nil)
-        if let thirdDescriptor {
-            flock(thirdDescriptor, LOCK_UN)
-            close(thirdDescriptor)
+        let locked = schedule()
+        if case .acquired(let fd) = ScheduleRunner.acquireLock(locked.id) {
+            let busy = execute(locked, mode: "ok")
+            check("run.locked", busy.status == .skipped
+                  && busy.message == "un run est déjà en cours" && argv() == nil, detail(busy))
+            flock(fd, LOCK_UN)
+            close(fd)
+        } else {
+            check("run.locked", false, "premier verrou non obtenu")
         }
 
-        // ── 4. Dry-run complet, sans aucune trace ────────────────────────────────
+        // ── 3. Politique de notification ─────────────────────────────────────────
         out.append("")
-        out.append("— dry-run de bout en bout —")
+        out.append("— politique de notification —")
+        check("échec, délai dépassé et run sauté sous launchd → bannière",
+              ScheduleRunner.shouldNotify(status: .failed, trigger: "launchd")
+              && ScheduleRunner.shouldNotify(status: .timedOut, trigger: "launchd")
+              && ScheduleRunner.shouldNotify(status: .skipped, trigger: "launchd"))
+        check("session terminée → PAS de bannière",
+              !ScheduleRunner.shouldNotify(status: .completed, trigger: "launchd"))
+        check("« Lancer maintenant » et ligne de commande → PAS de bannière",
+              !ScheduleRunner.shouldNotify(status: .failed, trigger: "manual")
+              && !ScheduleRunner.shouldNotify(status: .failed, trigger: "cli"))
 
-        guard SupersetCLI.isInstalled() else {
-            out.append("  (Superset introuvable : dry-run non exercé)")
-            try? FileManager.default.removeItem(at: root)
-            out.append("")
-            out.append(failures == 0 ? "RÉSULTAT : invariants vérifiés (dry-run non exercé)."
-                                     : "RÉSULTAT : \(failures) ÉCHEC(S).")
-            return out.joined(separator: "\n")
+        // ── 4. Dry-run sans aucune trace ─────────────────────────────────────────
+        out.append("")
+        out.append("— dry-run —")
+        let dryRoot = root.appendingPathComponent("dry", isDirectory: true)
+        SchedulePaths.overrideRoot = dryRoot
+        try? fm.removeItem(at: argvFile)
+        let planned = schedule(preScript: "touch dry.txt", mcp: ["claude.ai Asana"])
+        let dry = ScheduleRunner.executeReporting(planned, trigger: "launchd", dryRun: true, host: host)
+        check("run.dryRunSkipped", dry.status == .skipped, dry.status.rawValue)
+        check("run.dryRunReport", dry.report.contains("DRY-RUN")
+              && dry.report.contains("touch dry.txt")
+              && dry.report.contains("claude.ai Asana (needs-auth)")
+              && dry.report.contains("--permission-mode")
+              && dry.report.contains("StartCalendarInterval"))
+        check("run.dryRunNoTrace", !fm.fileExists(atPath: dryRoot.path)
+              && !fm.fileExists(atPath: folder.appendingPathComponent("dry.txt").path)
+              && argv() == nil)
+        SchedulePaths.overrideRoot = root
+
+        try? fm.removeItem(at: root)
+
+        out.append("")
+        out.append(failures == 0
+                   ? "RÉSULTAT : tous les invariants sont vérifiés."
+                   : "RÉSULTAT : \(failures) ÉCHEC(S).")
+        return out.joined(separator: "\n")
+    }
+
+    // MARK: - Live (opt-in, vrai claude)
+
+    /// `--sched-selftest live <dossier approuvé>` : un run complet avec le VRAI `claude`
+    /// (haiku, environ 0,01 $). Historique et `.tty` sous une racine jetable ; la
+    /// conversation, elle, atterrit là où `claude` la range toujours.
+    static func live(folderPath: String?) -> String {
+        guard let folderPath, !folderPath.isEmpty else {
+            return "usage : potof-toolkit --sched-selftest live <dossier approuvé par Claude>"
+        }
+        var out: [String] = []
+        var failures = 0
+        func check(_ label: String, _ condition: Bool, _ detail: String = "") {
+            if !condition { failures += 1 }
+            out.append("  [\(condition ? "OK  " : "ÉCHEC")] \(label)\(detail.isEmpty ? "" : " — \(detail)")")
         }
 
-        // On vise un workspace RÉEL, pour que la résolution par (projet, nom) soit
-        // réellement exercée — c'est le point que le matching par nom seul casserait.
-        let sample = SupersetCLI.workspaces()?.first { ($0.worktreePath?.isEmpty == false) }
-        guard let sample, let projectID = sample.projectId else {
-            out.append("  (aucun workspace exploitable : dry-run non exercé)")
-            try? FileManager.default.removeItem(at: root)
-            out.append("")
-            out.append(failures == 0 ? "RÉSULTAT : invariants vérifiés (dry-run non exercé)."
-                                     : "RÉSULTAT : \(failures) ÉCHEC(S).")
-            return out.joined(separator: "\n")
-        }
+        let folder = URL(fileURLWithPath: (folderPath as NSString).expandingTildeInPath)
+            .standardized.path
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("potof-sched-live-probe-\(UUID().uuidString)", isDirectory: true)
+        SchedulePaths.overrideRoot = root
+        defer { SchedulePaths.overrideRoot = nil }
+
+        out.append("── ScheduleRunner — probe live (vrai claude) ────────────────────")
+        out.append("Dossier : \(folder)")
+        out.append("Approuvé selon ~/.claude.json : "
+                   + "\(ClaudeInvocation.isTrusted(folderPath: folder, claudeJSON: try? Data(contentsOf: ClaudeInvocation.claudeJSONURL)))")
+        out.append("")
 
         let schedule = Schedule(
-            name: "Sonde — \(sample.name)",
-            action: .supersetAgent(
-                agentRef: Action.defaultAgentRef,
-                effort: nil,
-                prompt: "Sonde d'auto-test : ce prompt n'est jamais envoyé à un agent."),
+            name: "Sonde live", folderPath: folder,
+            action: .claude(prompt: "Réponds juste OK, sans rien faire d'autre.",
+                            model: "haiku", effort: nil, settingsPath: nil),
             recurrence: .daily(hour: 10, minute: 0),
-            target: .permanentWorkspace(
-                projectID: projectID,
-                projectName: sample.projectName ?? "",
-                workspaceName: sample.name,
-                branch: sample.branch ?? "main",
-                baseBranch: "main",
-                refreshWorktree: true))
+            timeoutMinutes: 2,
+            requiredMCPServers: ["plugin:sentry-mcp:sentry"])
+        let result = ScheduleRunner.executeReporting(schedule, trigger: "cli", dryRun: false)
+        let end = RunLog.loadLines().last { $0.phase == .end }
+        let ttyURL = end.map { SchedulePaths.ttyFile(runID: $0.runID) }
+        let tty = ttyURL.flatMap { try? String(decoding: Data(contentsOf: $0), as: UTF8.self) } ?? ""
 
-        let outcome = ScheduleRunner.executeReporting(schedule, trigger: "cli", dryRun: true)
-
-        check("le dry-run conclut en `skipped` (aucun agent lancé)",
-              outcome.status == .skipped, outcome.status.rawValue)
-        check("le rapport s'annonce comme un dry-run",
-              outcome.report.contains("DRY-RUN"))
-        check("le rapport contient l'argv de `agents create`",
-              outcome.report.contains("agents create"))
-        check("le rapport contient le prompt intégral",
-              outcome.report.contains("Sonde d'auto-test"))
-        check("le rapport contient le .plist qui serait installé",
-              outcome.report.contains("StartCalendarInterval"))
-        check("le rapport annonce le fetch/reset SANS l'exécuter",
-              outcome.report.contains("non exécuté"))
-        // ⭐ Le point qui rend le dry-run utile : un garde-fou qui déclenche est ANNOTÉ,
-        // il n'interrompt pas l'impression du plan. Sinon l'outil de debug ne montre
-        // justement rien le jour où il y a quelque chose à comprendre.
-        check("un garde-fou déclenché n'interrompt pas le plan",
-              !outcome.report.contains("⚠︎") || outcome.report.contains("agents create"),
-              outcome.report.contains("⚠︎") ? "un garde-fou a bien été annoté" : "aucun garde-fou déclenché")
-        check("la résolution a bien trouvé le workspace par (projet, nom)",
-              outcome.report.contains(sample.id), sample.name)
-
-        // ⭐ L'assertion qui autorise à se servir du dry-run pour déboguer.
-        let jsonlExists = FileManager.default.fileExists(atPath: SchedulePaths.runsFile.path)
-        check("AUCUNE ligne d'historique écrite par le dry-run", !jsonlExists)
-        let lockExists = FileManager.default.fileExists(
-            atPath: SchedulePaths.lockFile(scheduleID: schedule.id).path)
-        check("AUCUN verrou posé par le dry-run", !lockExists)
-
-        out.append("")
-        out.append("  — plan produit —")
-        for line in outcome.report.split(separator: "\n", omittingEmptySubsequences: false)
-            .prefix(24) {
-            out.append("  \(line)")
+        check("live.completed", result.status == .completed,
+              "\(result.status.rawValue) · \(end?.message ?? "(pas de ligne end)")")
+        check("live.ttyOK", tty.contains("OK"), ttyURL?.path ?? "pas de .tty")
+        let transcript = end?.sessionID.map {
+            PreviousSessionsStore.projectsRoot
+                .appendingPathComponent(PreviousSessionsStore.projectDirName(forPath: folder),
+                                        isDirectory: true)
+                .appendingPathComponent("\($0).jsonl")
         }
-        out.append("  … (\(outcome.report.split(separator: "\n").count) lignes au total)")
+        check("live.transcript", transcript.map { FileManager.default.fileExists(atPath: $0.path) } == true,
+              transcript?.path ?? "pas de sessionID")
 
-        try? FileManager.default.removeItem(at: root)
-
+        if failures == 0 {
+            try? FileManager.default.removeItem(at: root)
+        } else {
+            out.append("")
+            out.append("Racine conservée pour inspection : \(root.path)")
+            out.append(result.report)
+        }
         out.append("")
         out.append(failures == 0
                    ? "RÉSULTAT : tous les invariants sont vérifiés."

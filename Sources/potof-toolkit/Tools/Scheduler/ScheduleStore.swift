@@ -34,6 +34,11 @@ final class ScheduleStore: ObservableObject {
     @Published var selection: UUID?
     @Published private(set) var lastError: String?
 
+    /// `schedules.json` existe mais n'a pas pu être lu. Tant que c'est vrai, `save()`
+    /// refuse d'écrire : réécrire par-dessus un fichier qu'on n'a pas su lire effacerait
+    /// des planifications qu'on n'a jamais vues.
+    private var diskUnreadable = false
+
     private var watchSource: DispatchSourceFileSystemObject?
     private var watchHandle: FileHandle?
     private var reopening = false
@@ -47,11 +52,30 @@ final class ScheduleStore: ObservableObject {
     // MARK: - Format sur disque (SOCLE — gelé, ne pas modifier sans escalade)
 
     /// Enveloppe versionnée de `schedules.json`.
+    ///
+    /// v1 = Superset Scheduler (cible = workspace Superset) ; v2 = Claude Scheduler
+    /// (dossier + préscript + `claude`). **Aucune migration** : les planifications v1 sont
+    /// supprimées, c'est une décision (cf. `reload()`).
     struct SchedulesFile: Codable {
         var version: Int
         var schedules: [Schedule]
 
-        static let currentVersion = 1
+        static let currentVersion = 2
+    }
+
+    /// Seulement l'enveloppe : lire la version d'un fichier dont les planifications ne se
+    /// décodent pas (un v1 n'a pas de `folderPath`).
+    private struct VersionHeader: Decodable { var version: Int }
+
+    /// Ce que contient `schedules.json`, sans rien en déduire.
+    enum DiskState: Equatable {
+        case missing
+        case current([Schedule])
+        /// Version antérieure à `currentVersion`.
+        case legacy(version: Int)
+        /// JSON abîmé, enveloppe absente, ou version **future** (une app plus récente l'a
+        /// écrit) : dans les trois cas, on ne doit surtout pas réécrire par-dessus.
+        case unreadable
     }
 
     static func makeEncoder() -> JSONEncoder {
@@ -71,18 +95,51 @@ final class ScheduleStore: ObservableObject {
     /// sans elle, `--run-schedule` ne saurait pas dire « planification introuvable ».
     ///
     /// Renvoie un tableau vide si le fichier est absent (cas nominal au premier
-    /// lancement) ou illisible — un runner ne doit jamais crasher sur un fichier abîmé,
-    /// il doit sortir proprement en 66.
+    /// lancement), ancien ou illisible — un runner ne doit jamais crasher sur un fichier
+    /// abîmé, il doit sortir proprement en 66.
     static func loadFromDisk() -> [Schedule] {
-        guard let data = try? Data(contentsOf: SchedulePaths.schedulesFile) else { return [] }
-        guard let file = try? makeDecoder().decode(SchedulesFile.self, from: data) else { return [] }
-        return file.schedules
+        if case .current(let schedules) = readDisk() { return schedules }
+        return []
+    }
+
+    /// Lecture **sans effet de bord** : la décision (purger un v1, refuser d'écrire sur
+    /// un fichier illisible) appartient à `reload()`, côté GUI, seul écrivain.
+    static func readDisk() -> DiskState {
+        let url = SchedulePaths.schedulesFile
+        guard FileManager.default.fileExists(atPath: url.path) else { return .missing }
+        guard let data = try? Data(contentsOf: url),
+              let header = try? makeDecoder().decode(VersionHeader.self, from: data)
+        else { return .unreadable }
+        if header.version < SchedulesFile.currentVersion { return .legacy(version: header.version) }
+        guard header.version == SchedulesFile.currentVersion,
+              let file = try? makeDecoder().decode(SchedulesFile.self, from: data)
+        else { return .unreadable }
+        return .current(file.schedules)
     }
 
     // MARK: - Lecture
 
     func reload() {
-        schedules = Self.sorted(Self.loadFromDisk())
+        let wasUnreadable = diskUnreadable
+        diskUnreadable = false
+        switch Self.readDisk() {
+        case .missing:
+            schedules = []
+        case .current(let found):
+            schedules = Self.sorted(found)
+        case .legacy:
+            // Décision du 2026-10-30 : les planifications Superset sont obsolètes et ne se
+            // traduisent pas (pas de dossier). On les supprime en réécrivant un v2 vide.
+            // Leurs plists éventuels deviennent des orphelins que l'audit propose de purger.
+            schedules = []
+            save()
+        case .unreadable:
+            diskUnreadable = true
+            schedules = []
+            lastError = "schedules.json est illisible : aucune planification chargée, et rien "
+                + "ne sera écrit tant qu'il n'est pas réparé (\(SchedulePaths.schedulesFile.path))."
+        }
+        if wasUnreadable && !diskUnreadable { lastError = nil }
         reloadRuns()
         startWatchingRuns()
 
@@ -158,6 +215,11 @@ final class ScheduleStore: ObservableObject {
     /// un orphelin immédiat.
     @discardableResult
     private func save() -> Bool {
+        guard !diskUnreadable else {
+            lastError = "schedules.json est illisible : enregistrement refusé pour ne pas "
+                + "l'écraser. Réparez ou supprimez \(SchedulePaths.schedulesFile.path)."
+            return false
+        }
         SchedulePaths.ensureDirectories()
         let file = SchedulesFile(version: SchedulesFile.currentVersion, schedules: schedules)
         do {
@@ -217,8 +279,8 @@ final class ScheduleStore: ObservableObject {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.reloadRuns()
-                if status == .failed {
-                    self.lastError = "« \(schedule.name) » : le lancement a échoué "
+                if status == .failed || status == .timedOut {
+                    self.lastError = "« \(schedule.name) » : le run a échoué "
                         + "(voir l'historique)."
                 }
             }

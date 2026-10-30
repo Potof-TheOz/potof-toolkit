@@ -33,7 +33,7 @@ if let idx = CommandLine.arguments.firstIndex(of: "--ide-selftest") {
     IDESelfTest.run(arguments: CommandLine.arguments, flagIndex: idx)   // -> Never
 }
 
-// Superset Scheduler — mode headless exécuté par launchd (un `.plist` par planification).
+// Claude Scheduler — mode headless exécuté par launchd (un `.plist` par planification).
 // Vit ici, avant `NSApplication`, exactement pour la même raison que le mode ci-dessus :
 // aucune UI, aucun singleton de l'app, donc aucun risque de marcher sur l'instance GUI en
 // cours (le plus vicieux serait `NotificationChannel`, qui tronque `notifications.jsonl`).
@@ -42,7 +42,7 @@ if let idx = CommandLine.arguments.firstIndex(of: "--ide-selftest") {
 // dans `~/Library/LaunchAgents`.
 //
 //   potof-toolkit --run-schedule <uuid> [--dry-run]
-//   potof-toolkit --sched-selftest cli | plist | store | run
+//   potof-toolkit --sched-selftest pty | claude | plist | store | run | live <dossier>
 if let idx = CommandLine.arguments.firstIndex(of: "--run-schedule") {
     ScheduleRunner.run(arguments: CommandLine.arguments, flagIndex: idx)      // -> Never
 }

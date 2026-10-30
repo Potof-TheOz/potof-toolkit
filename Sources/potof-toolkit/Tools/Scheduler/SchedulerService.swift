@@ -516,8 +516,8 @@ final class SchedulerService: ObservableObject {
         out.append("  — refus d'écraser un fichier qui n'est pas à nous —")
         let intruderID = UUID(uuidString: "99999999-9999-4999-8999-999999999999")!
         let intruder = Schedule(
-            id: intruderID, name: "Intrus", action: schedules[0].action,
-            recurrence: schedules[0].recurrence, target: schedules[0].target)
+            id: intruderID, name: "Intrus", folderPath: schedules[0].folderPath,
+            action: schedules[0].action, recurrence: schedules[0].recurrence)
         let intruderURL = SchedulePaths.launchAgentPlistURL(for: intruder)
         let foreignPlist: [String: Any] = [
             "Label": intruder.launchAgentLabel,
@@ -547,8 +547,8 @@ final class SchedulerService: ObservableObject {
         out.append("  — orphelin (plist à nous, sans planification) —")
         let orphan = Schedule(
             id: UUID(uuidString: "55555555-5555-4555-8555-555555555555")!,
-            name: "Orphelin", action: schedules[0].action,
-            recurrence: schedules[0].recurrence, target: schedules[0].target)
+            name: "Orphelin", folderPath: schedules[0].folderPath,
+            action: schedules[0].action, recurrence: schedules[0].recurrence)
         _ = service.install(orphan)
         let orphanName = SchedulePaths.launchAgentPlistURL(for: orphan).lastPathComponent
         check(service.audit(against: schedules).contains(.orphanPlist(orphanName)),
