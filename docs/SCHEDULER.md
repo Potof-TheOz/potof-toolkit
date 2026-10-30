@@ -1,14 +1,19 @@
-# Superset Scheduler — lancer des agents à heure fixe
+# Claude Scheduler — lancer `claude` à heure fixe dans un dossier
 
-Quatrième outil du toolkit : on saisit un prompt, un agent, une périodicité et une cible,
-et l'app génère puis entretient un **job launchd** qui rappelle son propre binaire en mode
-**headless** pour lancer un agent Superset.
+Quatrième outil du toolkit. Une planification, c'est un **dossier**, un **préscript** shell
+facultatif, un **prompt** et une **cadence**. L'app génère puis entretient un **job
+launchd** qui rappelle son propre binaire en mode **headless**. Ce runner exécute le
+préscript, puis lance `claude` en **session interactive** dans un pseudo-terminal qu'il
+possède. La GUI rejoue la session en direct, et Claude Launcher sait la reprendre.
 
-> **Ce que l'outil garantit, et rien de plus : le lancement.** Un run réussi signifie
-> « `superset agents create` a rendu 0 », pas « le travail a été fait ». C'est pour ça que
-> le statut de succès s'appelle `launched` et **jamais** `ok` : un historique tout vert ne
-> prouve que la mise à feu. La vérification du livrable est du métier, elle reste hors de
-> cet outil (voir « Ce que le Superset Scheduler ne fait pas »).
+Il remplace le Superset Scheduler (v1), retiré avec l'abandon de Superset. Pourquoi plus
+d'IDE : [ADR 0001](adr/0001-scheduler-claude-vanilla-sans-ide.md). Pourquoi un PTY et pas
+`claude -p` : [ADR 0002](adr/0002-scheduler-session-interactive-pty.md).
+
+> **Ce que l'outil garantit : que la session a rendu la main.** Le statut de succès
+> s'appelle `completed` et **jamais** `ok` : il dit que le hook `Stop` a tiré et que la
+> session s'est fermée, pas que le travail est juste. La vérification du livrable est du
+> métier, elle reste hors de l'outil.
 
 ## Vue d'ensemble
 
@@ -26,162 +31,205 @@ ScheduleStore.shared (⭐ singleton : SEUL écrivain de schedules.json)
                                    ~/Library/LaunchAgents/
                                      com.potof.toolkit.schedule.<uuid>.plist
                                         │
-                                        │  à l'heure dite, launchd exec :
+                                        │  à l'heure dite (ou « Lancer maintenant »)
                                         ▼
                         potof-toolkit --run-schedule <uuid>
                         (mode HEADLESS, avant NSApplication — main.swift)
                                         │
                                         ▼
-                                 ScheduleRunner.execute
-                    verrou → host service → cible → gardes → agents create
+                                 ScheduleRunner
+          verrou → dossier → préscript (PTY) → claude mcp list → settings du run
+                 → session claude (PTY 120×40, hook Stop, /exit)
                                         │
-                     ┌──────────────────┴──────────────────┐
-                     ▼                                     ▼
-             runs.jsonl (append-only)         ScheduleNotifier (échec/skip)
-                     │
-                     │  tail (DispatchSource vnode, SANS O_TRUNC)
-                     ▼
-             ScheduleStore.runs → historique vivant dans l'UI
+             ┌──────────────────────────┼─────────────────────────┐
+             ▼                          ▼                         ▼
+   runs.jsonl (start/end)     logs/<runID>.tty (flux brut)   ScheduleNotifier
+             │                          │
+             │  tail (vnode)            │  tail (vnode) + TTYFileReader
+             ▼                          ▼
+   historique dans l'UI       onglet « Session » (TerminalView en lecture seule)
+                                        │
+                                        ▼  « Reprendre dans Claude Launcher »
+                              claude --resume <sessionID>
 ```
 
-Le prompt ne traverse **jamais** de shell ni de plist : `ProgramArguments` ne porte que
-`["<binaire>", "--run-schedule", "<uuid>"]`, et la CLI est appelée avec
-`arguments: [String]` (aucun échappement, donc aucune injection possible).
+Le prompt ne traverse **jamais** un shell ni un plist. `ProgramArguments` ne porte que
+`["<binaire>", "--run-schedule", "<uuid>"]`. Le runner passe le prompt en argument
+positionnel : `$SHELL -l -i -c 'exec claude "$@"' claude <args> -- <prompt>`. Le shell
+reçoit `"$@"` tel quel, et `claude` lit le prompt après `--`. Un prompt qui contient `'`,
+`$(…)`, des retours à la ligne ou qui commence par `-` arrive intact (`run.argvIntact`).
 
-## Ce que le Superset Scheduler ne fait pas
+## Déroulé d'un run
 
-C'est la partie la plus utile de cette doc : elle délimite ce que l'outil ne prend **pas**
-en charge. Elle a été écrite quand le poste portait **quatre** automations `com.potof.*`
-et que l'outil n'en remplaçait qu'une, partiellement. Depuis le **2026-08-11** il n'en
-reste que **deux** — les deux du coffre de connaissances — et ce sont précisément celles
-qu'il ne faut **pas** faire passer par ici :
+```
+ 1. RunLog.start()                                (paire start/end toujours complète)
+ 2. désactivée et déclencheur ≠ manual            → skipped « planification désactivée »
+ 3. flock(LOCK_EX|LOCK_NB) par planification      → skipped « un run est déjà en cours »
+ 4. le dossier existe et c'est un dossier ?       → failed « dossier introuvable : <chemin> »
+ 5. préscript non vide → PTY, $SHELL -l -i -c     code ≠ 0 → failed « préscript en échec (code N) »
+                                                  600 s    → failed « préscript : délai dépassé »
+ 6. MCP requis non vides → claude mcp list        indisponible → failed « MCP requis indisponibles : … »
+                                                  90 s     → failed « claude mcp list : délai dépassé »
+ 7. settings du run = settings de la planif + hook Stop
+                                                  illisible → failed « fichier de settings illisible : … »
+ 8. session claude dans le PTY (délai = timeoutMinutes)
+       hook Stop vu puis /exit          → completed « session terminée »
+       sortie sans hook Stop            → failed « claude s'est arrêté avant la fin de sa réponse (code N) »
+       délai dépassé                    → timedOut « délai de N min dépassé »
+       dialogue de confiance            → failed « dossier non approuvé par Claude : ouvrez-le une fois dans Claude Launcher »
+       fork impossible                  → failed « lancement impossible »
+ 9. échec, skip ou délai sous launchd → bannière (ScheduleNotifier), APRÈS la ligne `end`
+```
 
-| Automation restante | Forme | Pourquoi elle reste en bash |
-|---|---|---|
-| `knowledge-garden.sh` | un agent `claude -p` **par note échue**, chien de garde TERM/KILL | boucle, budget et timeouts sont **dans** le script — le Scheduler ne lance qu'un agent, une fois |
-| `knowledge-sync.sh` | git pur (commit par pathspec), aucun agent | il n'y a aucun agent à lancer, donc rien à planifier côté Superset |
+Ces messages sont vérifiés au mot près par `--sched-selftest run`. Le `.tty` reçoit un
+bandeau `── préscript ──` puis `── claude ──` : la vue « Session » montre les deux.
 
-Les deux portent leurs garde-fous dans le script et n'ont besoin ni de workspace, ni de
-worktree, ni de la CLI `superset`. Les planifier reviendrait à refaire ce que launchd fait
-déjà pour elles, en perdant leur logique propre. L'outil sert à créer la **prochaine**
-automation sans réécrire 500 lignes de bash, pas à absorber celles qui existent.
+Le `sessionID` est un UUID neuf par run, **toujours en minuscules**. Il est imposé à
+`claude` par `--session-id`, écrit dans la ligne `end` dès l'étape 8, et sert à retrouver
+la conversation (`~/.claude/projects/<dossier encodé>/<sessionID>.jsonl`).
 
-### La paire Sentry : le lancement est repris, la vérification du livrable est PERDUE
+### Le préscript
 
-Le pipeline bash Sentry — `superset-daily-sentry.sh` (le lancement),
-`sentry-daily-collect.sh` (vérification du livrable et promotion d'un point de reprise) et
-`sentry-report-promote.sh` — **n'existe plus.** Il a été supprimé du dépôt
-`potof-claude-skills` le 2026-08-11 (commit `2d21368`) avec ses deux LaunchAgents
-`com.potof.sentry-*`, `ARCHITECTURE_SENTRY.md` et les symlinks correspondants de
-`~/Scripts/`. Les deux labels sont `disabled` (`launchctl print-disabled gui/$UID`) et ne
-sont plus chargés.
+Facultatif. Exécuté dans le dossier par `$SHELL -l -i -c`, dans le même PTY enregistré
+que la session. Il sert à préparer le dossier : `git pull`, un `npm install`, un export.
+**Il est attendu jusqu'au bout.** Un code ≠ 0 ou un délai dépassé (600 s, fixe) fait
+échouer le run, et `claude` n'est **pas** lancé : une session ne part pas sur un dossier à
+moitié préparé. Un préscript qui attend une saisie (git qui demande un mot de passe) finit
+donc en `failed` au bout du délai (`run.preScriptHangs`).
 
-Il ne subsiste de ce pipeline que `scripts/sentry-report.settings.json`, parce que son
-chemin `~/Scripts/sentry-report.settings.json` est **codé en dur dans les `args`** de
-l'agent Superset `dc0a5495-…` (`--settings <chemin>`) qu'utilisent les deux planifications
-Sentry. Le déplacer sans corriger la config d'agent casserait les deux.
+`$SHELL` n'est retenu que si c'est zsh, bash ou sh ; sinon `/bin/zsh`. Le login shell
+interactif (`-l -i`) recharge le PATH des rc, comme les sessions de Claude Launcher.
 
-Donc le Scheduler ne remplace pas « une automation partiellement » : il a repris à son
-compte **le lancement** des deux veilles Sentry. Mais le collecteur faisait **deux** choses,
-et il faut les séparer — les confondre a été une erreur de cette section :
+### La session : un PTY 120×40 possédé par le runner
 
-| Rôle du collecteur | Statut aujourd'hui |
+`PTYProcess` lance la commande par `PseudoTerminalHelpers.fork` (SwiftTerm, sans vue) dans
+une grille **fixe de 120 colonnes × 40 lignes**. La GUI rejoue le flux dans un
+`TerminalView` forcé à la même grille : un autre format ferait mal rendre un TUI dessiné
+pour 120 colonnes. Si le panneau est plus petit, le conteneur défile.
+
+`forkpty` fait de l'enfant le chef de session et de son groupe. Tous les signaux visent le
+**groupe** (`kill(-pid, …)`), petits-enfants compris (`pty.killsGroup`). Arrêt gradué :
+SIGTERM, puis SIGKILL après 3 s.
+
+Une session interactive **ne se termine pas d'elle-même** : elle reste au prompt après sa
+réponse. La fin se décide ainsi :
+
+1. Le runner écrit `logs/<runID>.settings.json` : les settings de la planification
+   (facultatifs, objet JSON obligatoire), plus **en fin** de `hooks.Stop` un hook
+   `touch '<logs/<runID>.stop>'`. Les hooks `Stop` de l'utilisateur restent intacts.
+2. Quand le marqueur apparaît, le runner écrit `/exit\r` dans le PTY. Si la session n'est
+   pas sortie 10 s plus tard, il tue le groupe. Fin `completed` dans les deux cas.
+3. Sans marqueur, le délai de la planification (`timeoutMinutes`, 1…240, défaut 60) tue le
+   groupe. Fin `timedOut`, `.tty` conservé.
+
+### Le dialogue de confiance
+
+Dans un dossier que `claude` n'a jamais approuvé, la session reste bloquée sur « Do you
+trust this folder? ». Personne n'est là pour répondre. Le runner examine les 64 premiers
+Ko du flux : séquences d'échappement retirées, blancs retirés, minuscules, recherche de
+`trustthisfolder`. Le TUI espace ses mots par des déplacements de curseur (`ESC [ 1 C`),
+pas par des espaces : d'où le retrait des blancs. Trouvé ⇒ groupe tué, run `failed` en
+quelques secondes (`run.untrusted`), et la vue « Session » montre le dialogue.
+
+Le remède est manuel : ouvrir le dossier une fois dans Claude Launcher et accepter.
+L'approbation vit dans `~/.claude.json` (`projects[<chemin>].hasTrustDialogAccepted`). Le
+formulaire et la simulation la lisent (`ClaudeInvocation.isTrusted`) pour **avertir**, sans
+bloquer : seule la détection dans le PTY fait foi. Les dossiers parents ne comptent pas.
+
+### `dontAsk`, pont IDE coupé, environnement nettoyé
+
+Personne n'est devant l'écran pendant un run. Deux réglages en découlent, **toujours** :
+
+- **`--permission-mode dontAsk`** — jamais `bypassPermissions` ni `acceptEdits`. Un prompt
+  de permission figerait la session jusqu'au délai ; `dontAsk` refuse ce que les settings
+  n'autorisent pas, et le run continue. Ce qui doit être permis se déclare dans le fichier
+  de settings de la planification (`permissions.allow`).
+- **`CLAUDE_CODE_AUTO_CONNECT_IDE=false`** — sinon `claude` s'auto-connecterait au pont IDE
+  de Potof, et un `openDiff` bloquant ouvrirait la fenêtre de revue sans personne pour y
+  répondre. C'est la première condition testée par `claude` 2.1.314.
+
+L'environnement de la session (`ClaudeInvocation.environment`) part de celui du runner,
+puis :
+
+| Retiré | Pourquoi |
 |---|---|
-| Calculer et promouvoir le **point de reprise** | **Sans objet** — émigré dans le livrable, voir ci-dessous |
-| Vérifier qu'un run a **effectivement produit** son rapport | ⚠️ **Supprimé sans remplaçant** |
+| toute clé `CLAUDE_CODE_*` héritée | `CLAUDE_CODE_SSE_PORT` brancherait la session sur un port IDE mort ; `CLAUDE_CODE_CHILD_SESSION` (hérité quand on teste depuis une session Claude) empêche d'enregistrer la conversation, donc toute reprise |
+| `CLAUDECODE` | même famille : marqueur de session parente |
+| `POTOF_SESSION_ID` | clé des notifications : héritée, elle attribuerait les événements du run à une session Potof sans rapport |
 
-Le second rôle n'a **rien** qui le tienne. `RunStatus` ne va jamais plus loin que
-`launched` (la mise à feu, pas le résultat) et `SchedulerService.audit()` ne regarde que le
-nom, le chemin et l'orphelinat des `.plist` — **jamais la fraîcheur d'un run ni la présence
-d'un livrable**. C'est cohérent avec la promesse de l'outil affichée en tête de cette doc
-(« la vérification du livrable est du métier, elle reste hors de cet outil »), mais ça veut
-dire qu'un gel ne se signale pas tout seul.
+| Posé | Valeur |
+|---|---|
+| `TERM` / `COLORTERM` | `xterm-256color` / `truecolor` |
+| `CLAUDE_CODE_AUTO_CONNECT_IDE` | `false` (posé après le retrait des `CLAUDE_CODE_*`) |
+| `LANG` | `en_US.UTF-8`, seulement s'il est absent |
 
-📎 **« Le script de référence »**, cité quatre fois plus bas dans cette doc (déroulé d'un
-run, matching de workspace, regex `pgrep`), désigne ce `superset-daily-sentry.sh` — ses
-541 lignes ne sont **plus sur le disque**. Les leçons qu'on lui a prises restent vraies et
-restent décrites ici ; pour relire l'original :
-`git -C ~/WebstormProjects/potof-claude-skills show 2d21368^:scripts/superset-daily-sentry.sh`.
+Le shell de login peut redonner une de ces variables si un rc la pose : c'est voulu, le
+runner ne réécrit pas les rc de l'utilisateur.
 
-> ⚠️ **Résidu à connaître** : les deux `.plist` `com.potof.sentry-daily` et
-> `com.potof.sentry-collect` sont **toujours** dans `~/Library/LaunchAgents`, désactivés,
-> pointant vers des scripts qui n'existent plus. Le Scheduler ne les touchera **jamais** :
-> sa règle des deux conditions (nom `com.potof.toolkit.schedule.<uuid>.plist` **ET**
-> `ProgramArguments[0]` finissant par `/potof-toolkit`) le lui interdit, et c'est voulu —
-> voir « Écrire dans `~/Library/LaunchAgents` ». Leur suppression est un geste manuel.
+### Les MCP requis : `claude mcp list`
 
-### Le prompt est une chaîne littérale — et c'est ce qui a absorbé le point de reprise
+Certaines planifications n'ont aucun sens sans un MCP (le rapport Sentry sans Sentry). Chaque
+planification liste donc ses **MCP requis**. Avant la session, le runner lance
+`claude mcp list` dans le même shell de login et le même dossier, avec 90 s de délai, et
+échoue en nommant chaque MCP manquant : `nom (needs-auth)`, `nom (échec : …)`,
+`nom (absent)`.
 
-**Aucune substitution de jeton au lancement.** Une veille qui a besoin d'une fenêtre
-temporelle doit la faire calculer **par l'agent** (« depuis le rapport le plus récent de
-tel dossier, celui du jour exclu ; à défaut les 24 dernières heures ; jamais au-delà de
-30 jours »). C'est un choix assumé : le planificateur ne connaît aucun métier.
+**Ce n'est pas `-p` qui fait foi.** En `claude -p`, le plugin Sentry disparaît, supplanté par
+le connecteur « claude.ai Sentry » jamais autorisé (réglé hors dépôt par `deniedMcpServers`
+dans `~/.claude/settings.json`). En session interactive, le plugin est gardé. `mcp list` est
+donc le contrôle qui reflète ce qu'aura la session.
 
-Ce n'est pas qu'une contrainte, c'est le mécanisme qui a rendu le promoteur inutile :
-**le point de reprise a émigré dans le livrable lui-même.** Le prompt des planifications
-Sentry impose les trois premières lignes du rapport :
+⚠️ `claude mcp list` tourne avec sa sortie sur un **tube** (`… mcp list | cat`, avec
+`pipefail`), pas sur le PTY. Mesuré le 2026-10-30 : face à un terminal, il remplace les
+espaces par des déplacements de curseur, coupe les lignes à la largeur de la grille et
+réécrit ses premières lignes — illisible pour `MCPList.parse`. Sur un tube, il imprime des
+lignes simples.
 
-```
-STATUS: OK                                   ← ou « STATUS: ECHEC — <raison> »
-FENÊTRE-SUIVANTE: <date du jour>T00:00:00Z
-FENÊTRE-ANALYSÉE: <since> → aujourd'hui
-```
+### « Lancer maintenant » est détaché
 
-et il le dit sans détour : « elles **SONT** le point de reprise du prochain run, il n'y en
-a pas d'autre ». Le run suivant relit le rapport le plus récent dont la ligne 1 vaut
-`STATUS: OK`, et repart de sa `FENÊTRE-SUIVANTE`. Deux propriétés en découlent :
+`ScheduleStore.runNow` lance le binaire de l'app (`--run-schedule <uuid>`, environnement
+hérité + `POTOF_SCHEDULE_TRIGGER=manual`) comme un process **détaché**, sans tube. On
+n'attend pas sa fin : le tail de `runs.jsonl` et du `.tty` met l'UI à jour. Conséquence
+voulue : **quitter Potof n'interrompt pas un run**, qui écrit sa ligne `end` tout seul. Un
+run manuel ne poste pas de bannière : l'utilisateur regarde déjà l'écran.
 
-- Un `STATUS: ECHEC` s'écrit **sans** ligne `FENÊTRE-SUIVANTE` — donc la fenêtre non
-  couverte est reprise au run d'après, au lieu d'être perdue en silence. C'est exactement
-  le rôle que tenait le promoteur, rendu par une consigne de rédaction.
-- L'horodatage est **minuit UTC du jour**, jamais l'heure de fin d'analyse : le run suivant
-  re-couvre le temps passé à analyser plutôt que de le sauter.
+Sur une planification désactivée, « Lancer maintenant » part quand même : c'est un geste
+explicite. Le verrou par planification exclut un tir launchd simultané.
 
-Plus de fichier d'état, plus de promoteur : l'agent lit sa propre production. Contrôle
-indépendant que **ce mécanisme-là** fonctionne — la chaîne de `~/sentry-reports/` est
-continue **du 6 au 11 août 2026**, week-end enjambé (le rapport du lundi 10 repart bien du
-vendredi 7 à `00:00:00Z`), sans un trou et sans collecteur.
+### Voir et reprendre
 
-> ⚠️ **Ce contrôle ne prouve QUE le calcul de fenêtre — pas que la veille tourne.** Mesuré
-> le **2026-08-31** : les trois jobs sont chargés et `enabled`, et pourtant `~/sentry-reports/`
-> s'arrête au **11 août** et `runs.jsonl` n'a plus **une seule ligne** après
-> `2026-08-11T08:00:23Z`. Environ **13 occurrences ouvrées perdues**, sans un signal.
->
-> La cause n'est pas un bug : le Mac est resté **éteint** (boot du 2026-08-31 08:59), donc le
-> domaine `gui/<uid>` n'existait pas et `StartCalendarInterval` ne rattrape rien — exactement
-> ce que décrit « Sommeil, extinction, rattrapage ». Le problème est qu'**absolument rien ne
-> le dit** : pas de ligne `skipped`, pas de bannière, pas de bandeau d'audit. Le trou ne se
-> voit qu'en regardant la date du dernier fichier de `~/sentry-reports/`.
->
-> Et il se refermera **en silence** : le prochain run repartira du dernier
-> `FENÊTRE-SUIVANTE` connu et re-couvrira les 20 jours (la borne de 30 jours du prompt n'a
-> pas mordu), en le disant dans le rapport — mais personne n'aura été averti que la veille
-> était morte pendant trois semaines. Le profil de permissions de l'agent le note dans les
-> mêmes termes : « depuis le retrait du collecteur RIEN ne détecte plus ce gel […] ce qui
-> rattrape le trou sans le signaler ».
->
-> **Chantier ouvert** : un contrôle de fraîcheur (« aucun run `launched` depuis N jours
-> ouvrés alors que la planification est active ») est la seule pièce du collecteur qui
-> mériterait d'être reprise côté outil. Elle n'existe pas.
+L'onglet **« Session »** rejoue le `.tty` du run choisi dans un `TerminalView` SwiftTerm
+(pas `LocalProcessTerminalView` : aucun process côté GUI). Lecture seule : saisie jetée,
+souris non rapportée. Un `DispatchSource` vnode suit le fichier, et `TTYFileReader` ne lit
+que la suite depuis le dernier décalage. Un run terminé se lit d'une traite. L'onglet
+s'affiche par défaut quand un run tourne ; un clic dans l'historique y ouvre le run choisi.
+
+**« Reprendre dans Claude Launcher »** ouvre `claude --resume <sessionID>` dans le dossier
+et bascule d'outil. Le bouton est grisé, avec la raison au survol, quand le run tourne
+encore ou quand la conversation `<sessionID>.jsonl` est introuvable (run arrêté avant
+l'étape 8). On ne saisit jamais dans la session pendant le run : on la reprend après.
 
 ## Les fichiers
 
 ```
 ~/Library/Application Support/PotofToolkit/scheduler/
-├── schedules.json        ← source de vérité. Écrite UNIQUEMENT par la GUI, atomiquement.
-├── runs.jsonl            ← historique append-only. Écrit par la GUI ET par le headless.
-├── logs/<runID>.log      ← sortie détaillée d'un run
+├── schedules.json                  ← source de vérité (v2). Écrite UNIQUEMENT par la GUI, atomiquement.
+├── runs.jsonl                      ← historique append-only. Écrit par la GUI ET par le headless.
+├── logs/<runID>.log                ← journal détaillé du run
+├── logs/<runID>.tty                ← flux brut du PTY (préscript puis session), rejoué par la GUI
+├── logs/<runID>.settings.json      ← settings passés à claude --settings
+├── logs/<runID>.stop               ← marqueur posé par le hook Stop
 └── locks/<scheduleID>.lock
 ~/Library/Logs/PotofToolkit/schedule-<uuid>.out.log   ← StandardOutPath du job
 ~/Library/LaunchAgents/com.potof.toolkit.schedule.<uuid>.plist
 ```
 
-**Pourquoi des fichiers et pas `UserDefaults`.** Pas pour l'histoire du domaine qui
-diffère entre dev et bundlée (vrai, mais hors sujet : sous launchd, Foundation remonte
-bien à l'enveloppe `.app`). Les vraies raisons : `UserDefaults` ne notifie pas de façon
-fiable les écritures d'un **autre process**, donc l'historique live serait impossible ; et
-une lecture-modification-écriture sur un tableau perdrait silencieusement des données
-quand la GUI édite pendant qu'un run headless écrit.
+Aucune purge des fichiers de `logs/` pour l'instant : à revoir si le dossier grossit.
+
+**Pourquoi des fichiers et pas `UserDefaults`.** `UserDefaults` ne notifie pas de façon
+fiable les écritures d'un **autre process** : l'historique et la session en direct seraient
+impossibles. Et une lecture-modification-écriture sur un tableau perdrait des données quand
+la GUI édite pendant qu'un run headless écrit.
 
 ### L'invariant qui supprime toute une classe de bugs
 
@@ -192,25 +240,42 @@ Corollaire visible dans le modèle : **il n'y a pas de `lastRunAt` dans `Schedul
 date du dernier run est **dérivée** de `runs.jsonl`. Sans ça, il faudrait arbitrer des
 courses entre deux process.
 
+### `schedules.json` v2
+
+`SchedulesFile.currentVersion = 2`. `Action` est encodé à la main avec un discriminant
+`"kind" : "claude"`. À la lecture :
+
+| État du fichier | Effet |
+|---|---|
+| absent | liste vide |
+| v2 | chargé |
+| **v1** (Superset Scheduler) | liste vide, et la GUI réécrit un v2 vide. Suppression décidée le 2026-10-30 ([ADR 0001](adr/0001-scheduler-claude-vanilla-sans-ide.md)) |
+| illisible | liste vide, **rien n'est réécrit**, bandeau d'erreur |
+
+Le headless lit par le statique `ScheduleStore.loadFromDisk()` et ne réécrit jamais rien.
+
 ### `runs.jsonl` — deux lignes par run
 
 ```json
-{"at":"…","phase":"start","pid":41207,"runID":"…","scheduleID":"…","trigger":"launchd","v":1}
-{"at":"…","message":"agent … lancé","phase":"end","runID":"…","status":"launched",…,"v":1}
+{"at":"…","phase":"start","pid":41207,"runID":"…","scheduleID":"…","trigger":"launchd","v":2}
+{"at":"…","message":"session terminée","phase":"end","runID":"…","sessionID":"…","status":"completed",…,"v":2}
 ```
 
 Deux lignes plutôt qu'une écrite à la fin : une ligne est **toujours complète** quand elle
 est écrite ; un run en cours est visible immédiatement ; un run interrompu (crash, reboot)
-se lit tout seul — `start` sans `end` avec un pid mort ⇒ `interrupted`.
+se lit tout seul — `start` sans `end` avec un pid mort ⇒ `interrupted`. Les lignes v1
+(statut `launched`) ne se décodent plus et sont sautées.
 
-`status` ∈ `launched` | `failed` | `skipped` | `running` | `interrupted`.
-**`skipped` n'est pas un échec** : c'est un garde-fou qui a joué. L'UI le montre en orange,
-`failed` en rouge — les confondre revient à crier au loup tous les jours jusqu'à ne plus
-regarder.
+`status` ∈ `completed` | `failed` | `skipped` | `timedOut`, plus `running` et
+`interrupted`, **dérivés** par le pliage et jamais écrits. **`skipped` n'est pas un
+échec** : c'est un garde-fou qui a joué. L'UI le montre en orange, `failed` en rouge — les
+confondre revient à crier au loup tous les jours jusqu'à ne plus regarder. `timedOut` a sa
+propre pastille : la session tournait encore, elle a été tuée.
 
 Écriture : `open(O_WRONLY|O_CREAT|O_APPEND)` → `flock(LOCK_EX)` → **un seul** `write` →
 `flock(LOCK_UN)` → `close`. D'où le plafond de 500 caractères sur `message` et
-l'interdiction d'y mettre un corps de log (il va dans `logs/<runID>.log`).
+l'interdiction d'y mettre un corps de log (il va dans `logs/<runID>.log`, le flux du
+terminal dans `logs/<runID>.tty`).
 
 **Compaction** : au lancement de la GUI seulement, au-delà de 2 Mo, on garde les 1 000
 dernières lignes par réécriture **en place** (`ftruncate`). ⚠️ **Jamais de `rename`** — ça
@@ -261,18 +326,20 @@ clés qui contraignent.
 ### Le plist
 
 Généré par `PropertyListSerialization.data(fromPropertyList:format:.xml)` — **jamais** de
-template de chaîne. (Il avale un `[String: Any]` Swift avec `Bool`/`Int`/`String` et des
-conteneurs imbriqués, sans aucun pontage `NSNumber` manuel.)
+template de chaîne.
 
 - **`RunAtLoad = false` impérativement.** `bootstrap` a lieu à chaque ouverture de session
-  **et** à chaque réinstallation du plist. `true` lancerait un agent à chaque login et à
+  **et** à chaque réinstallation du plist. `true` lancerait une session à chaque login et à
   chaque clic sur Enregistrer. **Ce n'est pas un mécanisme de rattrapage** — c'est le
   contresens à ne pas faire.
 - **Pas de `KeepAlive`** : un run qui échoue ne doit surtout pas être relancé en boucle.
 - launchd **ne développe pas `$HOME`** dans `EnvironmentVariables` : chemins littéraux
   absolus, construits depuis `NSHomeDirectory()`.
-- Le PATH par défaut sous launchd est `/usr/bin:/bin:/usr/sbin:/sbin`. Le plist pose donc
-  un PATH complet — et `SupersetCLI` le repose lui-même, ceinture et bretelles.
+- Le PATH par défaut sous launchd est `/usr/bin:/bin:/usr/sbin:/sbin`. Le plist pose un
+  plancher (`~/.local/bin`, où l'installeur natif pose `claude`, puis Homebrew et le
+  système) ; le shell de login du runner recharge ensuite le PATH complet des rc.
+- `POTOF_SCHEDULE_TRIGGER=launchd` dans `EnvironmentVariables` : c'est ce qui distingue un
+  tir launchd d'un run manuel (`manual`) ou lancé depuis un terminal (`cli`).
 
 ### `bootstrap` / `bootout`, pas `load` / `unload`
 
@@ -297,182 +364,31 @@ status  : launchctl print gui/<uid>/<label>     # exit 0 = chargé
 |---|---|---|
 | Mac **endormi** à l'heure dite | le job démarre **au réveil**, occurrences manquées coalescées en une seule | rien |
 | On voudrait **réveiller** la machine | `StartCalendarInterval` ne réveille pas | hors périmètre (ce serait `pmset repeat`) |
-| Mac **éteint** / session fermée | le domaine `gui/<uid>` n'existe pas, occurrences **perdues** | on **signale**, on ne relance jamais tout seul |
+| Mac **éteint** / session fermée | le domaine `gui/<uid>` n'existe pas, occurrences **perdues** | on ne relance jamais tout seul |
 
-Pas d'auto-rattrapage : après une semaine de vacances, il lancerait N agents simultanés
-dans le même worktree permanent — exactement ce que le garde-fou « agent vif » existe pour
-éviter. Et rejouer une veille de mardi dernier n'a aucun sens métier.
+Pas d'auto-rattrapage : après une semaine de vacances, il lancerait N sessions simultanées
+dans le même dossier. Et rejouer la veille de mardi dernier n'a aucun sens métier.
 
-## Déroulé d'un run
-
-```
- 1. argv → scheduleID, dryRun                          invalide → exit 64
- 2. schedules.json → le schedule                       absent   → exit 66
- 3. RunLog.start()                                     (paire start/end toujours complète)
- 4. désactivée ? (sauf « Lancer maintenant »)          → skipped, exit 0
- 5. flock(LOCK_EX|LOCK_NB)                    déjà pris → skipped, exit 0
- 6. host service : status --json → open -g -a Superset → superset start --daemon
-                                              injoignable → failed, exit 1
- 7. résolution de la cible (voir ci-dessous)
- 8. GARDE worktree : le dossier existe ?               absent → failed
- 9. GARDE agent vif (workspace permanent seulement)    vivant → skipped
-10. rafraîchissement PAR LE RUNNER (si demandé) :
-       git fetch origin --prune ; git reset --hard origin/<base>   échec → failed
-11. superset agents create …                           ≠ 0 → failed, exit 1
-12. finish(.launched) + exit 0
-13. échec/skip sous launchd → bannière (ScheduleNotifier), APRÈS la ligne `end`
-```
-
-Les points 7, 9, 10 et 12 sont repris du script de référence : ce sont des leçons payées en
-production.
-
-### Résolution de la cible — la règle qui évite le pire
-
-> **On stocke les COORDONNÉES du workspace (`projectID` + `workspaceName`), jamais son
-> `workspaceID`.** Un workspace supprimé puis recréé garde son nom et **change d'id** : la
-> résolution se refait donc à chaque run.
-
-> **Le matching se fait sur `(projectId, name)`, jamais sur le nom seul.** Mesuré sur ce
-> poste : deux workspaces s'appellent « Sentry report », un par projet suivi — c'est
-> normal, le script de référence a un `WS_NAME` constant et boucle sur les groupes. Un
-> matching par nom seul ferait résoudre la planification « portal » vers le workspace
-> « shopify ».
-
-> ⚠️ **Mais `(projectId, name)` n'est pas non plus une clé unique : Superset accepte deux
-> workspaces HOMONYMES dans le MÊME projet.** Constaté en recette. Deux conséquences, et
-> les deux ont été des bugs réels :
->
-> 1. **Après un `create`, on identifie le nouveau workspace par différence
->    d'identifiants**, jamais par son nom. Chercher par nom pouvait rendre un workspace
->    **préexistant** : l'agent partait dans le worktree de quelqu'un d'autre pendant que
->    celui qu'on venait de créer restait vide.
-> 2. **Le nom d'un workspace neuf porte les SECONDES** (`<préfixe> AAAA-MM-JJ HH:mm:ss`).
->    À la minute, deux runs rapprochés — un « Lancer maintenant » cliqué deux fois —
->    fabriquaient deux workspaces au nom identique. Ne pas retirer les secondes.
->
-> Et pour une cible **permanente**, si plusieurs workspaces portent le nom visé dans le
-> projet, le run **abandonne en le disant** plutôt que d'en choisir un : faire travailler
-> un agent dans un worktree que personne ne regarde est pire que ne rien faire.
-
-> **`workspaces()` rend `nil` quand la liste est ILLISIBLE, ce qui n'est pas une liste
-> vide.** Sur `nil`, le run **abandonne**. Créer à l'aveugle dupliquerait le workspace
-> permanent — et la duplication n'est pas théorique.
-
-On **ne parse jamais la sortie de `create`** : sa forme JSON n'est pas un contrat public.
-On relit la liste, qui en est un. Une seule forme de données à connaître.
-
-### `AgentPresence` — ce qu'il voit, et ce qu'il ne voit pas
-
-Le garde-fou répond à « un agent `claude` travaille-t-il encore dans ce worktree ? » :
-`pgrep -fl claude` → filtre sur le **premier token d'argv** → `lsof -a -p <pid> -d cwd -Fn`
-→ comparaison après `resolvingSymlinksInPath().standardized` (`/private/var` contre `/var`).
-
-Quatre faits mesurés :
-
-- **La regex du script de référence est cassée** : `pgrep -f '/\.local/bin/claude$'` trouve
-  un `claude` sans argument mais **manque** `claude --effort xhigh <prompt>` — dès qu'il y
-  a des arguments, le `$` ne matche plus. Ne jamais ancrer sur la fin de la ligne d'argv.
-- **`pgrep -fl` n'est pas une ligne par process** : un agent lancé avec un prompt multiligne
-  étale ses arguments sur des dizaines de lignes. Le filtre robuste est « premier token
-  entièrement numérique **et** deuxième token = exécutable `claude` reconnu ».
-- **Trois formes d'`argv[0]`** coexistent : `~/.local/bin/claude` (shim),
-  `~/.local/share/claude/ClaudeCode.app/Contents/MacOS/claude`, et
-  `~/.local/share/claude/versions/<version>` — d'où la condition `/claude/versions/`.
-- **Limite à connaître** : la détection repose sur le **`cwd`** du process. Les agents
-  lancés par `superset agents create` ont bien leur worktree comme `cwd` (vérifié), donc le
-  garde-fou couvre le cas qu'il doit couvrir. Mais une session `claude` démarrée autrement
-  — par exemple depuis `$HOME` puis naviguée — est **invisible** pour lui.
-
-Et ce sur quoi on ne construit rien : **le champ `exited` des terminaux Superset ne dit pas
-si l'agent a fini** — le shell survit à la sortie de `claude` et reste `exited: false` des
-heures après. La mort du process est la seule condition qui fasse foi.
-
-### « Pourquoi ne pas lancer quand même, dans un nouvel onglet ? »
-
-Question posée, et **tranchée : non.** Techniquement `agents create` sait le faire — un
-second appel ouvre une seconde session dans le même workspace. Mais le problème n'est pas
-l'onglet, c'est le **worktree partagé** : deux sessions, un seul système de fichiers, donc
-deux agents qui éditent les mêmes fichiers s'écrasent et se marchent dessus sur l'index git.
-S'y ajoute une contrainte dure : le garde-fou passe **avant** le rafraîchissement, donc le
-contourner ferait partir un `git reset --hard` sous les pieds de l'agent au travail.
-
-Un run sauté est visible en orange dans l'historique et ne coûte rien. **Si de la
-concurrence est vraiment voulue, la réponse architecturale existe déjà : la cible
-« nouveau workspace à chaque run »**, qui donne un worktree isolé — au prix des ~2 Go par
-exécution. Ne pas réintroduire d'option « lancer quand même » sans relire ce paragraphe.
-
-### ⚠️ Les sessions ne meurent jamais — conséquence opérationnelle
-
-Un agent lancé par `superset agents create` est une session **interactive** (les configs
-d'agent n'ont pas `-p`) : elle ne se termine pas en fin de tâche, elle reste au prompt.
-Mesuré sur ce poste — process `claude` encore vivants après **1 à 2 jours** dans quatre
-worktrees distincts.
-
-Conséquence directe : **une planification dont le worktree contient une session résiduelle
-est sautée à chaque exécution, indéfiniment.** Ça n'était pas visible avant, parce que la
-regex `pgrep` du script de référence était cassée (elle ratait les `claude` lancés avec des
-arguments) : le garde-fou n'y tirait jamais, d'où l'accumulation. La version corrigée, elle,
-tire vraiment.
-
-**Décision : on ne compense pas côté outil, on ferme les sessions à la main** dans Superset
-quand un run apparaît en orange. Trois pistes ont été examinées et écartées :
-
-- **Durée de vie sur le garde-fou** (ignorer un agent de plus de N heures) : faisable en
-  ~15 LOC via `ps -o etime`, mais ajoute un seuil arbitraire à comprendre lors d'un diagnostic.
-- **Instruction « ferme ta session » dans le prompt** : le profil de permissions laisse la
-  plupart des `Bash` sur `ask`, et un `ask` en session non surveillée **fige** l'agent —
-  sans allow explicite, l'instruction le ferait pendre au lieu de le terminer. Et
-  `superset terminals close` exige un `--terminal <id>` que l'agent ne connaît pas ; le
-  registre est de toute façon peu fiable (`terminals list` a rendu `{"sessions": []}` alors
-  que des process vivaient dans le worktree).
-- **`claude -p`**, qui sortirait naturellement : exclu pour le cas Sentry — le MCP Sentry
-  est un MCP HTTP distant en OAuth qu'un process non interactif ne peut pas authentifier
-  (faux négatif « aucun outil Sentry disponible »).
-
-## La CLI `superset`
-
-`~/.superset/bin/superset` **n'est pas un exécutable Mach-O** : c'est un shim `#!/bin/sh`
-qui `exec` le vrai binaire dans `Superset.app`. `posix_spawn` suit le shebang, donc
-`Process.executableURL` sur le shim fonctionne — c'est le point d'entrée stable. Repli sur
-le chemin interne à `Superset.app` s'il manque.
-
-**Environnement nettoyé avant chaque appel** :
-
-| Variable | Pourquoi |
-|---|---|
-| `CLAUDE_CODE_SSE_PORT` | court-circuite la découverte des locks IDE : l'agent spawné se brancherait sur un **port IDE mort** hérité |
-| `POTOF_SESSION_ID` | clé de mapping des notifications : héritée, elle attribuerait les events du nouvel agent à une session Potof sans rapport |
-| `CI`, `CLAUDECODE` | la CLI passe « auto-on `--json` under CI/agent envs » ⇒ parsing non déterministe. **`CI=1` seul suffit à faire sortir du JSON sans `--json`** (mesuré) : on nettoie **et** on passe `--json` partout |
-| `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` | détourneraient le `fetch`/`reset` vers un autre dépôt |
-
-Formes observées (CLI `1.18.3`, non contractuelles — décodage **tolérant** partout) :
-
-- `agents list --local --json` rend `{ id, presetId, iconId, label, command, args, … }` —
-  **ni `name`, ni `preset`**. `SupersetAgentConfig` mappe `label` → `name`,
-  `presetId` → `preset`.
-- **Un `id` d'agent n'est pas toujours un UUID** : l'entrée « Superset » a `id == "superset"`.
-  Toute validation par regex UUID casserait.
-- `status --json` rend `{ running, healthy, pid, port, endpoint, …, hostName }`, où
-  `hostName` vaut **`null`** sur ce poste : ne rien construire dessus.
-- `workspaces create` accepte `--local`, **`agents create` non** (il n'a que `--host`).
-  `--prompt` est **obligatoire dès que `--agent` est posé**.
-
-⚠️ **`superset start --daemon` est un piège de shell-out** : le daemon peut hériter de
-stdout, donc `readDataToEndOfFile()` sur le thread appelant **ne revient jamais**, même
-après la mort du fils. La lecture des pipes est déportée sur des files de fond — sans ça,
-un job launchd resterait pendu indéfiniment.
+> ⚠️ **L'angle mort : un Mac éteint ne laisse AUCUNE trace.** Mesuré le 2026-08-31 avec
+> l'ancien outil : Mac éteint trois semaines, environ 13 occurrences ouvrées perdues, et
+> pas une ligne `skipped`, pas une bannière, pas un bandeau d'audit. Le trou ne se voyait
+> qu'à la date du dernier livrable. C'est toujours vrai : rien ne contrôle la **fraîcheur**
+> des runs (« aucun `completed` depuis N jours alors que la planification est active »).
+> Une veille qui calcule sa fenêtre depuis son propre dernier livrable re-couvrira le trou
+> au run suivant, mais personne n'aura été averti.
 
 ## Notifications
 
 `ScheduleNotifier.post(...)` — `UserNotifications`, depuis le runner, **uniquement** sur
-`failed` ou `skipped`, et **uniquement** si `POTOF_SCHEDULE_TRIGGER == launchd`
-(« Lancer maintenant » n'a rien à notifier, l'utilisateur regarde déjà l'écran). Appelée
-**après** l'écriture de la ligne `end` : un canal de notification défaillant ne doit jamais
-coûter la trace du run. Le sort de la bannière est lui-même consigné dans le log du run.
+`failed`, `skipped` ou `timedOut`, et **uniquement** si `POTOF_SCHEDULE_TRIGGER == launchd`
+(« Lancer maintenant » n'a rien à notifier, l'utilisateur regarde déjà l'écran). Le titre
+distingue les cas : « run sauté », « délai dépassé », « échec ». Appelée **après**
+l'écriture de la ligne `end` : un canal de notification défaillant ne doit jamais coûter la
+trace du run. Le sort de la bannière est lui-même consigné dans le log du run.
 
 Pourquoi pas le canal interne de la cloche : `ChannelEvent.potofSessionId` est
-non-optionnel (le runner n'a pas de session), et surtout `NotificationChannel.start()` fait
-un `O_TRUNC` — une notif écrite app fermée serait effacée à l'ouverture suivante. Or
+non-optionnel (le runner n'a pas de session Potof), et surtout `NotificationChannel.start()`
+fait un `O_TRUNC` — une notif écrite app fermée serait effacée à l'ouverture suivante. Or
 « app fermée » est le cas **nominal** d'un job de 10:00.
 
 ### ⚠️ Pourquoi pas `osascript`
@@ -518,23 +434,19 @@ l'écran confirmée** :
 | via `Finder` | **1** (`-1743`) | non |
 | **`terminal-notifier`** | 0 | **OUI** |
 
-`terminal-notifier` (`fr.julienxx.oss.terminal-notifier`, v2.0.0, `/opt/homebrew/bin`)
-délivre parce qu'il porte **sa propre identité d'app** — il embarque son `.app`, déjà
-autorisé dans les réglages de notification. `knowledge-garden.sh` et `knowledge-sync.sh`
-l'utilisent depuis le commit `284aab6` de `potof-claude-skills`, avec repli sur `osascript`
-qui **ne prétend plus avoir abouti** (il journalise que la livraison est invérifiable).
+`terminal-notifier` délivre parce qu'il porte **sa propre identité d'app** — il embarque son
+`.app`, déjà autorisé dans les réglages de notification.
 
 En une ligne, la règle des deux mondes : **côté bash `terminal-notifier`, côté app
 `UNUserNotificationCenter`, et dans les deux cas le code de retour d'`osascript` n'est
-JAMAIS une preuve d'affichage.** L'app n'expose ni drapeau `--notify` ni scheme URL : il n'y
-a donc rien à router d'un script vers `ScheduleNotifier`, et en ajouter un serait la réponse
-propre le jour où `terminal-notifier` disparaîtrait du poste.
+JAMAIS une preuve d'affichage.**
 
 ## Le mode headless et sa liste noire
 
 `main.swift` reconnaît `--run-schedule` **avant** `NSApplication`, comme `--ide-selftest`.
 `ScheduleRunner` n'importe que `Foundation` : avec ce seul import, `NSApp` devient une
 **erreur de compilation**. Ce n'est pas une convention, c'est une garantie structurelle.
+`PTYProcess` importe SwiftTerm, mais n'en utilise que `PseudoTerminalHelpers` : aucune vue.
 
 Le runner ne doit réveiller **aucun** de ces singletons (tous lazy, donc inertes tant qu'on
 n'y touche pas) :
@@ -544,7 +456,7 @@ n'y touche pas) :
 | `NotificationCenterCoordinator.shared` | son `start()` fait `open(…, O_TRUNC)` sur `notifications.jsonl` → **effacerait le canal de la GUI en cours**. Le plus vicieux. |
 | `IDEHost.shared` | prend le lock `~/.claude/ide/<port>.lock` sur tout `$HOME` → deux IDE « valides » ⇒ plus aucune auto-connexion, des deux côtés |
 | `IDELog.startSession()` | tronque `ide.log` de l'app vivante |
-| `SessionStore` / `ScriptRunStore` / `*TerminalController` | tirent SwiftTerm, aucun intérêt |
+| `SessionStore` / `ScriptRunStore` / `*TerminalController` | tirent les vues SwiftTerm, aucun intérêt |
 | `Bundle.module` | `fatalError` en contexte bundlé |
 
 C'est pour ça que le runner passe par le **statique** `ScheduleStore.loadFromDisk()`, qui
@@ -574,83 +486,64 @@ supprime/écrase un fichier **que si** :
 
 Corollaire assumé : un fichier portant notre nom mais **illisible** (plist corrompu) n'est
 pas « le nôtre » — on refuse de l'écraser, on dit lequel et pourquoi, et la seule issue est
-manuelle.
+manuelle. Les plists laissés par des planifications v1 supprimées deviennent des orphelins
+que l'audit propose de purger.
 
 ## Débogage
 
 ```bash
-potof-toolkit --run-schedule <uuid> --dry-run    # plan complet, AUCUN effet de bord
-potof-toolkit --sched-selftest cli | plist | store | run
+potof-toolkit --run-schedule <uuid> --dry-run              # plan complet, AUCUN effet de bord
+potof-toolkit --sched-selftest pty | claude | plist | store | run
+potof-toolkit --sched-selftest live <dossier approuvé>     # opt-in : VRAI claude (haiku, ~0,01 $)
 ```
 
 Le binaire n'est **pas sur le `PATH`** : ces commandes s'appellent par chemin explicite,
 `~/Applications/Potof\ Toolkit.app/Contents/MacOS/potof-toolkit` (ou `.build/debug/` en dev
 — où l'installation de LaunchAgents est refusée, voir « Refus d'installer hors `.app` »).
+Les probes travaillent sous `SchedulePaths.overrideRoot` : le vrai dossier du scheduler et
+`~/Library/LaunchAgents` restent inchangés. Elles sortent avant `NSApplication`.
 
-> ⚠️ **Un argument inconnu démarrait une SECONDE INSTANCE de l'app.** Mesuré le 2026-08-11 :
-> `potof-toolkit --help` n'imprimait aucune aide — l'argument traversait les trois gardes de
-> `main.swift` (`--ide-selftest`, `--run-schedule`, `--sched-selftest`) et tombait sur
-> `NSApplication.shared` + `app.run()`, montant une instance GUI complète restée vivante
-> jusqu'à être tuée. C'est une collision frontale avec l'interdit du dépôt (une 2ᵉ instance
-> pose un second lock `~/.claude/ide/<port>.lock` ⇒ « deux IDE valides » ⇒ **auto-connexion
-> neutralisée des deux côtés**, et `NotificationChannel.start()` tronque le
-> `notifications.jsonl` de l'instance vivante).
->
-> **Corrigé** : la décision vit dans `App/CLIHelp.swift` — `isRequested(_:)`, **pur**, sans
-> AppKit — et `main.swift` l'appelle en tête. Le fichier est séparé exprès : le dispatch
-> d'argv de `main.swift` est en instructions top-level, donc inatteignable depuis une probe,
-> et démarrer le binaire pour tester la garde est justement l'acte interdit. Isolée, elle se
-> compile et s'exerce seule (`swiftc App/CLIHelp.swift <harnais>` — 16 cas d'argv, dont les
-> chemins où **macOS** passe ses propres arguments : `-psn_0_…`, `-NSDocumentRevisionsDebugMode`,
-> `-AppleLanguages`, tous correctement laissés au lancement normal).
->
-> ⚠️ **L'ancrage sur le PREMIER argument n'est pas cosmétique.** La première version testait
-> `CommandLine.arguments.contains("-h")` sur tout l'argv, et comme la garde passe avant les
-> trois autres modes, `--sched-selftest -h` et `--ide-selftest -h` **imprimaient l'aide et
-> sortaient en 0 sans exécuter la moindre probe** : un faux vert sur les seuls diagnostics du
-> dépôt, qui n'a pas de test target. Ne pas « simplifier » en un `contains`.
->
-> Le correctif ne prendra effet **qu'au prochain build/déploiement** : le bundle installé
-> garde son ancien binaire.
->
-> **Reste ouvert, et ce n'est PAS un simple `exit 64`.** Les autres arguments inconnus
-> (`--verson`, une faute de frappe) tombent toujours dans la GUI. Mais rejeter *tout* argv
-> non reconnu **casserait le démarrage** : macOS en passe lui-même sur certains chemins de
-> lancement (LaunchServices `-psn_0_…`, Xcode `-NSDocumentRevisionsDebugMode YES`,
-> `-AppleLanguages (…)`). Un rejet correct doit donc porter une **liste blanche des
-> arguments système** — c'est cette liste, pas le `exit 64`, qui est le vrai travail.
+La probe `run` remplace `claude` par un faux script sh et couvre chaque issue du déroulé.
+La probe `live` lance le vrai `claude` sur « Réponds juste OK » et vérifie aussi que la
+conversation est enregistrée — ce qui prouve que `CLAUDE_CODE_CHILD_SESSION` est bien
+retiré, puisqu'on la lance depuis une session Claude.
 
-Le `--dry-run` imprime : santé du host service, workspace résolu (ou « serait créé »),
-worktree, verdict de chaque garde-fou, argv exact de `superset agents create` (un argument
-par ligne), prompt intégral, et le `.plist` qui serait installé.
+Le `--dry-run` (bouton **« Simuler le prochain run »**, onglet **« Plan »**) ne lance aucun
+PTY ni pour le préscript ni pour la session. Il imprime : le dossier (existe ? approuvé ?),
+le préscript, le résultat **réel** de `claude mcp list` (lecture seule), l'argv exact de la
+session avec un `sessionID` d'exemple (un argument par ligne), le prompt intégral et le
+`.plist` qui serait installé. Il conclut `skipped`.
 
 ⚠️ **Un garde-fou qui se déclenche est ANNOTÉ, il n'interrompt pas le plan**
 (`⚠︎ un run réel s'arrêterait ici : …`), et le verdict final reflète ce qu'un run réel
 aurait fait. Sans ça, l'outil de debug ne montrerait rien le jour où il y a justement
-quelque chose à comprendre.
+quelque chose à comprendre. Un dry-run n'écrit **aucune** ligne d'historique et ne pose
+**aucun** verrou. Depuis l'app, il simule le déclencheur `launchd` (et non `manual`) : le
+runner traite une planification désactivée différemment selon le déclencheur.
 
-Un dry-run n'écrit **aucune** ligne d'historique et ne pose **aucun** verrou.
-
-Le même dry-run est accessible depuis l'app : bouton **« Simuler le prochain run »** de la
-top bar, résultat dans l'onglet **« Plan »**. Il simule le déclencheur `launchd` (et non
-`manual`), parce que c'est le tir de 10:00 qu'on veut voir venir — la distinction compte,
-le runner traite une planification désactivée différemment selon le déclencheur.
+> ⚠️ **Un argument inconnu démarre une SECONDE INSTANCE de l'app.** Seul `--help` / `-h` en
+> **première** position est intercepté (`App/CLIHelp.swift`, pur, testable au `swiftc`
+> sans lancer l'app). L'ancrage sur le premier argument n'est pas cosmétique : un
+> `contains("-h")` sur tout l'argv faisait sortir `--sched-selftest -h` en 0 sans exécuter
+> la probe, un faux vert. Les autres arguments inconnus tombent toujours dans la GUI ; les
+> rejeter exige une liste blanche des arguments que macOS passe lui-même (`-psn_0_…`,
+> `-NSDocumentRevisionsDebugMode`, `-AppleLanguages`).
 
 ### ⚠️ Pourquoi il n'y a pas de « tester le déclencheur launchd »
 
 Il y en a eu un. Il faisait `launchctl kickstart -k gui/<uid>/<label>` et se présentait
-comme un diagnostic. **C'en était un run réel** : launchd exécute le `ProgramArguments` du
-plist, c'est-à-dire `--run-schedule <uuid>` **sans** `--dry-run`. En trois clics il a créé
-des workspaces, fait un `reset --hard` et lancé deux agents payants.
+comme un diagnostic. **C'était un run réel** : launchd exécute le `ProgramArguments` du
+plist, c'est-à-dire `--run-schedule <uuid>` **sans** `--dry-run`. En trois clics il a lancé
+deux agents payants.
 
 Et ce n'est pas rattrapable : le plist fige son argv, délibérément (aucun texte utilisateur
 dans `~/Library/LaunchAgents`), donc **on ne peut pas demander à launchd une simulation**.
-Le bouton a donc été supprimé, pas renommé — même raisonnement que `confirmEditInTerminal`
+Le bouton a été supprimé, pas renommé — même raisonnement que `confirmEditInTerminal`
 dans le pont IDE : une affordance qui ment sur son effet ne se corrige pas par un meilleur
 libellé. `isLoaded(_:)` répond sans rien déclencher à la seule question que le kickstart
 tranchait vraiment (« le job est-il chargé ? »), et le bandeau d'audit la pose tout seul.
 
-**`ScheduleStore.runNow` est désormais le seul chemin de l'UI qui lance un run réel.**
+**`ScheduleStore.runNow` est le seul chemin de l'UI qui lance un run réel.**
 
 ## Désinstallation
 
@@ -665,9 +558,13 @@ rm ~/Library/LaunchAgents/$LABEL.plist
 rm -rf ~/Library/Application\ Support/PotofToolkit/scheduler
 ```
 
-## Hors périmètre v1
+## Hors périmètre
 
-Jetons de substitution dans le prompt · vérification du livrable · `claude -p` en direct
-comme seconde forme d'action · sélecteur d'agent au-delà de `--agent`/`--effort` · réveil
-de la machine (`pmset`) · « dernier jour du mois » · intervalle non-diviseur de 24 ·
-rattrapage automatique · suppression automatique des workspaces neufs.
+- Saisie dans la session pendant le run : la vue est en lecture seule, on reprend dans
+  Claude Launcher.
+- Coût et nombre de tours par run : pas de résultat JSON en interactif.
+- Rétention et purge des `.tty`, `.stop`, `.settings.json`.
+- Contrôle de fraîcheur des runs · vérification du livrable · jetons de substitution dans
+  le prompt · réveil de la machine (`pmset`) · « dernier jour du mois » · intervalle
+  non-diviseur de 24 · rattrapage automatique.
+- Pilotage des automations Orca existantes.

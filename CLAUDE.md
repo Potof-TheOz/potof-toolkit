@@ -3,8 +3,8 @@
 App macOS native (SwiftUI + AppKit) servant de **toolkit d'outils de dev locaux**.
 **Local par défaut** : aucun compte, aucune télémétrie, aucune sortie réseau — à une
 exception **opt-in** près, la génération de message de commit de Git Stuffs, qui invoque
-`claude` (outil externe → réseau) et, depuis le Superset Scheduler, l'appel à la CLI `superset`
-(qui parle au host service en **loopback** et fait spawner des agents `claude` → réseau).
+`claude` (outil externe → réseau), et les sessions `claude` que lance le Claude Scheduler
+aux heures planifiées (→ réseau).
 Seule écoute : un socket **`127.0.0.1` uniquement**
 (pont IDE, cf. plus bas), protégé par un token. Quatre outils à ce jour :
 **Claude Launcher** — liste les sous-dossiers d'un dossier racine et lance `claude`
@@ -15,13 +15,15 @@ du poste, **rebase interactivement** et **édite la copie de travail** (staging 
 hunk/ligne, commit, push/pull avec badge ahead/behind, résolution de conflits dans
 l'app). **Script Runner** — découvre les `package.json`
 et lance/arrête leurs scripts npm sur le même modèle de terminal possédé
-(voir `docs/SCRIPT_RUNNER.md`). **Superset Scheduler** — écrit et entretient un **job launchd**
-par planification, qui rappelle le binaire de l'app en **mode headless**
-(`--run-schedule <uuid>`) pour lancer un agent Superset à heure fixe ; l'outil garantit le
-**lancement**, jamais le résultat (voir `docs/SCHEDULER.md`).
+(voir `docs/SCRIPT_RUNNER.md`). **Claude Scheduler** (remplace le Superset Scheduler, retiré
+avec l'abandon de Superset) — écrit et entretient un **job launchd** par planification, qui
+rappelle le binaire de l'app en **mode headless** (`--run-schedule <uuid>`) : il exécute un
+préscript dans un dossier, puis y lance `claude` en **session interactive** dans un PTY qu'il
+possède. La GUI rejoue la session en direct et la reprend dans Claude Launcher. L'outil garantit
+que la session a **rendu la main**, jamais le résultat (voir `docs/SCHEDULER.md`).
 Transversal aux outils : le **pont IDE** — l'app se fait passer pour un IDE Claude Code
 et **valide dans une fenêtre flottante** les modifications proposées par les agents
-`claude` du poste (Superset, terminaux, sessions embarquées) au lieu du prompt de
+`claude` du poste (terminaux, Orca, sessions embarquées) au lieu du prompt de
 permission du terminal (voir `docs/IDE_BRIDGE.md`).
 
 > Le dépôt s'appelle encore `claude-launcher/` (dossier historique) mais le produit,
@@ -80,14 +82,14 @@ Core/
     TerminalHostView.swift    NSViewRepresentable partagé (a quitté ClaudeLauncher/) : place la
                               vue terminal possédée par le contrôleur appelant + focus au chgt d'id
   IDEHost/                    Pont IDE : l'app se fait passer pour un IDE Claude Code et sert des
-                              agents EXTERNES (Superset, terminaux) → docs/IDE_BRIDGE.md
+                              agents EXTERNES (terminaux, Orca…) → docs/IDE_BRIDGE.md
     IDEProtocolContract.swift ⭐ LE contrat en un seul endroit : formes de réponse openDiff, noms
                               d'outils, en-tête d'auth, dernière version de claude validée
     IDEBridge.swift           Types (IDEDiffRequest/Verdict, IDEDiffHandlers) + logger IDELog
     IDEHost.swift             ⭐ Hôte GLOBAL (singleton) : 1 port, 1 lock ($HOME), N connexions
     IDEServer.swift           Serveur d'UNE session possédée (port injecté) + sweepStaleLocks
     IDEConnection.swift       Handshake WebSocket + framing RFC 6455 + JSON-RPC/MCP, N openDiff en vol
-    IDEClientIdentity.swift   pid (ide_connected) → cwd (lsof) → worktree → « Superset · branche »
+    IDEClientIdentity.swift   pid (ide_connected) → cwd (lsof) → worktree → libellé « repo · branche »
     IDEContractGuard.swift    ⭐ Vérif post-acceptation + empreinte de version + bandeau de dérive
     IDEHostSettings.swift     Périmètre servi (ideHost.scope) / activation à la réception / expiration
     IDEHostMenu.swift         Menu « Hôte IDE » de la barre de menus (périmètre + diagnostic)
@@ -149,25 +151,34 @@ Tools/
     ScriptRunStore.swift      ⭐ Singleton : launch/stop/close/focus + machine à états de l'arrêt
     ScriptRunnerView.swift    UI : HSplitView(sidebar exécutions+projets | run ou détail au centre)
     PackageDetailView.swift   Détail d'un package : scripts + badge manager + ▶ (ou « voir le run »)
-  Scheduler/                  Quatrième outil : agents Superset à heure fixe → docs/SCHEDULER.md
-    Schedule.swift            ⭐ Modèles : Schedule + Action/Recurrence/Target (Codable À LA MAIN,
-                              discriminant "kind") + validate() + nommage gelé des workspaces neufs
-    ScheduleRun.swift         RunStatus (⭐ `launched`, pas `ok`) / RunLine / RunRecord.fold (PUR)
-    SchedulePaths.swift       ⭐ Tous les chemins + overrideRoot (probes sans effet de bord) +
-                              canInstallLaunchAgents + résolution du shim `superset`
-    SupersetCLI.swift         Shell-out CLI (gabarit Git.swift) + timeout + nettoyage d'env + JSON
-    AgentPresence.swift       « un agent claude vit-il dans ce worktree ? » (pgrep → lsof cwd)
+  Scheduler/                  Quatrième outil : claude à heure fixe dans un dossier → docs/SCHEDULER.md
+    Schedule.swift            ⭐ Modèles v2 : Schedule (dossier, préscript, délai, MCP requis) +
+                              Action.claude / Recurrence (Codable À LA MAIN, discriminant "kind") + validate()
+    ScheduleRun.swift         RunStatus (⭐ `completed`, pas `ok`) / RunLine (+ sessionID) / RunRecord.fold (PUR)
+    SchedulePaths.swift       ⭐ Tous les chemins (.log/.tty/.stop/.settings.json par run) + overrideRoot
+                              (probes sans effet de bord) + canInstallLaunchAgents + PATH plancher
+    PTYProcess.swift          ⭐ Commande dans un PTY 120×40 possédé : enregistre le .tty, fin par
+                              marqueur Stop + /exit, délai, dialogue de confiance ; signaux au GROUPE
+    ClaudeInvocation.swift    PUR : argv (dontAsk, --session-id, prompt après --), env nettoyé
+                              (+ AUTO_CONNECT_IDE=false), settings du run + hook Stop, isTrusted
+    MCPList.swift             PUR : parse `claude mcp list` → MCP requis indisponibles
     LaunchAgentPlist.swift    Recurrence → StartCalendarInterval + génération du .plist (PUR)
     SchedulerService.swift    bootout/enable/bootstrap + audit/repair + règle des DEUX conditions
-    ScheduleStore.swift       ⭐ Singleton : SEUL écrivain de schedules.json + tail du JSONL
+    ScheduleStore.swift       ⭐ Singleton : SEUL écrivain de schedules.json (purge du v1) + tail du
+                              JSONL + runNow DÉTACHÉ + selectedRunID
     RunLog.swift              JSONL append-only sous flock + compaction EN PLACE (jamais rename)
     ScheduleRunner.swift      ⭐ Mode headless (`Foundation` SEUL) : la séquence et les garde-fous
     ScheduleNotifier.swift    Bannière système du runner (UserNotifications, PAS osascript)
-    SchedulerSelfTest.swift   Dispatcher `--sched-selftest cli|plist|store|run` (figé)
-    ScheduleStoreProbe.swift / ScheduleRunnerProbe.swift   Auto-tests des lots correspondants
-    UI/SchedulerView.swift    HSplitView(liste | détail) + bandeaux audit/dev ; formulaire EN PLACE
-    UI/ScheduleRunHistoryView.swift  Historique alimenté par le tail (runs d'un autre process inclus)
-    UI/ScheduleFormView.swift / RecurrencePicker.swift / TargetPicker.swift   Formulaire et sélecteurs
+    SchedulerSelfTest.swift   Dispatcher `--sched-selftest pty|claude|plist|store|run|live <dossier>`
+    PTYProcessProbe.swift / ClaudeInvocationProbe.swift / ScheduleStoreProbe.swift /
+      ScheduleRunnerProbe.swift   Auto-tests (sous overrideRoot ; `live` = vrai claude, opt-in)
+    UI/SchedulerView.swift    HSplitView(liste | détail à onglets Historique/Session/Prompt/Plan)
+                              + bandeaux audit/dev ; formulaire EN PLACE
+    UI/RunSessionView.swift   Rejeu du .tty (TerminalView en LECTURE SEULE, 120×40) + TTYFileReader
+                              + ScheduleResume (« Reprendre dans Claude Launcher », --resume)
+    UI/ScheduleRunHistoryView.swift  Historique alimenté par le tail ; clic ⇒ run choisi
+    UI/ScheduleFormView.swift / RecurrencePicker.swift   Formulaire (Identité, Dossier, Préscript,
+                              Claude, Cadence, Prompt) et sélecteur de cadence
 Resources/AppIcon.png         Icône 1024×1024 (→ Bundle.module en dev, → .icns en bundle)
 ```
 `Scripts/build-app.sh` : packaging en `.app` (voir LIFECYCLE). Détails du modèle de
@@ -250,7 +261,7 @@ L'outil occupe tout le cadre sous le header et gère sa propre chrome.
   Dock marchent ; tester les bannières via l'app bundlée. Même logique que `applyDockIcon`.
 - **Persistance** : `@AppStorage("rootPath")` et `UserDefaults` clés `claudeLauncher.favorites`,
   `scriptRunner.packageDirs`, `ideHost.*` (périmètre de l'hôte IDE), `diffReview.layoutMode`.
-  ⚠️ **Exception : le Superset Scheduler persiste en FICHIERS, pas en `UserDefaults`** — c'est le
+  ⚠️ **Exception : le Claude Scheduler persiste en FICHIERS, pas en `UserDefaults`** — c'est le
   premier format d'**écriture** `Codable` de l'app (la lecture existait déjà :
   `PreviousSessionsStore`, `NotificationChannel`). Raison : `UserDefaults` ne notifie pas de
   façon fiable les écritures d'un **autre process**, or le mode headless en est un.
@@ -264,10 +275,10 @@ L'outil occupe tout le cadre sous le header et gère sa propre chrome.
   absent) et déclencherait un `fatalError` au démarrage. L'app bundlée tire son icône du
   `.icns` (Info.plist). ⚠️ Ne pas rappeler `Bundle.module` depuis un contexte bundlé, et
   garder le resource bundle dans `Contents/Resources/` (signable) dans `build-app.sh`.
-- **Superset Scheduler : le mode headless est un AUTRE process, et c'est tout le sujet**
+- **Claude Scheduler : le mode headless est un AUTRE process, et c'est tout le sujet**
   (détails → `docs/SCHEDULER.md`). launchd rappelle le binaire de l'app en
   `--run-schedule <uuid>`, **avant `NSApplication`** (même emplacement que `--ide-selftest`
-  dans `main.swift`). Sept points à ne pas casser :
+  dans `main.swift`). Huit points à ne pas casser :
   1. **`ScheduleRunner` n'importe que `Foundation`.** Garantie structurelle, pas convention :
      avec ce seul import, `NSApp` devient une erreur de compilation. Et il ne réveille
      **aucun** singleton — le plus vicieux étant `NotificationCenterCoordinator.shared`,
@@ -278,9 +289,9 @@ L'outil occupe tout le cadre sous le header et gère sa propre chrome.
   2. **`schedules.json` a un seul écrivain : la GUI.** Le headless est lecteur seul, et
      unique écrivain de sa portion du JSONL. Corollaire : **pas de `lastRunAt` dans
      `Schedule`**, il est dérivé de `runs.jsonl`. Ne pas « améliorer » ça.
-  3. **`launched`, jamais `ok`.** Le runner sait seulement que `agents create` a rendu 0. Un
-     historique tout vert ne prouve que la mise à feu. Et `skipped` (garde-fou qui a joué)
-     reste distinct de `failed`.
+  3. **`completed`, jamais `ok`.** Le runner sait seulement que la session a rendu la main
+     (hook `Stop` vu, puis `/exit`). Un historique tout vert ne prouve pas que le travail est
+     juste. Et `skipped` (garde-fou qui a joué) reste distinct de `failed` et de `timedOut`.
   4. **Compaction du JSONL EN PLACE** (`ftruncate`), **jamais par `rename`** : ça changerait
      l'inode sous le nez d'un appender ayant déjà son `fd` ouvert.
   5. **Écriture dans `~/Library/LaunchAgents` : les DEUX conditions**, nom
@@ -297,7 +308,17 @@ L'outil occupe tout le cadre sous le header et gère sa propre chrome.
      `--dry-run`, donc launchd ne sait pas simuler) et a créé deux agents payants en trois
      clics. Supprimé, pas renommé — même geste que `confirmEditInTerminal` côté pont IDE.
      La simulation est en-process : `ScheduleRunner.executeReporting(…, dryRun: true)`,
-     bouton « Simuler » → onglet « Plan ».
+     bouton « Simuler » → onglet « Plan ». `runNow` lance le binaire **détaché** : quitter
+     Potof n'interrompt pas le run.
+  8. **Session interactive dans un PTY possédé par le runner, fin par hook `Stop` puis
+     `/exit`, toujours `--permission-mode dontAsk` et `CLAUDE_CODE_AUTO_CONNECT_IDE=false`.**
+     Pas `claude -p` : le rendu CLI est voulu et les MCP de plugin y sont gardés
+     (`docs/adr/0002-…`). Grille fixe 120×40, signaux au **groupe**. Un dossier jamais
+     approuvé par `claude` bloque sur « trust this folder » : le runner le détecte et échoue
+     en quelques secondes. Les `CLAUDE_CODE_*` hérités sont retirés de l'env (sinon port IDE
+     mort, ou conversation non enregistrée). Le prompt n'est **jamais** interprété par un
+     shell : `"$@"` puis `--`. Sans `dontAsk`, un prompt de permission figerait la session ;
+     sans `AUTO_CONNECT_IDE=false`, un `openDiff` ouvrirait la fenêtre de revue sans personne.
 
   ⚠️ `canInstallLaunchAgents` (= `pathExtension == "app"`, même garde que `canUseUN`)
   **interdit d'installer depuis `swift run`** : le chemin `.build/debug/` est éphémère, un
@@ -338,3 +359,7 @@ L'outil occupe tout le cadre sous le header et gère sa propre chrome.
   `--dangerously-skip-permissions` : sans demande de permission, plus aucun `openDiff`.
   Le pont ne couvre de toute façon que `Edit`/`Write` (ni Bash, ni notebooks, ni outils
   MCP). `POTOF_SESSION_ID` reste la clé notifs, distincte du pont.
+  **Exception assumée : le Claude Scheduler** lance `claude` en `--permission-mode dontAsk`
+  avec `CLAUDE_CODE_AUTO_CONNECT_IDE=false` — personne n'est là pour valider, le pont est
+  coupé exprès (invariant 8 du scheduler). Jamais `acceptEdits` ni `bypassPermissions` pour
+  autant.
