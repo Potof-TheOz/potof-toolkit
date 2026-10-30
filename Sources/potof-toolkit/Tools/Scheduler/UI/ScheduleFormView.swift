@@ -68,6 +68,14 @@ struct ScheduleFormView: View {
     /// Un MCP par ligne.
     @State private var mcpText: String
     @State private var timeoutMinutes: Int
+    /// Le champ accepte n'importe quel entier : on le borne à `Schedule.timeoutRange`.
+    private var timeoutBinding: Binding<Int> {
+        Binding(
+            get: { timeoutMinutes },
+            set: { timeoutMinutes = min(max($0, Schedule.timeoutRange.lowerBound),
+                                        Schedule.timeoutRange.upperBound) }
+        )
+    }
     @State private var recurrence: Recurrence
     @State private var prompt: String
 
@@ -425,8 +433,16 @@ struct ScheduleFormView: View {
                 }
             }
             labeled("Délai") {
-                Stepper(value: $timeoutMinutes, in: Schedule.timeoutRange) {
-                    Text("\(timeoutMinutes) min").monospacedDigit()
+                // Champ saisissable + pas de 5 : avec un pas de 1 sur 1…240, passer de 60 à 5
+                // demandait 55 clics (vu en recette : on s'arrête à 39).
+                HStack(spacing: 6) {
+                    TextField("", value: timeoutBinding, format: .number)
+                        .frame(width: 56)
+                        .multilineTextAlignment(.trailing)
+                        .monospacedDigit()
+                    Stepper("", value: timeoutBinding, in: Schedule.timeoutRange, step: 5)
+                        .labelsHidden()
+                    Text("min").foregroundStyle(.secondary)
                 }
                 .help("Au-delà, la session est tuée et le run finit en « délai dépassé ».")
                 .accessibilityLabel("Délai maximal de la session, en minutes")

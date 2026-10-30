@@ -321,6 +321,8 @@ L'outil occupe tout le cadre sous le header et gère sa propre chrome.
      mort, ou conversation non enregistrée). Le prompt n'est **jamais** interprété par un
      shell : `"$@"` puis `--`. Sans `dontAsk`, un prompt de permission figerait la session ;
      sans `AUTO_CONNECT_IDE=false`, un `openDiff` ouvrirait la fenêtre de revue sans personne.
+     Les settings du run imposent `"tui": "default"` : en `fullscreen`, la session vit sur
+     l'écran alternatif, effacé à `/exit`, et le rejeu d'un run fini serait vide.
 
   ⚠️ `canInstallLaunchAgents` (= `pathExtension == "app"`, même garde que `canUseUN`)
   **interdit d'installer depuis `swift run`** : le chemin `.build/debug/` est éphémère, un

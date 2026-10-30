@@ -127,7 +127,11 @@ réponse. La fin se décide ainsi :
 
 1. Le runner écrit `logs/<runID>.settings.json` : les settings de la planification
    (facultatifs, objet JSON obligatoire), plus **en fin** de `hooks.Stop` un hook
-   `touch '<logs/<runID>.stop>'`. Les hooks `Stop` de l'utilisateur restent intacts.
+   `touch '<logs/<runID>.stop>'`. Les hooks `Stop` de l'utilisateur restent intacts. Il
+   impose aussi `"tui": "default"`, même si le fichier demande autre chose : en
+   `fullscreen`, `claude` dessine sur l'écran alternatif et le quitte à `/exit`, et le rejeu
+   d'un run fini ne montrait plus que « Resume this session with… » (vu en recette le
+   2026-10-30).
 2. Quand le marqueur apparaît, le runner écrit `/exit\r` dans le PTY. Si la session n'est
    pas sortie 10 s plus tard, il tue le groupe. Fin `completed` dans les deux cas.
 3. Sans marqueur, le délai de la planification (`timeoutMinutes`, 1…240, défaut 60) tue le

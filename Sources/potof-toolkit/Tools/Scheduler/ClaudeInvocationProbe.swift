@@ -69,6 +69,9 @@ enum ClaudeInvocationProbe {
         let s2 = settingsObject(Data(user.utf8), marker)
         check("claude.settingsMerge", s2.map(stopCommands) == ["echo u", "touch '/x y/it'\\''s.stop'"]
               && (s2?["permissions"] as? [String: Any])?["allow"] as? [String] == ["Read"])
+        let fullscreen = settingsObject(Data(#"{"tui":"fullscreen"}"#.utf8), marker)
+        check("claude.settingsTuiDefault", s1?["tui"] as? String == "default"
+              && fullscreen?["tui"] as? String == "default")
         check("claude.settingsInvalid", settingsObject(Data("[1]".utf8), marker) == nil
               && settingsObject(Data("{".utf8), marker) == nil)
 
