@@ -64,7 +64,7 @@ reçoit `"$@"` tel quel, et `claude` lit le prompt après `--`. Un prompt qui co
 ```
  1. RunLog.start()                                (paire start/end toujours complète)
  2. désactivée et déclencheur ≠ manual            → skipped « planification désactivée »
- 3. flock(LOCK_EX|LOCK_NB) par planification      → skipped « un run est déjà en cours »
+ 3. flock(LOCK_EX|LOCK_NB) PAR DOSSIER            → skipped « un run est déjà en cours dans ce dossier »
  4. le dossier existe et c'est un dossier ?       → failed « dossier introuvable : <chemin> »
  5. préscript non vide → PTY, $SHELL -l -i +m -c  code ≠ 0 → failed « préscript en échec (code N) »
                                                   600 s    → failed « préscript : délai dépassé »
@@ -80,6 +80,8 @@ reçoit `"$@"` tel quel, et `claude` lit le prompt après `--`. Un prompt qui co
        dialogue de confiance            → failed « dossier non approuvé par Claude : ouvrez-le une fois dans Claude Launcher »
        fork impossible                  → failed « lancement impossible »
  9. échec, skip ou délai sous launchd → bannière (ScheduleNotifier), APRÈS la ligne `end`
+10. fin du run (verrou encore tenu) → PTYProcess.sweepGroup sur chaque groupe lancé :
+       ce qu'ont laissé le préscript (job `nohup`…) ou claude (serveur MCP stdio…) est tué
 ```
 
 Ces messages sont vérifiés au mot près par `--sched-selftest run`. Le `.tty` reçoit un
@@ -131,8 +133,9 @@ SIGTERM, puis SIGKILL après 3 s.
 Une session interactive **ne se termine pas d'elle-même** : elle reste au prompt après sa
 réponse. La fin se décide ainsi :
 
-1. Le runner écrit `logs/<runID>.settings.json` : les settings de la planification
-   (facultatifs, objet JSON obligatoire), plus **en fin** de `hooks.Stop` un hook
+1. Le runner écrit `logs/<runID>.settings.json`, en **`0600`** comme le `.tty` (c'est une
+   copie des settings de l'utilisateur, qui peuvent porter des secrets) : les settings de la
+   planification (facultatifs, objet JSON obligatoire), plus **en fin** de `hooks.Stop` un hook
    `touch '<logs/<runID>.stop>'`. Les hooks `Stop` de l'utilisateur restent intacts. Il
    impose aussi `"tui": "default"`, même si le fichier demande autre chose : en
    `fullscreen`, `claude` dessine sur l'écran alternatif et le quitte à `/exit`, et le rejeu
@@ -215,7 +218,15 @@ voulue : **quitter Potof n'interrompt pas un run**, qui écrit sa ligne `end` to
 run manuel ne poste pas de bannière : l'utilisateur regarde déjà l'écran.
 
 Sur une planification désactivée, « Lancer maintenant » part quand même : c'est un geste
-explicite. Le verrou par planification exclut un tir launchd simultané.
+explicite. Le verrou exclut un tir launchd simultané. Il porte sur le **dossier**, pas sur
+la planification : deux planifications qui visent le même dossier ne lancent jamais deux
+sessions sur la même copie de travail, la seconde est `skipped`. Il ne voit pas, en
+revanche, une session que tu as toi-même ouverte dans ce dossier (Claude Launcher,
+terminal) : rien n'empêche un run de partir à côté.
+
+Un préscript peut démarrer un process de fond dont la session a besoin (serveur de dev…) :
+il vit le temps du run. En fin de run, le runner tue ce qui reste des groupes de process
+qu'il a lancés (`PTYProcess.sweepGroup`) ; il s'abstient si le pid du chef a été réattribué.
 
 ### Voir et reprendre
 
@@ -248,7 +259,7 @@ l'étape 8). On ne saisit jamais dans la session pendant le run : on la reprend 
 ├── logs/<runID>.tty                ← flux brut du PTY (préscript puis session), rejoué par la GUI
 ├── logs/<runID>.settings.json      ← settings passés à claude --settings
 ├── logs/<runID>.stop               ← marqueur posé par le hook Stop
-└── locks/<scheduleID>.lock
+└── locks/folder-<fnv64>.lock        ← un verrou par DOSSIER (hash du chemin normalisé)
 ~/Library/Logs/PotofToolkit/schedule-<uuid>.out.log   ← StandardOutPath du job
 ~/Library/LaunchAgents/com.potof.toolkit.schedule.<uuid>.plist
 ```
@@ -593,6 +604,21 @@ rm -rf ~/Library/Application\ Support/PotofToolkit/scheduler
   les 64 premiers Ko du flux, blancs et casse ignorés, écho du prompt par le TUI compris :
   un prompt (ou un début de réponse) qui contient « trust this folder » tue la session et
   finit en `failed « dossier non approuvé… »`, un message trompeur. Non corrigé.
+- **Fin détectée par le hook `Stop`, pas par l'état réel de la session.** Si un hook `Stop`
+  de l'utilisateur répond `decision: block` pour relancer `claude`, le marqueur est quand
+  même posé : le runner tape `/exit` dans une session qui travaille encore, la coupe au bout
+  de 10 s et compte le run `completed`. Avec `disableAllHooks` (ou une politique qui
+  n'autorise que les hooks gérés), le marqueur n'arrive jamais : tous les runs finissent en
+  `timedOut`.
+- **Le rejeu adapte le nombre de lignes à la hauteur du panneau** (pour occuper toute la
+  largeur à 120 colonnes), alors que le `.tty` est enregistré sur 40 lignes. Le TUI redessine
+  sa zone vivante par déplacements relatifs du curseur : sur un panneau très bas (moins
+  d'une quinzaine de lignes), le rejeu peut se brouiller.
+- **Chaque changement de taille de police rejoue tout le `.tty`.** Sur une session de
+  plusieurs dizaines de Mo, redimensionner le panneau coûte quelques secondes de CPU par
+  palier (après 0,2 s de stabilité).
+- **Historique du rejeu borné à 10 000 lignes** (`TTYReplay.scrollbackLines`). Au-delà, le
+  début de la session sort de la vue ; il reste dans le `.tty`.
 
 ## Hors périmètre
 
