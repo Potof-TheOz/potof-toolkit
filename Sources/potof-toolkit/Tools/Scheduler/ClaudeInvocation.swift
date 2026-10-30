@@ -18,14 +18,24 @@ enum ClaudeInvocation {
         return "/bin/zsh"
     }
 
+    /// `-l -i` : sourcing des rc (PATH complet). Mais un shell interactif active le contrôle
+    /// de jobs : chaque commande du préscript, chaque job de fond et chaque pipeline
+    /// (`claude mcp list | cat`) partirait dans son **propre groupe**, hors d'atteinte de
+    /// `kill(-pid, …)` — un `npm run dev &` survivrait au délai. On le coupe donc :
+    /// `+m` à l'invocation (suffit à zsh) ET `set +m;` en tête de commande (bash et sh
+    /// ignorent `+m` quand `-i` est présent — mesuré avec bash 3.2 ; c'est aussi
+    /// la forme qu'une rc ne peut pas défaire). Tout reste alors dans le groupe du shell.
     static func shellArguments(shell: String, command: String) -> [String] {
-        [shell, "-l", "-i", "-c", command]
+        [shell, "-l", "-i", "+m", "-c", "set +m; " + command]
     }
 
+    /// Même `+m` par cohérence ; le `set +m;` est inutile ici : `exec` fait de `claude`
+    /// le chef de session, il n'y a pas de job à rattraper.
+    ///
     /// Le prompt n'est jamais interprété par un shell : il arrive dans `"$@"`.
     static func claudeShellArguments(shell: String, claudeCommand: String,
                                      claudeArguments: [String]) -> [String] {
-        [shell, "-l", "-i", "-c", "exec " + shellQuote(claudeCommand) + " \"$@\"", "claude"] + claudeArguments
+        [shell, "-l", "-i", "+m", "-c", "exec " + shellQuote(claudeCommand) + " \"$@\"", "claude"] + claudeArguments
     }
 
     /// `--permission-mode dontAsk` est imposé ; le prompt vient après `--`.

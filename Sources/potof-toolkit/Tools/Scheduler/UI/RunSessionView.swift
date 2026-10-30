@@ -10,12 +10,16 @@ import SwiftTerm
 /// Fichier absent ou plus court que `offset` ⇒ (vide, `offset` inchangé) : le `.tty` n'est
 /// créé qu'au premier octet émis, et une vue ouverte juste après « Lancer maintenant »
 /// arrive avant lui.
+///
+/// `limit` borne la lecture : un `.tty` de plusieurs dizaines de Mo n'est jamais chargé
+/// d'un bloc en mémoire, l'appelant le relit tranche par tranche.
 enum TTYFileReader {
-    static func read(_ url: URL, from offset: UInt64) -> (data: Data, offset: UInt64) {
+    static func read(_ url: URL, from offset: UInt64,
+                     limit: Int = .max) -> (data: Data, offset: UInt64) {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return (Data(), offset) }
         defer { try? handle.close() }
         do { try handle.seek(toOffset: offset) } catch { return (Data(), offset) }
-        let data = handle.readDataToEndOfFile()
+        let data = ((try? handle.read(upToCount: limit)) ?? nil) ?? Data()
         return (data, offset + UInt64(data.count))
     }
 }
@@ -79,25 +83,34 @@ enum ScheduleResume {
 /// illisible. Si le panneau est plus petit, c'est le conteneur qui défile.
 ///
 /// Suivi : `DispatchSource` vnode (`.write|.extend`) sur le fichier. Un run **terminé** est
-/// lu d'une traite et rien n'est surveillé.
+/// relu sans rien surveiller. Dans les deux cas la lecture se fait **par tranches**, avec
+/// un retour au runloop entre deux tranches : la fenêtre reste réactive pendant qu'une
+/// session de plusieurs dizaines de Mo est rejouée.
 final class TTYReplay: ObservableObject {
 
     let terminalView: TerminalView
     /// Cadre qui contient exactement 120×40 cellules (scroller compris).
     let contentSize: NSSize
+    /// Le run est fini et n'a jamais écrit de `.tty` (échec avant le préscript et `claude`).
+    @Published private(set) var noSession = false
 
     private let url: URL
     private var offset: UInt64 = 0
     private var source: DispatchSourceFileSystemObject?
     private var retry: DispatchWorkItem?
+    private var following: Bool
+    private var draining = false
     private var stopped = false
 
-    /// Au-delà, on nourrit l'émulateur par tranches : un `.tty` de plusieurs Mo d'un coup
-    /// bloquerait le thread principal sans rien afficher entre-temps.
+    /// Taille d'une tranche donnée à l'émulateur avant de rendre la main au runloop.
     private static let sliceSize = 256 * 1024
+    /// Pause entre deux tranches : un `async` nu pourrait être servi à la suite, sans que
+    /// le runloop traite la saisie ni le dessin ; une échéance le force.
+    private static let sliceGap: TimeInterval = 0.002
 
     init(url: URL, follow: Bool) {
         self.url = url
+        self.following = follow
 
         let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
         view.allowMouseReporting = false
@@ -112,23 +125,40 @@ final class TTYReplay: ObservableObject {
         terminalView = view
 
         pump()
-        if follow { watch() }
+        if follow { watch() } else { noSession = !FileManager.default.fileExists(atPath: url.path) }
     }
 
     deinit { stop() }
 
-    /// Relit la suite du fichier et la donne à l'émulateur. Thread principal.
+    /// Relit la suite du fichier et la donne à l'émulateur, une tranche à la fois.
+    /// Thread principal. Sans effet si une relecture est déjà en cours : elle ira
+    /// jusqu'à la fin du fichier, donc jusqu'aux octets que ce nouvel appel annonçait.
     func pump() {
-        let chunk = TTYFileReader.read(url, from: offset)
-        guard !chunk.data.isEmpty else { return }
+        guard !draining, !stopped else { return }
+        feedNextSlice()
+    }
+
+    private func feedNextSlice() {
+        let chunk = TTYFileReader.read(url, from: offset, limit: Self.sliceSize)
+        guard !chunk.data.isEmpty, !stopped else { draining = false; return }
         offset = chunk.offset
-        let bytes = [UInt8](chunk.data)
-        var start = 0
-        while start < bytes.count {
-            let end = min(start + Self.sliceSize, bytes.count)
-            terminalView.feed(byteArray: bytes[start..<end])
-            start = end
+        draining = true
+        terminalView.feed(byteArray: [UInt8](chunk.data)[...])
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.sliceGap) { [weak self] in
+            self?.feedNextSlice()
         }
+    }
+
+    /// Le run n'est plus « en cours » : dernière relecture, plus de surveillance ni de
+    /// réessai. Sans `.tty` à ce stade, il n'y en aura jamais.
+    func runEnded() {
+        following = false
+        retry?.cancel()
+        retry = nil
+        pump()
+        source?.cancel()
+        source = nil
+        noSession = !FileManager.default.fileExists(atPath: url.path)
     }
 
     func stop() {
@@ -140,11 +170,11 @@ final class TTYReplay: ObservableObject {
     }
 
     private func watch() {
-        guard !stopped, source == nil else { return }
+        guard !stopped, following, source == nil else { return }
         let fd = open(url.path, O_EVTONLY)
         guard fd >= 0 else {
-            // Pas encore de `.tty` : le runner n'a rien émis. On réessaie, sans tourner
-            // indéfiniment si la vue disparaît (`stop()` annule).
+            // Pas encore de `.tty` : le runner n'a rien émis. On réessaie tant que le run
+            // est en cours (`runEnded()` et `stop()` annulent).
             let work = DispatchWorkItem { [weak self] in self?.pumpThenWatch() }
             retry = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
@@ -209,15 +239,25 @@ struct RunSessionView: View {
         VStack(spacing: 0) {
             header
             Divider()
-            ScrollView([.horizontal, .vertical]) {
-                ReplayTerminal(replay: replay)
-                    .frame(width: replay.contentSize.width, height: replay.contentSize.height)
+            if replay.noSession {
+                Text("Aucune session enregistrée pour ce run.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color(nsColor: .textBackgroundColor))
+            } else {
+                ScrollView([.horizontal, .vertical]) {
+                    ReplayTerminal(replay: replay)
+                        .frame(width: replay.contentSize.width, height: replay.contentSize.height)
+                }
+                .background(Color(nsColor: .textBackgroundColor))
             }
-            .background(Color(nsColor: .textBackgroundColor))
         }
         // La ligne `end` arrive après le dernier octet du flux : une relecture à la fin
         // ne coûte rien et garantit que la vue n'a rien raté.
-        .onChange(of: run.status) { _ in replay.pump() }
+        .onChange(of: run.status) { status in
+            if status == .running { replay.pump() } else { replay.runEnded() }
+        }
     }
 
     private var resumeReason: String? {

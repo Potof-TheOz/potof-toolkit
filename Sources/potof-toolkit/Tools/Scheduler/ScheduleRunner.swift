@@ -372,7 +372,11 @@ enum ScheduleRunner {
             message = "session terminée"
         case .exited(let code):
             status = .failed
-            message = "claude s'est arrêté avant la fin de sa réponse (code \(code))"
+            // 127 : SwiftTerm fait `_exit(127)` quand l'exec échoue, et le shell le rend lui
+            // aussi pour une commande introuvable. Dans les deux cas, claude n'a pas démarré.
+            message = code == 127
+                ? "claude introuvable ou non exécutable (code 127)"
+                : "claude s'est arrêté avant la fin de sa réponse (code \(code))"
         case .timedOut:
             status = .timedOut
             message = "délai de \(schedule.timeoutMinutes) min dépassé"
@@ -410,7 +414,9 @@ enum ScheduleRunner {
     static func acquireLock(_ scheduleID: UUID) -> LockOutcome {
         SchedulePaths.ensureDirectories()
         let url = SchedulePaths.lockFile(scheduleID: scheduleID)
-        let fd = open(url.path, O_WRONLY | O_CREAT, 0o644)
+        // O_CLOEXEC : `forkpty` + `execve` transmettraient sinon le fd du verrou au préscript,
+        // à `claude` et à leurs descendants ; un orphelin garderait alors le verrou tenu.
+        let fd = open(url.path, O_WRONLY | O_CREAT | O_CLOEXEC, 0o644)
         guard fd >= 0 else {
             return .unavailable("open a rendu errno \(errno)")
         }
