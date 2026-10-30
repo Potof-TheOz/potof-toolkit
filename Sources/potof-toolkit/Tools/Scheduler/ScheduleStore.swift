@@ -20,8 +20,8 @@ import Combine
 /// lancement de l'app. C'est ce qui fait apparaître un run headless dans l'UI en direct.
 ///
 /// ⚠️ Toutes les méthodes publiques sont à appeler **sur le thread principal** (elles
-/// mutent des `@Published`) — mais aucune n'y fait de travail lent : `runNow` part en fond
-/// et republie, et `upsert`/`setEnabled`/`remove` renvoient leur mutation launchd sur une
+/// mutent des `@Published`) — mais aucune n'y fait de travail lent : `runNow` lance un
+/// process détaché sans l'attendre, et `upsert`/`setEnabled`/`remove` renvoient leur mutation launchd sur une
 /// file sérielle (cf. `applyLaunchAgent`). Elles rendent donc la main tout de suite, et
 /// l'état launchd converge après coup.
 final class ScheduleStore: ObservableObject {
@@ -32,6 +32,9 @@ final class ScheduleStore: ObservableObject {
     @Published private(set) var schedules: [Schedule] = []
     @Published private(set) var runs: [RunRecord] = []
     @Published var selection: UUID?
+    /// Run affiché dans l'onglet « Session ». `nil` = le plus récent de la planification
+    /// sélectionnée. Jamais persisté.
+    @Published var selectedRunID: UUID?
     @Published private(set) var lastError: String?
 
     /// `schedules.json` existe mais n'a pas pu être lu. Tant que c'est vrai, `save()`
@@ -267,23 +270,49 @@ final class ScheduleStore: ObservableObject {
 
     // MARK: - Lancer maintenant
 
-    /// **Le même** `ScheduleRunner.execute` que le mode headless, sur une file de fond,
-    /// avec `trigger: "manual"`. Retour live dans l'UI via le tail ; fonctionne en
-    /// `swift run` ; et le `flock` étant **inter-process**, un tir launchd concurrent est
-    /// correctement exclu. C'est le **seul** chemin de l'UI qui lance un run réel — voir
-    /// `SchedulerService`, où l'ancien `launchctl kickstart` a été retiré pour cette raison.
+    /// Lance **le binaire de l'app** en mode headless (`--run-schedule <uuid>`), exactement
+    /// comme le fera launchd, avec `POTOF_SCHEDULE_TRIGGER=manual`. Et **on n'attend pas sa
+    /// fin** : le run est un autre process qui possède son PTY et écrit sa ligne `end`
+    /// tout seul. Quitter Potof pendant un « Lancer maintenant » ne le tue donc pas (il
+    /// serait mort avec l'app si le runner tournait ici, dans un thread). Retour live dans
+    /// l'UI par le tail de `runs.jsonl` ; le `flock` étant **inter-process**, un tir
+    /// launchd concurrent est correctement exclu.
+    ///
+    /// C'est le **seul** chemin de l'UI qui lance un run réel — voir `SchedulerService`,
+    /// où l'ancien `launchctl kickstart` a été retiré pour cette raison.
     func runNow(id: UUID) {
         guard let schedule = schedules.first(where: { $0.id == id }) else { return }
-        DispatchQueue.global(qos: .userInitiated).async {
-            let status = ScheduleRunner.execute(schedule, trigger: "manual", dryRun: false)
-            DispatchQueue.main.async { [weak self] in
+        // Le détail affiche « le dernier run » tant qu'aucun n'est choisi : on repart de là
+        // pour que le run qui démarre prenne la place dès que sa ligne `start` arrive.
+        selectedRunID = nil
+
+        let process = Process()
+        process.executableURL = SchedulePaths.hostExecutableURL
+        process.arguments = [LaunchAgentPlist.runScheduleFlag, schedule.id.uuidString]
+        var environment = ProcessInfo.processInfo.environment
+        environment[LaunchAgentPlist.triggerEnvironmentKey] = "manual"
+        process.environment = environment
+        // Aucun tube : un runner qui survit à l'app ne doit pas écrire dans un tube dont
+        // l'autre bout est fermé (SIGPIPE) — son rapport n'intéresse personne, tout est
+        // dans `runs.jsonl` et le `.tty`.
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        process.terminationHandler = { [weak self] finished in
+            let code = finished.terminationStatus
+            DispatchQueue.main.async {
                 guard let self else { return }
                 self.reloadRuns()
-                if status == .failed || status == .timedOut {
-                    self.lastError = "« \(schedule.name) » : le run a échoué "
-                        + "(voir l'historique)."
-                }
+                guard code != 0 else { return }
+                self.lastError = code == 1
+                    ? "« \(schedule.name) » : le run a échoué (voir l'historique)."
+                    : "« \(schedule.name) » : le lancement a échoué (code \(code))."
             }
+        }
+        do {
+            try process.run()
+        } catch {
+            lastError = "Impossible de lancer « \(schedule.name) » : \(error.localizedDescription)"
         }
     }
 

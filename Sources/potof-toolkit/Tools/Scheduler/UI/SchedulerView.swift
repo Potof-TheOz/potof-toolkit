@@ -15,7 +15,9 @@ import SwiftUI
 /// puis un corps à **onglets** (`Picker` segmenté). Les onglets existent parce que le
 /// prompt et l'historique se disputaient la hauteur : un prompt d'automation fait des
 /// dizaines de lignes, et l'encadré fixe qui le montrait en laissait voir cinq.
-/// **`Historique` est l'onglet par défaut** — c'est ce qu'on vient regarder.
+/// **`Historique` est l'onglet par défaut** — c'est ce qu'on vient regarder — sauf quand un
+/// run tourne : « Session » prend alors la place, c'est le rendu CLI en direct. Un clic sur
+/// une ligne de l'historique y ouvre le run choisi (`ScheduleStore.selectedRunID`).
 ///
 /// L'état vit dans `ScheduleStore.shared` (fichiers surveillés) et
 /// `SchedulerService.shared` (audit) : il **survit au changement d'outil**, la vue n'étant
@@ -53,7 +55,7 @@ struct SchedulerView: View {
         case existing(UUID)
     }
 
-    private enum DetailTab: Hashable { case history, prompt, plan }
+    private enum DetailTab: Hashable { case history, session, prompt, plan }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -66,7 +68,38 @@ struct SchedulerView: View {
             }
         }
         .frame(minWidth: 820, minHeight: 500)
-        .onAppear { store.reload() }
+        .onAppear {
+            store.reload()
+            showSessionIfRunning()
+        }
+        // Un run qui démarre (« Lancer maintenant » ou tir launchd) : on bascule sur le
+        // rendu en direct — mais seulement depuis l'historique, pour ne pas arracher
+        // quelqu'un qui lit le prompt ou le plan.
+        .onChange(of: runningRunID) { id in
+            if id != nil && tab == .history { tab = .session }
+        }
+        .onChange(of: store.selection) { _ in showSessionIfRunning() }
+    }
+
+    /// Run en cours de la planification sélectionnée, s'il y en a un.
+    private var runningRunID: UUID? {
+        guard let id = store.selection, let last = store.lastRun(of: id),
+              last.status == .running else { return nil }
+        return last.id
+    }
+
+    private func showSessionIfRunning() {
+        if runningRunID != nil { tab = .session }
+    }
+
+    /// Le run montré dans « Session » : celui qu'on a choisi dans l'historique, sinon le
+    /// plus récent. Un choix qui ne concerne pas cette planification est ignoré.
+    private func displayedRun(of schedule: Schedule) -> RunRecord? {
+        let runs = store.runs(of: schedule.id)
+        if let chosen = store.selectedRunID, let run = runs.first(where: { $0.id == chosen }) {
+            return run
+        }
+        return runs.first
     }
 
     // MARK: - Bandeaux
@@ -191,6 +224,7 @@ struct SchedulerView: View {
                                 canInstall: SchedulePaths.canInstallLaunchAgents,
                                 onSelect: {
                                     store.selection = schedule.id
+                                    store.selectedRunID = nil
                                     editing = nil
                                     diagnostic = nil
                                 },
@@ -375,6 +409,7 @@ struct SchedulerView: View {
             Button {
                 diagnostic = nil
                 store.runNow(id: schedule.id)
+                tab = .session
             } label: {
                 Label("Lancer maintenant", systemImage: "play.fill")
             }
@@ -460,6 +495,7 @@ struct SchedulerView: View {
         return Picker("", selection: $tab) {
             Text(runCount > 0 ? "Historique (\(runCount))" : "Historique")
                 .tag(DetailTab.history)
+            Text("Session").tag(DetailTab.session)
             Text("Prompt").tag(DetailTab.prompt)
             Text("Plan").tag(DetailTab.plan)
         }
@@ -474,8 +510,19 @@ struct SchedulerView: View {
         switch tab {
         case .history:
             ScrollView {
-                ScheduleRunHistoryView(scheduleID: schedule.id)
+                ScheduleRunHistoryView(scheduleID: schedule.id, onOpen: { _ in tab = .session })
                     .padding(20)
+            }
+        case .session:
+            // ⭐ Pas de `ScrollView` autour : la vue défile chez elle (grille 120×40 fixe).
+            // `.id(run.id)` : un autre run repart d'un terminal vierge, pas de celui d'avant.
+            if let run = displayedRun(of: schedule) {
+                RunSessionView(run: run, schedule: schedule)
+                    .id(run.id)
+            } else {
+                emptyMessage(icon: "terminal",
+                             text: "Aucun run à afficher.\nLancez la planification pour "
+                                 + "suivre la session claude en direct.")
             }
         case .prompt:
             // ⭐ La raison d'être des onglets : le prompt dispose de toute la hauteur

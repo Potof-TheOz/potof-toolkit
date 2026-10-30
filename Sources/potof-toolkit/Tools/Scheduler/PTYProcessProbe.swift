@@ -96,6 +96,23 @@ enum PTYProcessProbe {
                                args: ["a b", "$(x)", "c'd", "-z"], timeout: 10))
         check("pty.argvIntact", (try? String(contentsOf: outFile)) == "a b\n$(x)\nc'd\n-z\n")
 
+        // pty.readerIncremental — la vue « Session » relit le `.tty` par morceaux
+        let readerFile = dir.appendingPathComponent("reader.tty")
+        try? Data("ab".utf8).write(to: readerFile)
+        let first = TTYFileReader.read(readerFile, from: 0)
+        if let handle = try? FileHandle(forWritingTo: readerFile) {
+            handle.seekToEndOfFile()
+            handle.write(Data("c".utf8))
+            try? handle.close()
+        }
+        let second = TTYFileReader.read(readerFile, from: first.offset)
+        let absent = TTYFileReader.read(dir.appendingPathComponent("absent.tty"), from: 7)
+        check("pty.readerIncremental",
+              String(decoding: first.data, as: UTF8.self) == "ab" && first.offset == 2
+                  && String(decoding: second.data, as: UTF8.self) == "c" && second.offset == 3
+                  && absent.data.isEmpty && absent.offset == 7,
+              "\(first.offset) / \(second.offset) / \(absent.offset)")
+
         out.append("")
         out.append(failures == 0
                    ? "RÉSULTAT : tous les invariants sont vérifiés."
