@@ -15,14 +15,17 @@ import SwiftUI
 struct ScheduleRunHistoryView: View {
 
     let scheduleID: UUID
+    /// Appelé après la sélection d'une ligne : l'appelant bascule sur l'onglet « Session ».
+    let onOpen: (RunRecord) -> Void
 
     @ObservedObject private var store = ScheduleStore.shared
 
     /// Au-delà, on ne déroule pas : l'historique complet vit dans `runs.jsonl`.
     private static let displayLimit = 30
 
-    init(scheduleID: UUID) {
+    init(scheduleID: UUID, onOpen: @escaping (RunRecord) -> Void = { _ in }) {
         self.scheduleID = scheduleID
+        self.onOpen = onOpen
     }
 
     private var records: [RunRecord] {
@@ -40,7 +43,11 @@ struct ScheduleRunHistoryView: View {
             } else {
                 VStack(spacing: 0) {
                     ForEach(records) { record in
-                        RunHistoryRow(record: record)
+                        RunHistoryRow(record: record, isSelected: record.id == store.selectedRunID)
+                            .onTapGesture {
+                                store.selectedRunID = record.id
+                                onOpen(record)
+                            }
                         if record.id != records.last?.id { Divider() }
                     }
                 }
@@ -53,6 +60,7 @@ struct ScheduleRunHistoryView: View {
 
 private struct RunHistoryRow: View {
     let record: RunRecord
+    let isSelected: Bool
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -85,6 +93,12 @@ private struct RunHistoryRow: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
+        .background(isSelected ? Color.accentColor.opacity(0.14) : .clear)
+        .contentShape(Rectangle())
+        .help("Voir la session de ce run.")
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityHint("Ouvre la session de ce run")
     }
 
     private static func absolute(_ date: Date) -> String {
