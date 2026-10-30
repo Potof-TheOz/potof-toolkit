@@ -19,6 +19,7 @@ enum SchedulerSelfTest {
     static func run(arguments: [String], flagIndex: Int) -> Never {
         let sub = arguments.count > flagIndex + 1 ? arguments[flagIndex + 1] : "help"
         switch sub {
+        case "pty":   print(PTYProcessProbe.run())
         case "cli":   print(SupersetCLI.probe())
         case "plist": print(LaunchAgentPlist.probe())
         case "store": print(ScheduleStore.probe())

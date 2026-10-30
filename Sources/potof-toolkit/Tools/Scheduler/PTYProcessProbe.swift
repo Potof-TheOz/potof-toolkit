@@ -1,0 +1,105 @@
+import Foundation
+
+/// Auto-test de `PTYProcess` — `potof-toolkit --sched-selftest pty`.
+///
+/// Chaque cas lance `/bin/sh -c '<script>' …` dans un dossier jetable, avec une env
+/// minimale. Aucun `claude`, aucun écrit hors du dossier jetable : le vrai dossier du
+/// scheduler et `~/Library/LaunchAgents` restent inchangés.
+enum PTYProcessProbe {
+
+    static func run() -> String {
+        var out: [String] = []
+        var failures = 0
+
+        func check(_ label: String, _ condition: Bool, _ detail: String = "") {
+            if condition {
+                out.append("  [OK  ] \(label)\(detail.isEmpty ? "" : " — \(detail)")")
+            } else {
+                failures += 1
+                out.append("  [ÉCHEC] \(label)\(detail.isEmpty ? "" : " — \(detail)")")
+            }
+        }
+
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("potof-pty-probe-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        out.append("── PTYProcess — auto-test ───────────────────────────────────────")
+        out.append("Dossier jetable : \(dir.path)")
+        out.append("")
+
+        /// `/bin/sh -c script argv0 args…` : `$0` = `argv0`, `$1…` = `args`.
+        func req(_ script: String, argv0: String = "sh", args: [String] = [],
+                 tty: URL? = nil, marker: URL? = nil, timeout: TimeInterval,
+                 trust: Bool = false, keep: Bool = false) -> PTYRequest {
+            PTYRequest(executable: "/bin/sh",
+                       arguments: ["sh", "-c", script, argv0] + args,
+                       environment: ["PATH=/usr/bin:/bin"],
+                       directory: dir.path,
+                       ttyFile: tty,
+                       timeout: timeout,
+                       stopMarker: marker,
+                       detectTrustDialog: trust,
+                       keepOutput: keep)
+        }
+
+        // pty.exited + pty.recorded
+        let tty1 = dir.appendingPathComponent("exited.tty")
+        let r1 = PTYProcess.run(req("printf hello; exit 3", tty: tty1, timeout: 10))
+        check("pty.exited", r1.end == .exited(code: 3), "\(r1.end)")
+        check("pty.recorded", (try? String(contentsOf: tty1))?.contains("hello") == true)
+
+        // pty.stopMarker — le script pose le marqueur puis attend « /exit »
+        let marker = dir.appendingPathComponent("hook.stop")
+        let r2 = PTYProcess.run(req("touch \"$1\"; read l; [ \"$l\" = /exit ] && exit 0; exit 9",
+                                    args: [marker.path], marker: marker, timeout: 20))
+        check("pty.stopMarker", r2.end == .stopped(code: 0), "\(r2.end)")
+
+        // pty.timeout — rend la main en moins de timeout + killGrace + 2 s
+        let t0 = Date()
+        let r3 = PTYProcess.run(req("sleep 60", timeout: 1))
+        let elapsed = Date().timeIntervalSince(t0)
+        check("pty.timeout", r3.end == .timedOut && elapsed < 6,
+              "\(r3.end) en \(String(format: "%.1f", elapsed)) s")
+
+        // pty.killsGroup — le petit-fils écrit son pid, il doit être mort après le délai
+        let pidFile = dir.appendingPathComponent("grandchild.pid")
+        _ = PTYProcess.run(req("sleep 60 & echo $! > \"$1\"; wait", args: [pidFile.path], timeout: 1))
+        let grandchild = (try? String(contentsOf: pidFile))
+            .flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        var dead = false
+        if let grandchild {
+            // Le SIGKILL est parti ; on laisse au plus 2 s à launchd pour récolter le zombie.
+            for _ in 0..<40 {
+                if kill(grandchild, 0) != 0 { dead = true; break }
+                usleep(50_000)
+            }
+        }
+        check("pty.killsGroup", grandchild != nil && dead,
+              grandchild.map { "pid \($0)" } ?? "pid illisible")
+
+        // pty.trustDialog — séquences de déplacement du curseur entre les mots, comme le vrai TUI
+        let r5 = PTYProcess.run(req(
+            "printf 'Do you\\033[1Ctrust\\033[1Cthis\\033[1Cfolder?'; sleep 60",
+            timeout: 30, trust: true))
+        check("pty.trustDialog", r5.end == .trustDialog, "\(r5.end)")
+
+        // pty.keepOutput
+        let r6 = PTYProcess.run(req("printf 'a\\nb'", timeout: 10, keep: true))
+        check("pty.keepOutput", String(decoding: r6.output, as: UTF8.self).contains("b"))
+
+        // pty.argvIntact — aucun shell ne ré-interprète les arguments
+        let outBase = dir.appendingPathComponent("argv")
+        let outFile = URL(fileURLWithPath: outBase.path + ".out")
+        _ = PTYProcess.run(req("printf '%s\\n' \"$@\" > \"$0.out\"", argv0: outBase.path,
+                               args: ["a b", "$(x)", "c'd", "-z"], timeout: 10))
+        check("pty.argvIntact", (try? String(contentsOf: outFile)) == "a b\n$(x)\nc'd\n-z\n")
+
+        out.append("")
+        out.append(failures == 0
+                   ? "RÉSULTAT : tous les invariants sont vérifiés."
+                   : "RÉSULTAT : \(failures) ÉCHEC(S).")
+        return out.joined(separator: "\n")
+    }
+}
